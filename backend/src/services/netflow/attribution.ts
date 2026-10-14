@@ -39,6 +39,8 @@ export interface AttributionMaps {
   clientBySite: Map<number, Map<string, string>>;
   /** Fleet-wide: client address → its one site and MAC, or AMBIGUOUS. */
   clientAnySite: Map<string, { siteId: number | null; mac: string } | typeof AMBIGUOUS>;
+  /** Per site (key: site id, 0 for none): every known client MAC (EUI-64 IPv6 matching). */
+  macsBySite: Map<number, Set<string>>;
   /** The only site with devices, if there is exactly one. */
   soleSite: number | null;
 }
@@ -105,6 +107,7 @@ export function buildAttributionMaps(devices: DeviceRow[], clients: ClientRow[])
   }
 
   const clientBySite = new Map<number, Map<string, string>>();
+  const macsBySite = new Map<number, Set<string>>();
   const clientAnySite = new Map<string, { siteId: number | null; mac: string } | typeof AMBIGUOUS>();
   for (const c of clients) {
     if (!c.ip_address) continue;
@@ -116,6 +119,9 @@ export function buildAttributionMaps(devices: DeviceRow[], clients: ClientRow[])
     if (map.has(c.ip_address)) continue; // an older holder of the address in this site
     const mac = c.mac_address.toLowerCase();
     map.set(c.ip_address, mac);
+    let macs = macsBySite.get(key);
+    if (!macs) { macs = new Set(); macsBySite.set(key, macs); }
+    macs.add(mac);
 
     if (allDeviceIps.has(c.ip_address)) continue;
     const any = clientAnySite.get(c.ip_address);
@@ -124,7 +130,7 @@ export function buildAttributionMaps(devices: DeviceRow[], clients: ClientRow[])
   }
 
   const soleSite = sites.size === 1 ? [...sites][0] : null;
-  return { exporterByIp, clientBySite, clientAnySite, soleSite };
+  return { exporterByIp, clientBySite, clientAnySite, macsBySite, soleSite };
 }
 
 export interface ClientMatch {
@@ -139,7 +145,12 @@ export interface ClientMatch {
  */
 export function matchClient(maps: AttributionMaps, exporter: ExporterInfo | null, ip: string): ClientMatch {
   if (exporter) {
-    const mac = maps.clientBySite.get(siteKey(exporter.siteId))?.get(ip);
+    const key = siteKey(exporter.siteId);
+    let mac = maps.clientBySite.get(key)?.get(ip);
+    if (mac === undefined && ip.includes(':')) {
+      const derived = macFromEui64(ip);
+      if (derived && maps.macsBySite.get(key)?.has(derived)) mac = derived;
+    }
     return { mac, siteId: exporter.siteId };
   }
   const any = maps.clientAnySite.get(ip);
@@ -165,7 +176,9 @@ export function isLocalAddress(ip: string): boolean {
     const lower = ip.toLowerCase();
     if (lower === '::1') return true;
     if (lower.startsWith('::ffff:')) return isLocalAddress(lower.slice(7));
-    return lower.startsWith('fc') || lower.startsWith('fd') || lower.startsWith('fe8');
+    if (lower.startsWith('fc') || lower.startsWith('fd')) return true;
+    // fe80::/10 is fe80 through febf
+    return /^fe[89ab][0-9a-f]:/.test(lower) || /^fe[89ab][0-9a-f]$/.test(lower);
   }
   const parts = ip.split('.');
   if (parts.length !== 4) return false;
