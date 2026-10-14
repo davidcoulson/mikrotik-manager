@@ -80,6 +80,12 @@ router.get('/rules', async (_req, res) => {
 router.put('/rules/:type', requireWrite, async (req, res) => {
   const { type } = req.params;
   const { enabled, threshold, cooldown_min } = req.body;
+  if (cooldown_min !== undefined) {
+    const n = typeof cooldown_min === 'number' || (typeof cooldown_min === 'string' && cooldown_min.trim() !== '') ? Number(cooldown_min) : NaN;
+    if (!Number.isInteger(n) || n < 0 || n > 10080) {
+      return res.status(400).json({ error: 'cooldown_min must be a whole number of minutes from 0 to 10080' });
+    }
+  }
 
   const row = await alertService.upsertRule(type, {
     enabled:     enabled     !== undefined ? Boolean(enabled)         : undefined,
@@ -112,9 +118,16 @@ router.get('/channels', async (_req, res) => {
 
 /** POST /api/alerts/channels */
 router.post('/channels', requireWrite, async (req, res) => {
-  const { name, type, enabled = true, config = {} } = req.body;
+  const { name, type, enabled = true } = req.body;
+  let config = req.body.config ?? {};
   if (!name || !type) {
     return res.status(400).json({ error: 'name and type are required' });
+  }
+  // A new email channel always records its TLS choice, so the upgrade
+  // migration (which opts channels *without* the key out of verification)
+  // can never apply to it.
+  if (type === 'email' && config.smtp_allow_self_signed === undefined) {
+    config = { ...config, smtp_allow_self_signed: false };
   }
   const validTypes = ['email', 'slack', 'discord', 'telegram', 'ntfy', 'gotify'];
   if (!validTypes.includes(type)) {

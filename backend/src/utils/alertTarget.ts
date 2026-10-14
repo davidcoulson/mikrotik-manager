@@ -1,5 +1,6 @@
 import * as dns from 'dns';
 import { isIP, isIPv4, isIPv6 } from 'net';
+import { embeddedIPv4 } from './ipv6Embedded';
 
 /**
  * Where an alert channel (Slack, Discord, ntfy, Gotify) may send.
@@ -25,8 +26,8 @@ export function isInternalOnlyAddress(ip: string): boolean {
   if (isIPv6(ip)) {
     const lower = ip.toLowerCase();
     if (lower === '::1' || lower === '::') return true;
-    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isInternalOnlyAddress(mapped[1]);
+    const embedded = embeddedIPv4(lower);
+    if (embedded) return isInternalOnlyAddress(embedded);
     const head = lower.split(':')[0];
     if (/^fe[89ab]/.test(head)) return true;        // fe80::/10 link-local
     if (head.startsWith('ff')) return true;         // multicast
