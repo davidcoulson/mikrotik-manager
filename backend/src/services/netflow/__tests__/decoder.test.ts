@@ -195,6 +195,21 @@ describe('template cache insert-time caps', () => {
     expect(cache.has('10.0.0.9|0|256')).toBe(true);
   });
 
+  it('drops index state with evicted templates under exporter churn', () => {
+    const cache: TemplateCache = new Map();
+    for (let e = 0; e < 200; e++) {
+      decodePacket(v9Packet(0, [tmpl(256)]), `10.2.${e >> 8}.${e & 255}`, cache);
+    }
+    expect(cache.size).toBe(200);
+    // TTL prune removes them all; a new exporter must then behave as fresh
+    pruneTemplateCache(cache, 0, 10_000, Date.now() + 1000);
+    expect(cache.size).toBe(0);
+    for (let t = 256; t < 256 + 256; t++) decodePacket(v9Packet(0, [tmpl(t)]), '10.2.0.1', cache);
+    decodePacket(v9Packet(0, [tmpl(600)]), '10.2.0.1', cache);
+    expect(cache.size).toBe(MAX_TEMPLATES_PER_EXPORTER);
+    expect(cache.has('10.2.0.1|0|600')).toBe(true);
+  });
+
   it('enforces the global ceiling', () => {
     const cache: TemplateCache = new Map();
     const n = Math.ceil(MAX_TEMPLATES_TOTAL / MAX_TEMPLATES_PER_EXPORTER) + 5;
