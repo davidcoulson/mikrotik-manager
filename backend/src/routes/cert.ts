@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import crypto from 'crypto';
 import path from 'path';
 import { requireAuth, requireAdmin } from '../middleware/auth';
+import { validateCertificateBundle } from '../utils/certChain';
 
 const router = Router();
 router.use(requireAuth);
@@ -119,28 +120,10 @@ router.post('/upload', requireAdmin, async (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Failed to parse certificate — ensure it is valid PEM format' });
   }
 
-  // Verify the private key matches the certificate's public key
-  try {
-    const certObj = new crypto.X509Certificate(certificate);
-    const privKey = crypto.createPrivateKey(private_key);
-    const certPubKey = certObj.publicKey;
-
-    // Sign test data with private key, verify with cert's public key
-    const sign = crypto.createSign('SHA256');
-    sign.update('mikrotik-manager-cert-verify');
-    const signature = sign.sign(privKey);
-
-    const verify = crypto.createVerify('SHA256');
-    verify.update('mikrotik-manager-cert-verify');
-    const matches = verify.verify(certPubKey, signature);
-
-    if (!matches) {
-      return res.status(400).json({ error: 'Private key does not match the certificate' });
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return res.status(400).json({ error: `Key/certificate validation failed: ${msg}` });
-  }
+  // Every block of the bundle must parse, in chain order, and the key must
+  // match the leaf; otherwise nginx would fail to load it on the next reload.
+  const bundleError = validateCertificateBundle(certificate, private_key);
+  if (bundleError) return res.status(400).json({ error: bundleError });
 
   // Write files atomically (write to temp, then rename). Installs run one at a
   // time: two uploads sharing the '.tmp' files could put one upload's
