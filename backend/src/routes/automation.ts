@@ -28,16 +28,43 @@ router.get('/tokens', requireAdmin, async (_req: Request, res: Response) => {
   res.json(rows);
 });
 
+// A write token is fleet-wide remote command execution (bulk commands, SSH,
+// firmware), is not site-scoped, and is audited only by name (auth review M4).
+// So it expires by default, and living forever needs an explicit, repeated ask.
+export const WRITE_TOKEN_DEFAULT_DAYS = 90;
+export const WRITE_TOKEN_MAX_DAYS = 365;
+
 router.post('/tokens', requireAdmin, async (req: Request, res: Response) => {
-  const { name, scope, expires_days } = req.body as { name?: string; scope?: string; expires_days?: number };
+  const { name, scope, expires_days, no_expiry, acknowledge_risk } = req.body as {
+    name?: string; scope?: string; expires_days?: number | null; no_expiry?: boolean; acknowledge_risk?: boolean;
+  };
   if (!name || !name.trim()) return res.status(400).json({ error: 'name is required' });
   if (scope !== 'read' && scope !== 'write') return res.status(400).json({ error: 'scope must be read or write' });
+  if (expires_days != null && (typeof expires_days !== 'number' || !Number.isFinite(expires_days) || expires_days < 0)) {
+    return res.status(400).json({ error: 'expires_days must be a positive number of days' });
+  }
+
+  let days: number | null = expires_days && expires_days > 0 ? Math.ceil(expires_days) : null;
+  if (scope === 'write') {
+    if (no_expiry === true || expires_days === 0) {
+      if (no_expiry !== true || acknowledge_risk !== true) {
+        return res.status(400).json({
+          code: 'token_risk_not_acknowledged',
+          error: 'A write token can run commands on every device, and this one would never expire. '
+            + 'Send no_expiry: true and acknowledge_risk: true to confirm, or choose an expiry.',
+        });
+      }
+      days = null;
+    } else if (days === null) {
+      days = WRITE_TOKEN_DEFAULT_DAYS;
+    } else if (days > WRITE_TOKEN_MAX_DAYS) {
+      return res.status(400).json({ error: `A write token can last at most ${WRITE_TOKEN_MAX_DAYS} days.` });
+    }
+  }
 
   const token = `mtm_${randomBytes(24).toString('hex')}`;
   const hash = createHash('sha256').update(token).digest('hex');
-  const expiresAt = expires_days && expires_days > 0
-    ? new Date(Date.now() + expires_days * 86_400_000).toISOString()
-    : null;
+  const expiresAt = days !== null ? new Date(Date.now() + days * 86_400_000).toISOString() : null;
 
   const row = await queryOne<{ id: number }>(
     `INSERT INTO api_tokens (name, token_hash, prefix, scope, created_by, expires_at)
@@ -45,7 +72,13 @@ router.post('/tokens', requireAdmin, async (req: Request, res: Response) => {
     [name.trim().slice(0, 100), hash, token.slice(0, 12), scope, req.user?.username ?? null, expiresAt]);
 
   // The full token is returned exactly once — only the hash is stored.
-  res.status(201).json({ id: row!.id, token });
+  res.status(201).json({
+    id: row!.id, token, scope, expires_at: expiresAt,
+    ...(scope === 'write' ? {
+      warning: 'This token can run commands on every device. It is not limited to a site. '
+        + (expiresAt ? `It expires ${expiresAt.slice(0, 10)}.` : 'It never expires: revoke it when it is no longer needed.'),
+    } : {}),
+  });
 });
 
 router.delete('/tokens/:id', requireAdmin, async (req: Request, res: Response) => {

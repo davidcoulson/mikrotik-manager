@@ -10,8 +10,19 @@ import { loginRateLimit, rateLimitRedis } from '../middleware/rateLimitRedis';
 import { validatePassword } from '../utils/passwordPolicy';
 import { sessionResponse } from '../utils/sessionResponse';
 import { passwordLoginEnabled } from '../utils/passwordLogin';
+import { sealTotpSecret, openTotpSecret } from '../utils/totpSecret';
+import { randomBytes } from 'crypto';
+import {
+  bump, peek, clear, claimOnce, accountFailKey, totpUserFailKey, totpTokenFailKey,
+  ACCOUNT_FAIL_MAX, ACCOUNT_FAIL_WINDOW_SEC, TOTP_USER_FAIL_MAX, TOTP_TOKEN_FAIL_MAX,
+  PARTIAL_TOKEN_TTL_SEC, TOTP_REPLAY_TTL_SEC, OVER_CAP_SLOT_SEC,
+} from '../utils/authThrottle';
 
 const router = Router();
+
+// bcrypt hash of a random string nobody knows: compared against when the
+// account has no local password, so timing matches a real attempt.
+const DUMMY_HASH = '$2b$12$x1ShfS6ua.IHfzy/kdOkeuC0OtQwJzjRaIpYhRdUDBT7Ecg3cyyL2';
 
 router.get(
   '/security-status',
@@ -30,10 +41,10 @@ router.get(
     // Stored credentials no known key decrypts: the key was lost (P2-29).
     if (encryptionKeyMissing()) warnings.push('encryption_key_missing');
 
-    const adminUser = await queryOne<{ password_hash: string }>(
+    const adminUser = await queryOne<{ password_hash: string | null }>(
       `SELECT password_hash FROM users WHERE username = 'admin' LIMIT 1`
     );
-    if (adminUser && (await bcrypt.compare('admin', adminUser.password_hash))) {
+    if (adminUser?.password_hash && (await bcrypt.compare('admin', adminUser.password_hash))) {
       warnings.push('admin_password_default');
     }
 
@@ -75,18 +86,37 @@ router.post('/login', loginRateLimit(), async (req: Request, res: Response) => {
   const user = await queryOne<{
     id: number;
     username: string;
-    password_hash: string;
+    password_hash: string | null;
     role: string;
     totp_enabled: boolean;
     must_change_password: boolean;
   }>(`SELECT id, username, password_hash, role, totp_enabled, must_change_password, session_version FROM users WHERE username = $1`, [username]);
 
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-    return res.status(401).json({ error: 'Invalid credentials' });
+  // Per-account cap on top of the per-IP one: a botnet guessing one account's
+  // password is stopped here (auth review M2).
+  const failKey = accountFailKey(String(username));
+  // Past the cap the account is slowed to one attempt per OVER_CAP_SLOT_SEC
+  // rather than shut: a hard lock would let anyone who knows a username keep
+  // that user (an admin) out indefinitely.
+  if ((await peek(failKey)) >= ACCOUNT_FAIL_MAX && !(await claimOnce(`afs:${failKey}`, OVER_CAP_SLOT_SEC))) {
+    res.setHeader('Retry-After', String(OVER_CAP_SLOT_SEC));
+    return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again shortly.' });
   }
 
+  // An account with no local password (SSO) must fail like a wrong password,
+  // after the same bcrypt work, not crash bcrypt (and not reveal itself).
+  const passwordOk = await bcrypt.compare(String(password), user?.password_hash || DUMMY_HASH);
+  if (!user || !user.password_hash || !passwordOk) {
+    await bump(failKey, ACCOUNT_FAIL_WINDOW_SEC);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  await clear(failKey);
+
   if (user.totp_enabled) {
-    const totpToken = signRawToken({ userId: user.id, partial: true }, { expiresIn: '5m' });
+    // jti makes the partial token countable and single-use at /totp/verify.
+    const totpToken = signRawToken(
+      { userId: user.id, partial: true, jti: randomBytes(16).toString('hex') },
+      { expiresIn: PARTIAL_TOKEN_TTL_SEC });
     return res.json({ requires_totp: true, totp_token: totpToken });
   }
 
@@ -100,9 +130,9 @@ router.post('/totp/verify', rateLimitRedis({ windowSec: 60, max: 5, keyPrefix: '
   if (!totp_token || !code) {
     return res.status(400).json({ error: 'totp_token and code are required' });
   }
-  let payload: { userId: number; partial: boolean };
+  let payload: { userId: number; partial: boolean; jti?: string };
   try {
-    payload = verifyRawToken<{ userId: number; partial: boolean }>(totp_token);
+    payload = verifyRawToken<{ userId: number; partial: boolean; jti?: string }>(totp_token);
   } catch {
     return res.status(401).json({ error: 'Invalid or expired TOTP token' });
   }
@@ -118,11 +148,36 @@ router.post('/totp/verify', rateLimitRedis({ windowSec: 60, max: 5, keyPrefix: '
     return res.status(401).json({ error: 'TOTP not configured' });
   }
 
-  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(user.totp_secret), digits: 6, period: 30 });
+  // Attempt caps (auth review M2): per partial token and per account, so
+  // distributing guesses over addresses does not help.
+  const userFailKey = totpUserFailKey(user.id);
+  const tokenFailKey = payload.jti ? totpTokenFailKey(payload.jti) : null;
+  if ((await peek(userFailKey)) >= TOTP_USER_FAIL_MAX && !(await claimOnce(`tfs:${user.id}`, OVER_CAP_SLOT_SEC))) {
+    res.setHeader('Retry-After', String(OVER_CAP_SLOT_SEC));
+    return res.status(429).json({ error: 'Too many failed codes for this account. Try again shortly.' });
+  }
+  if (tokenFailKey && (await peek(tokenFailKey)) >= TOTP_TOKEN_FAIL_MAX) {
+    return res.status(401).json({ error: 'Invalid or expired TOTP token' });
+  }
+
+  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(openTotpSecret(user.totp_secret)), digits: 6, period: 30 });
   const delta = totp.validate({ token: code.replace(/\s/g, ''), window: 1 });
   if (delta === null) {
+    await bump(userFailKey, ACCOUNT_FAIL_WINDOW_SEC);
+    if (tokenFailKey) await bump(tokenFailKey, PARTIAL_TOKEN_TTL_SEC);
     return res.status(401).json({ error: 'Invalid TOTP code' });
   }
+
+  // A code is good once: a captured one cannot be replayed within its window,
+  // and the partial token buys one session (auth review M2).
+  const step = Math.floor(Date.now() / 30_000) + delta;
+  const fresh = await claimOnce(`tu:${user.id}:${step}`, TOTP_REPLAY_TTL_SEC);
+  const tokenFresh = payload.jti ? await claimOnce(`tj:${payload.jti}`, PARTIAL_TOKEN_TTL_SEC + 30) : true;
+  if (!fresh || !tokenFresh) {
+    await bump(userFailKey, ACCOUNT_FAIL_WINDOW_SEC);
+    return res.status(401).json({ error: 'Invalid TOTP code' });
+  }
+  await clear(userFailKey);
 
   return res.json(await sessionResponse(user));
 });
@@ -159,7 +214,7 @@ router.post('/totp/setup', requireAuth, async (req: Request, res: Response) => {
   // Held as pending until a code from it is confirmed (outside review S1).
   // Writing it over totp_secret replaced a working authenticator the moment
   // setup was started, so an abandoned re-setup locked the user out.
-  await query(`UPDATE users SET totp_pending_secret = $1 WHERE id = $2`, [secret.base32, req.user!.userId]);
+  await query(`UPDATE users SET totp_pending_secret = $1 WHERE id = $2`, [sealTotpSecret(secret.base32), req.user!.userId]);
   return res.json({ secret: secret.base32, uri, qr: qrDataUrl });
 });
 
@@ -179,7 +234,7 @@ router.post('/totp/confirm', requireAuth, async (req: Request, res: Response) =>
   );
   if (!user?.totp_pending_secret) return res.status(400).json({ error: 'Run /totp/setup first' });
 
-  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(user.totp_pending_secret), digits: 6, period: 30 });
+  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(openTotpSecret(user.totp_pending_secret)), digits: 6, period: 30 });
   const delta = totp.validate({ token: code.replace(/\s/g, ''), window: 1 });
   if (delta === null) return res.status(400).json({ error: 'Invalid code', code: 'credential_rejected' });
 
@@ -196,11 +251,11 @@ router.post('/totp/disable', requireAuth, async (req: Request, res: Response) =>
   const { password } = req.body as { password?: string };
   if (!password) return res.status(400).json({ error: 'password is required' });
 
-  const user = await queryOne<{ password_hash: string }>(
+  const user = await queryOne<{ password_hash: string | null }>(
     `SELECT password_hash FROM users WHERE id = $1`,
     [req.user!.userId]
   );
-  if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+  if (!user?.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(400).json({ error: 'Incorrect password', code: 'credential_rejected' });
   }
 
@@ -239,12 +294,12 @@ router.put('/password', requireAuth, async (req: Request, res: Response) => {
     return res.status(400).json({ error: pwError });
   }
 
-  const user = await queryOne<{ id: number; password_hash: string }>(
+  const user = await queryOne<{ id: number; password_hash: string | null }>(
     `SELECT id, password_hash FROM users WHERE id = $1`,
     [req.user!.userId]
   );
 
-  if (!user || !(await bcrypt.compare(currentPassword, user.password_hash))) {
+  if (!user?.password_hash || !(await bcrypt.compare(currentPassword, user.password_hash))) {
     return res.status(400).json({ error: 'Current password is incorrect', code: 'credential_rejected' });
   }
   if (newPassword === currentPassword) {
