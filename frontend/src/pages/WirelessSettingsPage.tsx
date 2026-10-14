@@ -894,24 +894,44 @@ export default function WirelessSettingsPage() {
   const [writeError, setWriteError] = useState('');
   const failed = (e: unknown) =>
     setWriteError((e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Operation failed');
-  const done = (res: unknown) => { qc.invalidateQueries({ queryKey: ['wireless-ifaces', selectedApId] }); setWriteError(''); guard.onSuccess(res); };
+  // The AP a write was sent to travels with the write: the verdict, its dialog and
+  // the "apply anyway" retry all use it, never the live selection (review M2/L2).
+  const [lockoutAp, setLockoutAp] = useState<{ id: number; name?: string } | null>(null);
+  const done = (res: unknown, vars: { apId: number }) => {
+    qc.invalidateQueries({ queryKey: ['wireless-ifaces', vars.apId] });
+    setWriteError('');
+    setLockoutAp(null);
+    guard.onSuccess(res);
+  };
 
   const deleteSsidMutation = useMutation({
-    mutationFn: ({ name, confirm }: { name: string; confirm?: boolean }) => wirelessApi.deleteInterface(selectedApId!, name, confirm),
+    mutationFn: ({ apId, name, confirm }: { apId: number; name: string; confirm?: boolean }) => wirelessApi.deleteInterface(apId, name, confirm),
     onSuccess: done,
   });
 
   const toggleSsidMutation = useMutation({
-    mutationFn: ({ name, disabled, confirm }: { name: string; disabled: boolean; confirm?: boolean }) =>
-      wirelessApi.updateInterface(selectedApId!, name, { disabled, ...(confirm ? { confirm_lockout: true } : {}) }),
+    mutationFn: ({ apId, name, disabled, confirm }: { apId: number; name: string; disabled: boolean; confirm?: boolean }) =>
+      wirelessApi.updateInterface(apId, name, { disabled, ...(confirm ? { confirm_lockout: true } : {}) }),
     onSuccess: done,
   });
-  const toggleSsid = (name: string, disabled: boolean) => toggleSsidMutation.mutate({ name, disabled }, {
-    onError: guard.onError(() => toggleSsidMutation.mutate({ name, disabled, confirm: true }, { onError: failed }), failed),
-  });
-  const deleteSsid = (name: string) => deleteSsidMutation.mutate({ name }, {
-    onError: guard.onError(() => deleteSsidMutation.mutate({ name, confirm: true }, { onError: failed }), failed),
-  });
+  const toggleSsid = (name: string, disabled: boolean) => {
+    if (selectedApId === null) return;
+    const apId = selectedApId;
+    const ap = { id: apId, name: selectedAp?.name };
+    toggleSsidMutation.mutate({ apId, name, disabled }, {
+      onError: guard.onError(() => toggleSsidMutation.mutate({ apId, name, disabled, confirm: true }, { onError: failed }), failed),
+    });
+    setLockoutAp(ap);
+  };
+  const deleteSsid = (name: string) => {
+    if (selectedApId === null) return;
+    const apId = selectedApId;
+    const ap = { id: apId, name: selectedAp?.name };
+    deleteSsidMutation.mutate({ apId, name }, {
+      onError: guard.onError(() => deleteSsidMutation.mutate({ apId, name, confirm: true }, { onError: failed }), failed),
+    });
+    setLockoutAp(ap);
+  };
 
   // Detect new RouterOS 7 wifi package by interface naming (wifi1/wifi2 vs wlan1/wlan2).
   // When ifaces haven't loaded yet, default to true so the security fields are visible.
@@ -939,7 +959,7 @@ export default function WirelessSettingsPage() {
           <select
             className="input w-auto"
             value={selectedApId ?? ''}
-            onChange={e => setSelectedApId(Number(e.target.value))}
+            onChange={e => { guard.setLockout(null); setLockoutAp(null); setSelectedApId(Number(e.target.value)); }}
           >
             {aps.map(ap => (
               <option key={ap.id} value={ap.id}>
@@ -957,8 +977,8 @@ export default function WirelessSettingsPage() {
       )}
 
       {writeError && <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-600 dark:text-red-400">{writeError}</div>}
-      {selectedApId && (
-        <GuardedWriteUi state={guard} deviceId={selectedApId} deviceName={selectedAp?.name}
+      {lockoutAp && (
+        <GuardedWriteUi state={guard} deviceId={lockoutAp.id} deviceName={lockoutAp.name}
           pending={toggleSsidMutation.isPending || deleteSsidMutation.isPending} />
       )}
       {selectedAp && (
