@@ -240,10 +240,25 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS rack_slot VARCHAR(20);
 ALTER TABLE topology_links ADD COLUMN IF NOT EXISTS neighbor_caps VARCHAR(255);
 ALTER TABLE topology_links ADD COLUMN IF NOT EXISTS discovered_by VARCHAR(50);
 -- RouterOS can return a long comma-separated discovered-by list; 50 chars was too small.
-ALTER TABLE topology_links ALTER COLUMN discovered_by TYPE VARCHAR(512);
+DO $$ BEGIN
+  IF (SELECT character_maximum_length FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'topology_links' AND column_name = 'discovered_by') < 512 THEN
+    ALTER TABLE topology_links ALTER COLUMN discovered_by TYPE VARCHAR(512);
+  END IF;
+END $$;
 -- Interface names from neighbor discovery can exceed 50 chars (long bridge/bond names).
-ALTER TABLE topology_links ALTER COLUMN from_interface TYPE VARCHAR(512);
-ALTER TABLE topology_links ALTER COLUMN to_interface TYPE VARCHAR(512);
+DO $$ BEGIN
+  IF (SELECT character_maximum_length FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'topology_links' AND column_name = 'from_interface') < 512 THEN
+    ALTER TABLE topology_links ALTER COLUMN from_interface TYPE VARCHAR(512);
+  END IF;
+END $$;
+DO $$ BEGIN
+  IF (SELECT character_maximum_length FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'topology_links' AND column_name = 'to_interface') < 512 THEN
+    ALTER TABLE topology_links ALTER COLUMN to_interface TYPE VARCHAR(512);
+  END IF;
+END $$;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS firmware_update_available BOOLEAN DEFAULT FALSE;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS latest_ros_version VARCHAR(20);
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS routerboard_upgrade_available BOOLEAN DEFAULT FALSE;
@@ -271,7 +286,12 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS ip_addresses_jsonb JSONB;
 -- The management address can now be a hostname (DDNS name, public FQDN), not
 -- only a LAN IP, so 45 chars (enough for an IPv6 literal) is too narrow —
 -- widen to fit a full DNS name. A no-op if already this size or larger.
-ALTER TABLE devices ALTER COLUMN ip_address TYPE VARCHAR(253);
+DO $$ BEGIN
+  IF (SELECT character_maximum_length FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'devices' AND column_name = 'ip_address') < 253 THEN
+    ALTER TABLE devices ALTER COLUMN ip_address TYPE VARCHAR(253);
+  END IF;
+END $$;
 
 -- Whether the name column should keep following the router's own
 -- /system/identity on every poll (DeviceCollector.collectSystemInfo), or was
@@ -658,7 +678,7 @@ ALTER TABLE device_change_guards ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPT
 UPDATE device_change_guards
    SET resolved_at = COALESCE(resolved_at, committed_at)
  WHERE status <> 'pending' AND resolved_at IS NULL;
-UPDATE device_change_guards SET committed_at = NULL WHERE status <> 'committed';
+UPDATE device_change_guards SET committed_at = NULL WHERE status <> 'committed' AND committed_at IS NOT NULL;
 
 -- VLAN cache correctness.
 --
@@ -671,11 +691,21 @@ ALTER TABLE vlans ADD COLUMN IF NOT EXISTS vlan_ids TEXT;
 ALTER TABLE vlans ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 UPDATE vlans SET bridge = '' WHERE bridge IS NULL;
 ALTER TABLE vlans ALTER COLUMN bridge SET DEFAULT '';
-ALTER TABLE vlans ALTER COLUMN bridge SET NOT NULL;
+DO $$ BEGIN
+  IF (SELECT is_nullable FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'vlans' AND column_name = 'bridge') = 'YES' THEN
+    ALTER TABLE vlans ALTER COLUMN bridge SET NOT NULL;
+  END IF;
+END $$;
 ALTER TABLE vlans DROP CONSTRAINT IF EXISTS vlans_device_id_vlan_id_key;
 -- Collapse rows the old key could not distinguish, keeping the most recent.
-DELETE FROM vlans a USING vlans b
-  WHERE a.id < b.id AND a.device_id = b.device_id AND a.bridge = b.bridge AND a.vlan_id = b.vlan_id;
+-- Only needed until the unique index below exists; skipped on every later boot.
+DO $$ BEGIN
+  IF to_regclass('idx_vlans_device_bridge_vid') IS NULL THEN
+    DELETE FROM vlans a USING vlans b
+      WHERE a.id < b.id AND a.device_id = b.device_id AND a.bridge = b.bridge AND a.vlan_id = b.vlan_id;
+  END IF;
+END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vlans_device_bridge_vid ON vlans (device_id, bridge, vlan_id);
 
 -- Per-port VLAN membership. vlan_ids was declared but never written and tagged
@@ -1148,7 +1178,12 @@ ALTER TABLE firmware_rollouts ADD COLUMN IF NOT EXISTS scheduled_until TIMESTAMP
 
 -- API tokens are recorded as "token:<name>" with names up to 100 characters;
 -- at 50 the insert failed and the write went unrecorded.
-ALTER TABLE audit_log ALTER COLUMN username TYPE VARCHAR(150);
+DO $$ BEGIN
+  IF (SELECT character_maximum_length FROM information_schema.columns
+       WHERE table_schema = current_schema() AND table_name = 'audit_log' AND column_name = 'username') < 150 THEN
+    ALTER TABLE audit_log ALTER COLUMN username TYPE VARCHAR(150);
+  END IF;
+END $$;
 
 -- Proxy access logs written by RouterOS containers (3proxy JSON lines), parsed out
 -- of the device log so the dashboard can rank clients, users and destinations.
@@ -1210,8 +1245,19 @@ CREATE TABLE IF NOT EXISTS proxy_usage_hourly (
 );
 CREATE INDEX IF NOT EXISTS idx_proxy_usage_hourly_bucket ON proxy_usage_hourly(bucket);
 -- Fold per-worker suffixes (3proxy-b-32 -> 3proxy) on rows stored before they were stripped.
-UPDATE proxy_connections SET source = COALESCE(NULLIF(regexp_replace(source, '(-[a-zA-Z])?-[0-9]+$', ''), ''), 'proxy')
-  WHERE source ~ '-[0-9]+$';
+-- One-shot: re-running it every boot rescanned the table and re-folded legitimate
+-- names that end in -N, so it is recorded in schema_migrations and never repeated.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  key        TEXT PRIMARY KEY,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE key = 'proxy_source_fold_worker_suffix') THEN
+    UPDATE proxy_connections SET source = COALESCE(NULLIF(regexp_replace(source, '(-[a-zA-Z])?-[0-9]+$', ''), ''), 'proxy')
+      WHERE source ~ '-[0-9]+$';
+    INSERT INTO schema_migrations (key) VALUES ('proxy_source_fold_worker_suffix');
+  END IF;
+END $$;
 
 -- Session revocation (outside review P2-1): every session carries the account's
 -- session_version, which goes up when the role or password changes, ending
@@ -1845,9 +1891,15 @@ const DEFAULT_SETTINGS = [
   { key: 'docs_link_enabled', value: true },
 ];
 
+// Arbitrary constant namespacing this app's migration lock.
+const MIGRATION_LOCK_KEY = 7_315_204_911;
+
 export async function runMigrations(): Promise<void> {
   console.log('Running database migrations...');
   const client = await pool.connect();
+  // Serialise concurrent starts (two replicas, or a restart overlapping a slow
+  // migration): the second waits, then finds everything already applied.
+  await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
   try {
     await client.query(MIGRATION_SQL);
     console.log('Schema created/verified');
@@ -1916,6 +1968,7 @@ export async function runMigrations(): Promise<void> {
 
     console.log('Database migrations completed successfully');
   } finally {
+    await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => undefined);
     client.release();
   }
 }
