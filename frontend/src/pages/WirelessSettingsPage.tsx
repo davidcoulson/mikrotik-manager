@@ -900,7 +900,6 @@ export default function WirelessSettingsPage() {
   const done = (res: unknown, vars: { apId: number }) => {
     qc.invalidateQueries({ queryKey: ['wireless-ifaces', vars.apId] });
     setWriteError('');
-    setLockoutAp(null);
     guard.onSuccess(res);
   };
 
@@ -919,18 +918,23 @@ export default function WirelessSettingsPage() {
     const apId = selectedApId;
     const ap = { id: apId, name: selectedAp?.name };
     toggleSsidMutation.mutate({ apId, name, disabled }, {
-      onError: guard.onError(() => toggleSsidMutation.mutate({ apId, name, disabled, confirm: true }, { onError: failed }), failed),
+      onError: (e) => {
+        // Verdict, retry and AP are bound together when the response arrives.
+        setLockoutAp(ap);
+        guard.onError(() => toggleSsidMutation.mutate({ apId, name, disabled, confirm: true }, { onError: failed }), failed)(e);
+      },
     });
-    setLockoutAp(ap);
   };
   const deleteSsid = (name: string) => {
     if (selectedApId === null) return;
     const apId = selectedApId;
     const ap = { id: apId, name: selectedAp?.name };
     deleteSsidMutation.mutate({ apId, name }, {
-      onError: guard.onError(() => deleteSsidMutation.mutate({ apId, name, confirm: true }, { onError: failed }), failed),
+      onError: (e) => {
+        setLockoutAp(ap);
+        guard.onError(() => deleteSsidMutation.mutate({ apId, name, confirm: true }, { onError: failed }), failed)(e);
+      },
     });
-    setLockoutAp(ap);
   };
 
   // Detect new RouterOS 7 wifi package by interface naming (wifi1/wifi2 vs wlan1/wlan2).
@@ -977,8 +981,8 @@ export default function WirelessSettingsPage() {
       )}
 
       {writeError && <div className="p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-600 dark:text-red-400">{writeError}</div>}
-      {lockoutAp && (
-        <GuardedWriteUi state={guard} deviceId={lockoutAp.id} deviceName={lockoutAp.name}
+      {(lockoutAp ?? selectedAp) && (
+        <GuardedWriteUi state={guard} deviceId={(lockoutAp ?? selectedAp)!.id} deviceName={(lockoutAp ?? selectedAp)!.name}
           pending={toggleSsidMutation.isPending || deleteSsidMutation.isPending} />
       )}
       {selectedAp && (
