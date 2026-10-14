@@ -645,6 +645,12 @@ ALTER TABLE alert_channels DROP CONSTRAINT IF EXISTS alert_channels_type_check;
 ALTER TABLE alert_channels ADD CONSTRAINT alert_channels_type_check
   CHECK (type IN ('email','slack','discord','telegram','ntfy','gotify'));
 
+-- SMTP certificates are now verified unless a channel opts out. Channels that
+-- existed before that keep the old (unverified) behaviour until an admin turns
+-- it off; the key is only added when absent, so a later choice is never undone.
+UPDATE alert_channels SET config = config || '{"smtp_allow_self_signed": true}'::jsonb
+  WHERE type = 'email' AND NOT (config ? 'smtp_allow_self_signed');
+
 -- Change Guard ledger: committed_at used to be stamped for every terminal status,
 -- so an abandoned or failed guard read as though the change had been kept. It now
 -- means what it says, and resolved_at records when the guard finished either way.
