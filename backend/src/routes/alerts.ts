@@ -118,9 +118,16 @@ router.get('/channels', async (_req, res) => {
 
 /** POST /api/alerts/channels */
 router.post('/channels', requireWrite, async (req, res) => {
-  const { name, type, enabled = true, config = {} } = req.body;
+  const { name, type, enabled = true } = req.body;
+  let config = req.body.config ?? {};
   if (!name || !type) {
     return res.status(400).json({ error: 'name and type are required' });
+  }
+  // A new email channel always records its TLS choice, so the upgrade
+  // migration (which opts channels *without* the key out of verification)
+  // can never apply to it.
+  if (type === 'email' && config.smtp_allow_self_signed === undefined) {
+    config = { ...config, smtp_allow_self_signed: false };
   }
   const validTypes = ['email', 'slack', 'discord', 'telegram', 'ntfy', 'gotify'];
   if (!validTypes.includes(type)) {
