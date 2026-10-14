@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 /**
  * Topology graph construction.
  *
@@ -356,13 +357,24 @@ export function buildTopology(
   // Keyed by the same neighbour key used everywhere else, so two unmanaged devices
   // that merely share an address in disconnected segments stay two nodes.
   const externalMap = new Map<string, ExternalNode>();
+  const usedExternalIds = new Set<string>();
+  // Ids must stay [a-z0-9] (routes/topology.ts EXTERNAL_REF). Stripping punctuation
+  // can map two distinct keys to one id ('a:10.0.0.1@15' / 'a:10.0.0.11@5'); the
+  // first keeps the historic id (saved positions), a later collision gets a hash.
+  const externalId = (key: string): string => {
+    const base = `ext-${key.replace(/[^a-z0-9]/gi, '')}`;
+    if (base.length <= 140 && !usedExternalIds.has(base)) return base;
+    return `${base.slice(0, 120)}h${createHash('sha1').update(key).digest('hex').slice(0, 16)}`;
+  };
   for (const link of links) {
     if (link.to_device_id) continue;
     const key = neighborKey(link);
     if (!key) continue;
     if (!externalMap.has(key)) {
+      const id = externalId(key);
+      usedExternalIds.add(id);
       externalMap.set(key, {
-        id: `ext-${key.replace(/[^a-z0-9]/gi, '')}`,
+        id,
         name: link.neighbor_identity || link.neighbor_address || 'Unknown',
         address: link.neighbor_address || '',
         platform: link.neighbor_platform || '',
