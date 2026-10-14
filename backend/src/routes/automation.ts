@@ -5,7 +5,7 @@ import { query, queryOne } from '../config/database';
 import { requireAuth, requireAdmin, requireWrite, fleetOnly } from '../middleware/auth';
 import { canSeeDeviceSecrets, maskUrl } from '../utils/redactSecrets';
 import { webhookService, WEBHOOK_EVENTS } from '../services/WebhookService';
-import { reportService, computeNextRun } from '../services/ReportService';
+import { reportService, computeNextRun, appTimezone } from '../services/ReportService';
 
 const router = Router();
 router.use(requireAuth);
@@ -178,7 +178,7 @@ router.post('/reports', requireWrite, async (req: Request, res: Response) => {
   const row = await queryOne<{ id: number }>(
     `INSERT INTO report_schedules (name, frequency, recipients, next_run_at)
      VALUES ($1,$2,$3,$4) RETURNING id`,
-    [name.trim().slice(0, 100), frequency, rcpts.join(', '), computeNextRun(frequency!, new Date())]);
+    [name.trim().slice(0, 100), frequency, rcpts.join(', '), computeNextRun(frequency!, new Date(), await appTimezone())]);
   res.status(201).json({ id: row!.id });
 });
 
