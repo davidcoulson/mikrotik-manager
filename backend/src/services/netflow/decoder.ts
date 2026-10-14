@@ -70,6 +70,37 @@ export function pruneTemplateCache(
   return removed;
 }
 
+// Insert-time bounds so a spoofed exporter can't balloon the cache between
+// the periodic prunes. Per exporter first, then a global ceiling.
+export const MAX_TEMPLATES_PER_EXPORTER = 256;
+export const MAX_TEMPLATES_TOTAL = 10_000;
+
+// Per-cache index of exporterKey -> template keys (tolerates stale entries
+// left behind by pruneTemplateCache; they are dropped lazily).
+const exporterIndex = new WeakMap<TemplateCache, Map<string, Set<string>>>();
+
+function insertTemplate(cache: TemplateCache, exporterKey: string, key: string, tpl: Template): void {
+  let idx = exporterIndex.get(cache);
+  if (!idx) { idx = new Map(); exporterIndex.set(cache, idx); }
+  let keys = idx.get(exporterKey);
+  if (!keys) { keys = new Set(); idx.set(exporterKey, keys); }
+  if (!cache.has(key)) {
+    if (keys.size >= MAX_TEMPLATES_PER_EXPORTER) {
+      for (const k of keys) if (!cache.has(k)) keys.delete(k);
+      // Still full: evict this exporter's oldest-inserted template (O(1)).
+      const oldest = keys.values().next().value;
+      if (oldest !== undefined) { cache.delete(oldest); keys.delete(oldest); }
+    }
+    if (cache.size >= MAX_TEMPLATES_TOTAL) {
+      // Map iteration order is insertion order: drop the oldest-inserted entry.
+      const first = cache.keys().next().value;
+      if (first !== undefined) cache.delete(first);
+    }
+    keys.add(key);
+  }
+  cache.set(key, tpl);
+}
+
 export interface DecodeResult {
   flows: FlowRecord[];
   templatesParsed: number;
@@ -184,7 +215,7 @@ function parseTemplates(
       minLength += length === 0xffff ? 1 : length;
     }
     if (!ok || minLength === 0) break;
-    cache.set(`${exporterKey}|${sourceId}|${templateId}`, { fields, minLength, lastUsed: Date.now() });
+    insertTemplate(cache, exporterKey, `${exporterKey}|${sourceId}|${templateId}`, { fields, minLength, lastUsed: Date.now() });
     parsed++;
   }
   return parsed;

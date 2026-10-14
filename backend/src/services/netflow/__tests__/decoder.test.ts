@@ -1,4 +1,4 @@
-import { decodePacket, pruneTemplateCache, TemplateCache } from '../decoder';
+import { decodePacket, pruneTemplateCache, TemplateCache, MAX_TEMPLATES_PER_EXPORTER, MAX_TEMPLATES_TOTAL } from '../decoder';
 
 // ─── Fixture builders ─────────────────────────────────────────────────────────
 
@@ -168,6 +168,44 @@ describe('NetFlow v9 decoding', () => {
     const v5ish = Buffer.alloc(24);
     v5ish.writeUInt16BE(5, 0);
     expect(decodePacket(v5ish, '10.0.0.1', cache).flows).toHaveLength(0);
+  });
+});
+
+describe('template cache insert-time caps', () => {
+  const tmpl = (id: number) => flowset(0, templateBody(id, V9_FIELDS));
+
+  it('caps templates per exporter at insert time', () => {
+    const cache: TemplateCache = new Map();
+    for (let sid = 0; sid < 5; sid++) {
+      const sets: Buffer[] = [];
+      for (let t = 256; t < 256 + 200; t++) sets.push(tmpl(t));
+      decodePacket(v9Packet(sid, sets), '10.0.0.1', cache);
+    }
+    expect(cache.size).toBeLessThanOrEqual(MAX_TEMPLATES_PER_EXPORTER);
+  });
+
+  it('keeps other exporters intact when one floods', () => {
+    const cache: TemplateCache = new Map();
+    decodePacket(v9Packet(0, [tmpl(256)]), '10.0.0.9', cache);
+    for (let sid = 0; sid < 3; sid++) {
+      const sets: Buffer[] = [];
+      for (let t = 256; t < 456; t++) sets.push(tmpl(t));
+      decodePacket(v9Packet(sid, sets), '10.0.0.1', cache);
+    }
+    expect(cache.has('10.0.0.9|0|256')).toBe(true);
+  });
+
+  it('enforces the global ceiling', () => {
+    const cache: TemplateCache = new Map();
+    const n = Math.ceil(MAX_TEMPLATES_TOTAL / MAX_TEMPLATES_PER_EXPORTER) + 5;
+    for (let e = 0; e < n; e++) {
+      for (let b = 0; b < 2; b++) {
+        const sets: Buffer[] = [];
+        for (let t = 256 + b * 128; t < 256 + (b + 1) * 128; t++) sets.push(tmpl(t));
+        decodePacket(v9Packet(0, sets), `10.1.${e >> 8}.${e & 255}`, cache);
+      }
+    }
+    expect(cache.size).toBeLessThanOrEqual(MAX_TEMPLATES_TOTAL);
   });
 });
 
