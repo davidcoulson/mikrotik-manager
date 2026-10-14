@@ -50,7 +50,9 @@ export default function CommandsPage() {
   const [waveSize, setWaveSize] = useState(1);
   const [haltOnFailure, setHaltOnFailure] = useState(true);
   const [useGuard, setUseGuard] = useState(true);
-  const [acknowledged, setAcknowledged] = useState(false);
+  // The acknowledgement is tied to what it was given for: changing the command,
+  // the targets, the wave size or the guard toggle makes it stale (frontend review M1).
+  const [ackFor, setAckFor] = useState<string | null>(null);
   const canWrite = useCanWrite();
   const [openRun, setOpenRun] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
@@ -78,6 +80,10 @@ export default function CommandsPage() {
     queryFn: () => commandsApi.preview(command, selected, waveSize).then(r => r.data),
     enabled: command.trim().length > 0 && selected.length > 0,
   });
+
+  const ackFingerprint = JSON.stringify([command, [...selected].sort((a, b) => a - b), waveSize, useGuard]);
+  const acknowledged = ackFor === ackFingerprint;
+  const setAcknowledged = (v: boolean) => setAckFor(v ? ackFingerprint : null);
 
   const startRun = useMutation({
     meta: { inlineError: true },
