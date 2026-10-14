@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import morgan from 'morgan';
 import { createServer } from 'http';
+import { createShutdown } from './utils/shutdown';
 import { Server as SocketServer } from 'socket.io';
 import { Client as SshClient } from 'ssh2';
 import { resolveAuth, type SshExecDevice } from './services/sshExec';
@@ -563,16 +564,16 @@ async function start(): Promise<void> {
   void startProxyBackfillsInBackground();
 
   // Graceful shutdown
-  const shutdown = async () => {
-    console.log('Shutting down...');
-    await stopBulkAddWorker();
-    await stopSshKeyFleetWorker();
-    await netflowCollector.stop();
-    await pollerService.stop();
-    await redis.quit().catch(() => {});
-    await pool.end();
-    process.exit(0);
-  };
+  const shutdown = createShutdown([
+    { name: 'log', run: () => console.log('Shutting down...') },
+    { name: 'http', run: () => { httpServer.close(); httpServer.closeIdleConnections?.(); } },
+    { name: 'bulk-add worker', run: () => stopBulkAddWorker() },
+    { name: 'ssh-key worker', run: () => stopSshKeyFleetWorker() },
+    { name: 'netflow', run: () => netflowCollector.stop() },
+    { name: 'poller', run: () => pollerService.stop() },
+    { name: 'redis', run: () => redis.quit().catch(() => {}) },
+    { name: 'database', run: () => pool.end() },
+  ]);
 
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
