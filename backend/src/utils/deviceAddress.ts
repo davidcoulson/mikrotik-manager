@@ -8,6 +8,7 @@
 // device address, shared by device creation/update and the frontend forms.
 
 import { isIPv4, isIPv6 } from 'net';
+import { embeddedIPv4 } from './ipv6Embedded';
 
 // RFC 1123 hostname/FQDN: labels of 1-63 chars, alphanumeric with internal
 // hyphens, dot-separated, 253 chars overall. Matches the pattern already
@@ -101,9 +102,9 @@ export function isBlockedAddress(ip: string): boolean {
   if (isIPv6(ip)) {
     const lower = ip.toLowerCase();
     if (lower === '::1' || lower === '::') return true;
-    // IPv4-mapped (::ffff:1.2.3.4) — validate the embedded IPv4
-    const mapped = lower.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    if (mapped) return isBlockedAddress(mapped[1]);
+    // IPv4-mapped/compatible/NAT64 (any textual form) — validate the embedded IPv4
+    const embedded = embeddedIPv4(lower);
+    if (embedded) return isBlockedAddress(embedded);
     const head = lower.split(':')[0];
     if (head.startsWith('fe8') || head.startsWith('fe9') || head.startsWith('fea') || head.startsWith('feb')) return true; // fe80::/10
     if (head.startsWith('fc') || head.startsWith('fd')) return true; // fc00::/7 unique-local
