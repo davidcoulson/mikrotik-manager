@@ -1,0 +1,109 @@
+import { analyzeChange } from '../analyzeChange';
+import { resolveManagementPath, routeFor, type DeviceSnapshot } from '../pathModel';
+import type { GuardDevice } from '../ChangeGuard';
+
+const device: GuardDevice = {
+  id: 1, name: 'crs510', ip_address: '10.9.0.2', api_port: 8728,
+  api_username: 'admin', api_password_encrypted: 'x',
+};
+
+/** Management address on vlan-mgmt, which sits in VRF "mgmt"; the manager is off-subnet. */
+function vrfSnapshot(over: Partial<DeviceSnapshot> = {}): DeviceSnapshot {
+  return {
+    addresses: [{ '.id': '*1', address: '10.9.0.2/24', interface: 'vlan-mgmt', disabled: 'false' }],
+    interfaces: [
+      { name: 'bridge', type: 'bridge' },
+      { name: 'vlan-mgmt', type: 'vlan' },
+      { name: 'sfp28-1', type: 'ether' },
+    ],
+    vlanInterfaces: [{ name: 'vlan-mgmt', 'vlan-id': '90', interface: 'bridge' }],
+    bridges: [{ name: 'bridge', 'vlan-filtering': 'true', pvid: '1' }],
+    bridgePorts: [{ interface: 'sfp28-1', bridge: 'bridge', pvid: '1' }],
+    bridgeVlans: [
+      { bridge: 'bridge', 'vlan-ids': '90', tagged: 'bridge,sfp28-1', untagged: '',
+        'current-tagged': 'bridge,sfp28-1', 'current-untagged': '' },
+    ],
+    bonds: [],
+    routes: [
+      { '.id': '*M', 'dst-address': '0.0.0.0/0', gateway: '172.16.0.1', 'routing-table': 'main', active: 'true' },
+      { '.id': '*V', 'dst-address': '0.0.0.0/0', gateway: '10.9.0.1', 'routing-table': 'mgmt', active: 'true' },
+      { '.id': '*C', 'dst-address': '10.9.0.0/24', gateway: 'vlan-mgmt', 'routing-table': 'mgmt', active: 'true' },
+    ],
+    arp: [{ address: '10.9.0.1', 'mac-address': 'AA:BB:CC:00:00:01', interface: 'vlan-mgmt' }],
+    bridgeHosts: [{ 'mac-address': 'AA:BB:CC:00:00:01', 'on-interface': 'sfp28-1', vid: '90', local: 'false' }],
+    services: [{ '.id': '*1', name: 'api', port: '8728', vrf: 'mgmt', disabled: 'false' }],
+    vrfs: [{ name: 'mgmt', interfaces: 'vlan-mgmt' }],
+    vrfsRead: true,
+    firewallFilter: [],
+    mgmtConnections: [],
+    ...over,
+  };
+}
+
+describe('management routing table', () => {
+  it('resolves the table from the API service vrf', () => {
+    const p = resolveManagementPath(vrfSnapshot(), device);
+    expect(p.mgmtTable).toBe('mgmt');
+    expect(p.mgmtTableCertain).toBe(true);
+    expect(p.managerGateway).toBe('10.9.0.1');
+  });
+
+  it('falls back to the interface VRF when the service vrf is the default', () => {
+    const snap = vrfSnapshot({ services: [{ '.id': '*1', name: 'api', port: '8728', disabled: 'false' }] });
+    expect(resolveManagementPath(snap, device).mgmtTable).toBe('mgmt');
+  });
+
+  it('is unconfirmed when /ip/vrf could not be read', () => {
+    const p = resolveManagementPath(vrfSnapshot({ vrfs: [], vrfsRead: false }), device);
+    expect(p.mgmtTable).toBe('mgmt');
+    expect(p.mgmtTableCertain).toBe(false);
+  });
+
+  it('routeFor only considers the requested table', () => {
+    const snap = vrfSnapshot();
+    expect(routeFor(snap, '8.8.8.8', 'mgmt')?.['.id']).toBe('*V');
+    expect(routeFor(snap, '8.8.8.8')?.['.id']).toBe('*M');
+  });
+});
+
+describe('Change Guard with a management VRF', () => {
+  it('removing the main-table default route does not affect management', () => {
+    const v = analyzeChange(vrfSnapshot(), device, { kind: 'route.remove', routeId: '*M' });
+    expect(v.severity).toBe('safe');
+  });
+
+  it('removing the VRF default route is critical', () => {
+    const v = analyzeChange(vrfSnapshot(), device, { kind: 'route.remove', routeId: '*V' });
+    expect(v.severity).toBe('critical');
+  });
+
+  it('a route added in another table does not count as re-pointing management', () => {
+    const v = analyzeChange(vrfSnapshot(), device, {
+      kind: 'route.add', dstAddress: '0.0.0.0/0', gateway: '172.16.0.99', distance: 1, table: 'main',
+    });
+    expect(v.severity).toBe('safe');
+  });
+
+  it('a lower-distance default route added to the management table is flagged', () => {
+    const v = analyzeChange(vrfSnapshot(), device, {
+      kind: 'route.add', dstAddress: '0.0.0.0/0', gateway: '10.9.0.77', distance: 1, table: 'mgmt',
+    });
+    expect(v.severity).not.toBe('safe');
+  });
+});
+
+describe('main-table device is unchanged', () => {
+  const mainSnap = (): DeviceSnapshot => vrfSnapshot({
+    routes: [
+      { '.id': '*A', 'dst-address': '0.0.0.0/0', gateway: '10.9.0.1', active: 'true' },
+      { '.id': '*C', 'dst-address': '10.9.0.0/24', gateway: 'vlan-mgmt', active: 'true' },
+    ],
+    services: [{ '.id': '*1', name: 'api', port: '8728', disabled: 'false' }],
+    vrfs: [],
+  });
+
+  it('uses main and flags default route removal', () => {
+    expect(resolveManagementPath(mainSnap(), device).mgmtTable).toBe('main');
+    expect(analyzeChange(mainSnap(), device, { kind: 'route.remove', routeId: '*A' }).severity).toBe('critical');
+  });
+});

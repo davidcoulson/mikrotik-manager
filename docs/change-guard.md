@@ -203,7 +203,10 @@ What the model follows:
   port whose PVID is that VLAN (tagged at the CPU, untagged on the wire);
 - a bond holding the address, under its VLAN interface, or as the ingress port;
 - the route back to an off-subnet manager, whether that is the default route or a more
-  specific one;
+  specific one, looked up in the routing table (VRF) the management session actually
+  uses: the API service's `vrf`, or the VRF its interface is in, else `main`. A route in
+  any other table is not treated as affecting management, and if the table can't be
+  confirmed (for example `/ip/vrf` is unreadable) the check reports uncertain;
 - the API service and the input firewall chain.
 
 A failed read during the check is never taken as "nothing there": the check fails, and the
