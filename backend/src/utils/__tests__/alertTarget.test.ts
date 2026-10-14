@@ -13,6 +13,23 @@ describe('alert channel targets', () => {
     }
   });
 
+  it('refuses loopback/metadata reached through IPv4-mapped, compatible and NAT64 IPv6 forms', async () => {
+    const forms = [
+      '::ffff:7f00:1', '::ffff:7f00:0001', '0:0:0:0:0:ffff:7f00:1', '::ffff:a9fe:a9fe', '::FFFF:127.0.0.1',
+      '::7f00:1', '::127.0.0.1', '64:ff9b::7f00:1', '64:ff9b::169.254.169.254', '::ffff:0:0',
+    ];
+    for (const ip of forms) expect(isInternalOnlyAddress(ip)).toBe(true);
+    // what WHATWG URL produces for http://[::ffff:127.0.0.1]/
+    const host = new URL('http://[::ffff:127.0.0.1]/').hostname;
+    await expect(resolveAlertTarget(host)).rejects.toThrow(/inside the manager/);
+  });
+
+  it('still allows a mapped LAN or public address', () => {
+    for (const ip of ['::ffff:c0a8:114', '::ffff:192.168.1.20', '::ffff:cb00:709']) {
+      expect(isInternalOnlyAddress(ip)).toBe(false);
+    }
+  });
+
   it("refuses this stack's own services by name", async () => {
     for (const host of ['influxdb', 'postgres', 'redis', 'backend', 'localhost', 'x.localhost']) {
       await expect(resolveAlertTarget(host)).rejects.toThrow(/inside the manager/);
