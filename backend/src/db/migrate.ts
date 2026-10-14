@@ -1242,6 +1242,9 @@ CREATE INDEX IF NOT EXISTS idx_user_site_roles_site ON user_site_roles(site_id);
 -- TOTP setup in progress (outside review S1): the new secret waits here until a
 -- code from it is confirmed, so the active one keeps working meanwhile.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret VARCHAR(64);
+-- Seeds are now stored encrypted (iv:tag:ciphertext is longer than 64).
+ALTER TABLE users ALTER COLUMN totp_secret TYPE TEXT;
+ALTER TABLE users ALTER COLUMN totp_pending_secret TYPE TEXT;
 
 -- One record per serial number (outside review C3). Skipped, with a notice,
 -- if duplicates already exist, so startup never fails on old data; the
