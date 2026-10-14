@@ -107,3 +107,32 @@ describe('main-table device is unchanged', () => {
     expect(analyzeChange(mainSnap(), device, { kind: 'route.remove', routeId: '*A' }).severity).toBe('critical');
   });
 });
+
+// Rows as the live CRS510 (RouterOS 7.24.5) returned them: a "mgmt" table and VRF
+// interface exist, but the routes sit in `main` with vrf-interface set, and the
+// API services are bound to vrf=main.
+describe('live CRS510 shape', () => {
+  const live = (): DeviceSnapshot => ({
+    addresses: [{ '.id': '*1', address: '10.2.0.9/24', interface: 'ether1', disabled: 'false' }],
+    interfaces: [{ name: 'ether1', type: 'ether' }, { name: 'mgmt', type: 'vrf' }],
+    vlanInterfaces: [], bridges: [{ name: 'bridge' }], bridgePorts: [], bridgeVlans: [], bonds: [],
+    routes: [
+      { '.id': '*D', 'dst-address': '0.0.0.0/0', gateway: '10.2.0.1', 'routing-table': 'main', 'vrf-interface': 'ether1', distance: '1', active: 'true', dynamic: 'true' },
+      { '.id': '*C', 'dst-address': '10.2.0.0/24', gateway: 'ether1', 'routing-table': 'main', distance: '0', active: 'true', dynamic: 'true' },
+    ],
+    arp: [{ address: '10.2.0.1', 'mac-address': 'AA:BB:CC:00:00:02', interface: 'ether1' }],
+    bridgeHosts: [],
+    services: [{ '.id': '*8', name: 'api-ssl', port: '8729', vrf: 'main', disabled: 'false' }],
+    vrfs: [], vrfsRead: false,
+    firewallFilter: [], mgmtConnections: [],
+  });
+  const dev: GuardDevice = { ...device, ip_address: '10.2.0.9', api_port: 8729 };
+
+  it('resolves to main and keeps default-route removal critical', () => {
+    const p = resolveManagementPath(live(), dev);
+    expect(p.mgmtTable).toBe('main');
+    expect(p.mgmtTableCertain).toBe(true);
+    expect(p.managerGateway).toBe('10.2.0.1');
+    expect(analyzeChange(live(), dev, { kind: 'route.remove', routeId: '*D' }).severity).toBe('critical');
+  });
+});
