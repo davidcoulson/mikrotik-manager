@@ -92,3 +92,21 @@ describe('cronMatches — the #117 bug', () => {
     expect(cronMatches('30 9 * * *', AT)).toBe(true);
   });
 });
+
+describe('matchField range with a step', () => {
+  it('matches a-b/n inside the range on the step only', () => {
+    expect(matchField('0-30/5', 0)).toBe(true);
+    expect(matchField('0-30/5', 15)).toBe(true);
+    expect(matchField('0-30/5', 30)).toBe(true);
+    expect(matchField('0-30/5', 35)).toBe(false);
+    expect(matchField('0-30/5', 7)).toBe(false);
+    expect(matchField('10-20/4', 14)).toBe(true);
+    expect(matchField('10-20/4', 12)).toBe(false);
+  });
+  it('still handles */n, a/n and lists mixing them', () => {
+    expect(matchField('*/15', 45)).toBe(true);
+    expect(matchField('5/10', 25)).toBe(true);
+    expect(matchField('1,20-40/10', 30)).toBe(true);
+    expect(matchField('x-y/5', 5)).toBe(false);
+  });
+});

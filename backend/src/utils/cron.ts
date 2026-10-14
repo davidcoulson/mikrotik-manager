@@ -55,10 +55,18 @@ export function matchField(field: string, val: number): boolean {
   return field.split(',').some((f) => {
     if (f.includes('/')) {
       const [base, step] = f.split('/');
-      const start = base === '*' ? 0 : Number(base);
       const by = Number(step);
       if (!Number.isFinite(by) || by <= 0) return false;
-      return val >= start && (val - start) % by === 0;
+      // `*/n`, `a/n` (a to the end) and `a-b/n`.
+      let start = 0;
+      let end = Infinity;
+      if (base !== '*') {
+        const range = base.split('-');
+        if (range.length === 2) { start = Number(range[0]); end = Number(range[1]); }
+        else start = Number(base);
+      }
+      if (Number.isNaN(start) || Number.isNaN(end)) return false;
+      return val >= start && val <= end && (val - start) % by === 0;
     }
     if (f.includes('-')) {
       const [lo, hi] = f.split('-').map(Number);
