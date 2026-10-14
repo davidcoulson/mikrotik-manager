@@ -313,20 +313,21 @@ export default function CopyVlanModal({
 
   // ── Mutation ───────────────────────────────────────────────────────────────
 
+  type VlanOp = Parameters<typeof devicesApi.copyVlans>[1];
+  const buildOps = (): VlanOp => toApply.map((op) => ({
+    action: op.status === 'add' ? 'add' : 'update',
+    vlan_id: op.sourceVlan.vlan_id,
+    bridge: op.targetBridge,
+    tagged_ports: op.effectiveTagged,
+    untagged_ports: op.effectiveUntagged,
+  }));
+
+  // The change set is fixed when "Apply" is pressed and travels with the
+  // request, so the lockout retry sends exactly what the verdict described.
   const applyMutation = useMutation({
     meta: { inlineError: true },
-    mutationFn: (confirm: boolean) =>
-      devicesApi.copyVlans(
-        deviceId,
-        toApply.map((op) => ({
-          action: op.status === 'add' ? 'add' : 'update',
-          vlan_id: op.sourceVlan.vlan_id,
-          bridge: op.targetBridge,
-          tagged_ports: op.effectiveTagged,
-          untagged_ports: op.effectiveUntagged,
-        })),
-        confirm,
-      ),
+    mutationFn: ({ ops, confirm }: { ops: VlanOp; confirm: boolean }) =>
+      devicesApi.copyVlans(deviceId, ops, confirm),
     onSuccess: (res) => {
       // No results when contact was lost and the device restored itself.
       setApplyResults(res.data.results ?? []);
@@ -334,9 +335,12 @@ export default function CopyVlanModal({
       queryClient.invalidateQueries({ queryKey: ['vlans', deviceId] });
     },
   });
-  const apply = () => applyMutation.mutate(false, {
-    onError: guard.onError(() => applyMutation.mutate(true), () => { /* shown below */ }),
-  });
+  const apply = () => {
+    const ops = buildOps();
+    applyMutation.mutate({ ops, confirm: false }, {
+      onError: guard.onError(() => applyMutation.mutate({ ops, confirm: true }), () => { /* shown below */ }),
+    });
+  };
 
   // ── Toggle helpers ─────────────────────────────────────────────────────────
 
