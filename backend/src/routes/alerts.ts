@@ -87,6 +87,12 @@ router.get('/rules', async (_req, res) => {
 router.put('/rules/:type', requireWrite, async (req, res) => {
   const { type } = req.params;
   const { enabled, threshold, cooldown_min } = req.body;
+  if (cooldown_min !== undefined) {
+    const n = typeof cooldown_min === 'number' || (typeof cooldown_min === 'string' && cooldown_min.trim() !== '') ? Number(cooldown_min) : NaN;
+    if (!Number.isInteger(n) || n < 0 || n > 10080) {
+      return res.status(400).json({ error: 'cooldown_min must be a whole number of minutes from 0 to 10080' });
+    }
+  }
 
   const row = await alertService.upsertRule(type, {
     enabled:     enabled     !== undefined ? Boolean(enabled)         : undefined,
