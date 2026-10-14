@@ -1,4 +1,4 @@
-import { AMBIGUOUS, buildAttributionMaps, canonicalIp, isLocalAddress, matchClient, type DeviceRow, type ClientRow } from '../attribution';
+import { AMBIGUOUS, buildAttributionMaps, canonicalIp, isLocalAddress, macFromEui64, matchClient, type DeviceRow, type ClientRow } from '../attribution';
 
 // Outside review P2-23 / J4: two customers on the RouterOS default subnet.
 const devices: DeviceRow[] = [
@@ -58,9 +58,9 @@ describe('buildAttributionMaps / matchClient', () => {
 });
 
 describe('isLocalAddress', () => {
-  it.each(['10.1.2.3', '172.20.0.1', '192.168.65.1', '127.0.0.1', '100.64.0.1', '169.254.1.1', 'fd00::1', '::1', '::ffff:192.168.1.5'])(
+  it.each(['10.1.2.3', '172.20.0.1', '192.168.65.1', '127.0.0.1', '100.64.0.1', '169.254.1.1', 'fd00::1', '::1', '::ffff:192.168.1.5', 'fe80::1', 'febf::1', 'fe9a::2'])(
     '%s is local', (ip) => expect(isLocalAddress(ip)).toBe(true));
-  it.each(['8.8.8.8', '172.32.0.1', '203.0.113.9', '2001:db8::1', '::ffff:8.8.8.8'])(
+  it.each(['8.8.8.8', '172.32.0.1', '203.0.113.9', '2001:db8::1', '::ffff:8.8.8.8', 'fec0::1', 'fe7f::1'])(
     '%s is not', (ip) => expect(isLocalAddress(ip)).toBe(false));
 });
 
