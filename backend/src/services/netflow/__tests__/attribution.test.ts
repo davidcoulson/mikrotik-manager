@@ -1,4 +1,4 @@
-import { AMBIGUOUS, buildAttributionMaps, canonicalIp, isLocalAddress, matchClient, type DeviceRow, type ClientRow } from '../attribution';
+import { AMBIGUOUS, buildAttributionMaps, canonicalIp, isLocalAddress, macFromEui64, matchClient, type DeviceRow, type ClientRow } from '../attribution';
 
 // Outside review P2-23 / J4: two customers on the RouterOS default subnet.
 const devices: DeviceRow[] = [
@@ -58,9 +58,9 @@ describe('buildAttributionMaps / matchClient', () => {
 });
 
 describe('isLocalAddress', () => {
-  it.each(['10.1.2.3', '172.20.0.1', '192.168.65.1', '127.0.0.1', '100.64.0.1', '169.254.1.1', 'fd00::1', '::1', '::ffff:192.168.1.5'])(
+  it.each(['10.1.2.3', '172.20.0.1', '192.168.65.1', '127.0.0.1', '100.64.0.1', '169.254.1.1', 'fd00::1', '::1', '::ffff:192.168.1.5', 'fe80::1', 'febf::1', 'fe9a::2'])(
     '%s is local', (ip) => expect(isLocalAddress(ip)).toBe(true));
-  it.each(['8.8.8.8', '172.32.0.1', '203.0.113.9', '2001:db8::1', '::ffff:8.8.8.8'])(
+  it.each(['8.8.8.8', '172.32.0.1', '203.0.113.9', '2001:db8::1', '::ffff:8.8.8.8', 'fec0::1', 'fe7f::1'])(
     '%s is not', (ip) => expect(isLocalAddress(ip)).toBe(false));
 });
 
@@ -89,3 +89,21 @@ describe('canonicalIp (#233)', () => {
   });
 });
 
+
+describe('native IPv6 attribution (EUI-64)', () => {
+  it('derives the MAC from a modified EUI-64 address', () => {
+    expect(macFromEui64('2001:db8::a8aa:aaff:fe00:1')).toBe('aa:aa:aa:00:00:01');
+    expect(macFromEui64('2001:db8::1')).toBeNull();
+    expect(macFromEui64('192.168.1.1')).toBeNull();
+  });
+
+  it('attributes a flow endpoint to the site client whose MAC is embedded', () => {
+    const maps = buildAttributionMaps(devices, clients);
+    const hq = maps.exporterByIp.get('10.0.0.1');
+    const m = matchClient(maps, hq as never, '2001:db8:1::a8aa:aaff:fe00:2');
+    expect(m).toEqual({ mac: 'aa:aa:aa:00:00:02', siteId: 1 });
+    // Same MAC does not leak across sites
+    const cust = maps.exporterByIp.get('172.16.5.1');
+    expect(matchClient(maps, cust as never, '2001:db8:1::a8aa:aaff:fe00:2').mac).toBeUndefined();
+  });
+});
