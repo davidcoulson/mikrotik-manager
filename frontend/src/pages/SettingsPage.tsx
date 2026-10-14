@@ -2145,6 +2145,10 @@ export default function SettingsPage() {
                     <input type="checkbox" id="smtp_secure" checked={!!(chForm.config['smtp_secure'])} onChange={(e) => setCfg('smtp_secure', e.target.checked)} className="rounded" />
                     <label htmlFor="smtp_secure" className="text-xs text-gray-600 dark:text-slate-400">Use TLS/SSL (port 465)</label>
                   </div>
+                  <div className="flex items-center gap-2">
+                    <input type="checkbox" id="smtp_allow_self_signed" checked={!!(chForm.config['smtp_allow_self_signed'])} onChange={(e) => setCfg('smtp_allow_self_signed', e.target.checked)} className="rounded" />
+                    <label htmlFor="smtp_allow_self_signed" className="text-xs text-gray-600 dark:text-slate-400">Accept a self-signed or untrusted server certificate (not recommended)</label>
+                  </div>
                 </>
               )}
 
