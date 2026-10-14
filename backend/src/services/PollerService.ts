@@ -961,12 +961,26 @@ export class PollerService {
   private async pruneProxyConnections(settings: Record<string, unknown>): Promise<void> {
     const days = Number(settings['retention_proxy_days'] ?? 30);
     if (!Number.isFinite(days) || days <= 0) return;
-    const deleted = await query<{ id: number }>(
-      `DELETE FROM proxy_connections WHERE event_time < NOW() - ($1 || ' days')::interval RETURNING id`,
-      [String(days)]
-    );
-    if (deleted.length > 0) {
-      console.log(`[Poller] Pruned ${deleted.length} proxy connections older than ${days} days`);
+    // Batched with a bounded loop (like the event prune): one statement over a
+    // large backlog held locks and pulled every id into memory.
+    const BATCH = 20_000;
+    let total = 0;
+    for (let i = 0; i < 50; i++) {
+      const res = await query<{ n: number }>(
+        `WITH gone AS (
+           DELETE FROM proxy_connections
+            WHERE id IN (SELECT id FROM proxy_connections
+                          WHERE event_time < NOW() - ($1 || ' days')::interval LIMIT ${BATCH})
+           RETURNING 1
+         ) SELECT COUNT(*)::int AS n FROM gone`,
+        [String(days)]
+      );
+      const n = res[0]?.n ?? 0;
+      total += n;
+      if (n < BATCH) break;
+    }
+    if (total > 0) {
+      console.log(`[Poller] Pruned ${total} proxy connections older than ${days} days`);
     }
     await query(`DELETE FROM proxy_sources WHERE last_seen < NOW() - ($1 || ' days')::interval`, [String(days)]);
     await query(`DELETE FROM proxy_usage_hourly WHERE bucket < NOW() - ($1 || ' days')::interval`, [String(days)]);
@@ -974,7 +988,9 @@ export class PollerService {
 
   private async pruneStaleClients(settings: Record<string, unknown>): Promise<void> {
     // Delete inactive clients not seen for longer than the configured retention period.
-    // Default: 7 days. Preserves any client that was active within the window so
+    // Default: 7 days. Rows carrying user-entered data (custom name, comment,
+    // category) are kept; the volatile state stays and the client reconnects onto it.
+    // Preserves any client that was active within the window so
     // short-lived or intermittent devices aren't wiped prematurely.
     const retentionDays = (settings['retention_clients_days'] as number) || 7;
     const result = await query<{ count: string }>(
@@ -982,6 +998,9 @@ export class PollerService {
          DELETE FROM clients
          WHERE active = FALSE
            AND last_seen < NOW() - ($1 || ' days')::interval
+           AND COALESCE(custom_name, '') = ''
+           AND COALESCE(comment, '') = ''
+           AND COALESCE(custom_category, '') = ''
          RETURNING 1
        )
        SELECT COUNT(*) AS count FROM deleted`,
@@ -1004,6 +1023,9 @@ export class PollerService {
          DELETE FROM clients
          WHERE active = FALSE
            AND last_seen < NOW() - ($1 || ' days')::interval
+           AND COALESCE(custom_name, '') = ''
+           AND COALESCE(comment, '') = ''
+           AND COALESCE(custom_category, '') = ''
          RETURNING 1
        )
        SELECT COUNT(*) AS count FROM deleted`,
