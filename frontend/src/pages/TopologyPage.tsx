@@ -22,6 +22,7 @@ import { topologyApi } from '../services/api';
 import type { TopologyDevice, TopologyNode, HandLinkEnd } from '../types';
 import clsx from 'clsx';
 import { useThemeStore } from '../store/themeStore';
+import { useSiteStore } from '../store/siteStore';
 import { buildTopologyGraph, endFor, type GraphEdge, type StpUpstream } from '../utils/topologyGraph';
 import type { BridgeInfo } from '../utils/stpRoot';
 import type { Side } from '../utils/topologyGeometry';
@@ -196,7 +197,13 @@ export default function TopologyPage() {
 
   const linkMutation = useMutation({
     mutationFn: async (c: { a: HandLinkEnd; b: HandLinkEnd }) => {
+      // X-Site-Id is read at send time, so a site switch while the arrangement
+      // saves would land the link in the new site: stop instead (review L1).
+      const siteAtStart = useSiteStore.getState().currentSiteId;
       await saveArrangement();
+      if (useSiteStore.getState().currentSiteId !== siteAtStart) {
+        throw new Error('The site changed before the link was created');
+      }
       return topologyApi.createHandLink(c.a, c.b);
     },
     onSuccess: () => { setLinkError(''); invalidate(); },
