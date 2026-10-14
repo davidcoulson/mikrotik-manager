@@ -15,6 +15,7 @@ import { SEALED_PREFIX, isSealed, seal, sealedCiphertext } from '../utils/sealed
 import * as fs from 'fs';
 import { query } from '../config/database';
 import { encrypt, decrypt, ciphertextKeyState } from '../utils/crypto';
+import { isEncryptedTotpSecret } from '../utils/totpSecret';
 
 export interface LocationStatus {
   location: string;
@@ -31,6 +32,8 @@ const COLUMNS: Array<{ table: string; id: string; column: string; label: string 
   { table: 'credential_presets', id: 'id', column: 'api_password_encrypted', label: 'Credential preset API passwords' },
   { table: 'credential_presets', id: 'id', column: 'ssh_password_encrypted', label: 'Credential preset SSH passwords' },
   { table: 'device_ssh_keys', id: 'device_id', column: 'private_key_encrypted', label: 'Device SSH private keys' },
+  { table: 'users', id: 'id', column: 'totp_secret', label: 'Two-factor seeds' },
+  { table: 'users', id: 'id', column: 'totp_pending_secret', label: 'Two-factor seeds (pending setup)' },
 ];
 
 const OIDC_KEY = 'oidc_config';
@@ -39,7 +42,10 @@ type Row = { id: number; value: string };
 
 async function columnRows(c: (typeof COLUMNS)[number]): Promise<Row[]> {
   // Identifiers come from the fixed list above, never from a request.
-  return query<Row>(`SELECT ${c.id} AS id, ${c.column} AS value FROM ${c.table} WHERE ${c.column} IS NOT NULL AND ${c.column} <> ''`);
+  const rows = await query<Row>(`SELECT ${c.id} AS id, ${c.column} AS value FROM ${c.table} WHERE ${c.column} IS NOT NULL AND ${c.column} <> ''`);
+  // A legacy plaintext TOTP seed is not ciphertext; sealPlaintextSecrets
+  // encrypts it at startup, so it is neither "old" nor "unreadable".
+  return c.table === 'users' ? rows.filter((r) => isEncryptedTotpSecret(r.value)) : rows;
 }
 
 async function oidcSecret(): Promise<{ config: Record<string, unknown>; value: string } | null> {
@@ -85,6 +91,15 @@ export async function sealPlaintextSecrets(): Promise<number> {
     if (isSealed(w.secret)) continue;
     await query(`UPDATE webhooks SET secret = $1 WHERE id = $2`, [seal(w.secret), w.id]);
     sealed++;
+  }
+  for (const col of ['totp_secret', 'totp_pending_secret']) {
+    // Identifiers are the fixed pair above.
+    const rows = await query<Row>(`SELECT id, ${col} AS value FROM users WHERE ${col} IS NOT NULL AND ${col} <> ''`);
+    for (const r of rows) {
+      if (isEncryptedTotpSecret(r.value)) continue;
+      await query(`UPDATE users SET ${col} = $1 WHERE id = $2 AND ${col} = $3`, [encrypt(r.value), r.id, r.value]);
+      sealed++;
+    }
   }
   if (sealed > 0) console.log(`[secrets] encrypted ${sealed} alert channel / webhook secret(s) that were stored in plaintext`);
   return sealed;

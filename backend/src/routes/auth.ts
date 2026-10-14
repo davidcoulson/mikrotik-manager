@@ -10,6 +10,7 @@ import { loginRateLimit, rateLimitRedis } from '../middleware/rateLimitRedis';
 import { validatePassword } from '../utils/passwordPolicy';
 import { sessionResponse } from '../utils/sessionResponse';
 import { passwordLoginEnabled } from '../utils/passwordLogin';
+import { sealTotpSecret, openTotpSecret } from '../utils/totpSecret';
 
 const router = Router();
 
@@ -118,7 +119,7 @@ router.post('/totp/verify', rateLimitRedis({ windowSec: 60, max: 5, keyPrefix: '
     return res.status(401).json({ error: 'TOTP not configured' });
   }
 
-  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(user.totp_secret), digits: 6, period: 30 });
+  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(openTotpSecret(user.totp_secret)), digits: 6, period: 30 });
   const delta = totp.validate({ token: code.replace(/\s/g, ''), window: 1 });
   if (delta === null) {
     return res.status(401).json({ error: 'Invalid TOTP code' });
@@ -159,7 +160,7 @@ router.post('/totp/setup', requireAuth, async (req: Request, res: Response) => {
   // Held as pending until a code from it is confirmed (outside review S1).
   // Writing it over totp_secret replaced a working authenticator the moment
   // setup was started, so an abandoned re-setup locked the user out.
-  await query(`UPDATE users SET totp_pending_secret = $1 WHERE id = $2`, [secret.base32, req.user!.userId]);
+  await query(`UPDATE users SET totp_pending_secret = $1 WHERE id = $2`, [sealTotpSecret(secret.base32), req.user!.userId]);
   return res.json({ secret: secret.base32, uri, qr: qrDataUrl });
 });
 
@@ -179,7 +180,7 @@ router.post('/totp/confirm', requireAuth, async (req: Request, res: Response) =>
   );
   if (!user?.totp_pending_secret) return res.status(400).json({ error: 'Run /totp/setup first' });
 
-  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(user.totp_pending_secret), digits: 6, period: 30 });
+  const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(openTotpSecret(user.totp_pending_secret)), digits: 6, period: 30 });
   const delta = totp.validate({ token: code.replace(/\s/g, ''), window: 1 });
   if (delta === null) return res.status(400).json({ error: 'Invalid code', code: 'credential_rejected' });
 
