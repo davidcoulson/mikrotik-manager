@@ -1,5 +1,6 @@
 jest.mock('../../config/database');
 jest.mock('nodemailer');
+import nodemailer from 'nodemailer';
 
 import { AlertService } from '../AlertService';
 import { query } from '../../config/database';
@@ -290,5 +291,51 @@ describe('sendNtfy', () => {
     const { service, calls } = capture();
     await asNtfy(service).sendNtfy({ topic: 'mt', token: 'tk_1' }, 'device_offline', 'x', {});
     expect(calls[0].headers).toEqual({ Authorization: 'Bearer tk_1' });
+  });
+});
+
+// ── M2 / M5 / L2 ─────────────────────────────────────────────────────────────
+
+describe('email delivery', () => {
+  const emailChannel = (config: Record<string, unknown>) => ({
+    id: 2, name: 'mail', type: 'email' as const, enabled: true,
+    config: { smtp_host: 'smtp.example.com', recipients: ['a@example.com'], ...config },
+  });
+  const run = async (config: Record<string, unknown>, ctx = {}) => {
+    const sendMail = jest.fn().mockResolvedValue(undefined);
+    const createTransport = jest.mocked(nodemailer.createTransport);
+    createTransport.mockReturnValue({ sendMail } as never);
+    const service = new AlertService();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (service as any).sendToChannel(emailChannel(config), 'device_offline', '<b>msg</b>', ctx);
+    return { sendMail, opts: createTransport.mock.calls[0][0] as { tls: { rejectUnauthorized: boolean } } };
+  };
+
+  it('verifies the server certificate by default', async () => {
+    expect((await run({})).opts.tls.rejectUnauthorized).toBe(true);
+  });
+  it('accepts self-signed relays only when the channel opts out', async () => {
+    expect((await run({ smtp_allow_self_signed: true })).opts.tls.rejectUnauthorized).toBe(false);
+  });
+  it('escapes message, device name and details', async () => {
+    const { sendMail } = await run({}, { deviceName: '<img src=x onerror=1>', details: '</pre><a href="//evil">go</a>' });
+    const html = sendMail.mock.calls[0][0].html as string;
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('<a href="//evil">');
+    expect(html).not.toContain('<b>msg</b>');
+    expect(html).toContain('&lt;img src=x onerror=1&gt;');
+  });
+});
+
+describe('cooldown only after delivery (L2)', () => {
+  it('lets the next alert through when every channel failed', async () => {
+    const service = new AlertService();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sendSpy = jest.spyOn(service as any, 'sendToChannel').mockRejectedValue(new Error('smtp down'));
+    for (let i = 0; i < 2; i++) {
+      mockedQuery.mockResolvedValueOnce([enabledRule]).mockResolvedValueOnce([slackChannel]).mockResolvedValueOnce([]);
+      await service.dispatch('device_offline', 'down', { cooldownKey: 'test-l2-fail' });
+    }
+    expect(sendSpy).toHaveBeenCalledTimes(2);
   });
 });
