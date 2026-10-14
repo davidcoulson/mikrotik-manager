@@ -9,6 +9,7 @@
 
 import { expandIpv6, embeddedIpv4, isUnspecifiedOrLoopback6 } from './ipv6';
 import { isIPv4, isIPv6 } from 'net';
+import { embeddedIPv4 } from './ipv6Embedded';
 
 // RFC 1123 hostname/FQDN: labels of 1-63 chars, alphanumeric with internal
 // hyphens, dot-separated, 253 chars overall. Matches the pattern already
