@@ -418,7 +418,7 @@ export function GuardedWriteUi({
       {state.lockout && (
         <LockoutVerdictDialog
           verdict={state.lockout.verdict}
-          confirmPhrase={deviceName || 'confirm'}
+          confirmPhrase={deviceName || `device-${deviceId}`}
           deviceId={deviceId}
           pending={pending}
           onConfirm={state.lockout.retry}
