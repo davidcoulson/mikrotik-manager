@@ -390,3 +390,16 @@ describe('an unmanaged neighbour heard through the network', () => {
     expect(drawnTo(g)).toEqual(['1:ether5']);
   });
 });
+
+describe('external node ids stay unique', () => {
+  it('does not merge neighbours whose keys differ only by punctuation', () => {
+    const graph = buildTopology([dev(1, 'alpha', '192.168.1.10')], [
+      link({ from_device_id: 1, from_interface: 'ether1', neighbor_identity: 'ap-1' }),
+      link({ from_device_id: 1, from_interface: 'ether2', neighbor_identity: 'ap1' }),
+    ], []);
+    const ext = graph.externalNodes.filter((n) => n.caps !== 'segment');
+    expect(ext.map((n) => n.name).sort()).toEqual(['ap-1', 'ap1']);
+    expect(new Set(ext.map((n) => n.id)).size).toBe(2);
+    for (const n of ext) expect(n.id).toMatch(/^ext-[a-z0-9]{1,150}$/i);
+  });
+});
