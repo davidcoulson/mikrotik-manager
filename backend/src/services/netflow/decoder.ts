@@ -48,14 +48,14 @@ export function pruneTemplateCache(
   const cutoff = now - ttlMs;
   for (const [key, tpl] of cache) {
     if (tpl.lastUsed < cutoff) {
-      cache.delete(key);
+      removeTemplate(cache, key);
       removed++;
     }
   }
   if (cache.size > max) {
     const byAge = [...cache.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed);
     for (let i = 0; i < byAge.length - max; i++) {
-      cache.delete(byAge[i][0]);
+      removeTemplate(cache, byAge[i][0]);
       removed++;
     }
   }
@@ -67,27 +67,44 @@ export function pruneTemplateCache(
 export const MAX_TEMPLATES_PER_EXPORTER = 256;
 export const MAX_TEMPLATES_TOTAL = 10_000;
 
-// Per-cache index of exporterKey -> template keys (tolerates stale entries
-// left behind by pruneTemplateCache; they are dropped lazily).
+// Per-cache index of exporterKey -> template keys. Every removal goes through
+// removeTemplate so the index can't outlive the cache entries it describes.
 const exporterIndex = new WeakMap<TemplateCache, Map<string, Set<string>>>();
+
+// Keys are `${exporterKey}|${sourceId}|${templateId}`.
+function exporterOf(key: string): string {
+  const last = key.lastIndexOf('|');
+  return key.slice(0, key.lastIndexOf('|', last - 1));
+}
+
+function removeTemplate(cache: TemplateCache, key: string): void {
+  cache.delete(key);
+  const idx = exporterIndex.get(cache);
+  if (!idx) return;
+  const exporterKey = exporterOf(key);
+  const keys = idx.get(exporterKey);
+  if (!keys) return;
+  keys.delete(key);
+  if (keys.size === 0) idx.delete(exporterKey);
+}
 
 function insertTemplate(cache: TemplateCache, exporterKey: string, key: string, tpl: Template): void {
   let idx = exporterIndex.get(cache);
   if (!idx) { idx = new Map(); exporterIndex.set(cache, idx); }
-  let keys = idx.get(exporterKey);
-  if (!keys) { keys = new Set(); idx.set(exporterKey, keys); }
   if (!cache.has(key)) {
-    if (keys.size >= MAX_TEMPLATES_PER_EXPORTER) {
-      for (const k of keys) if (!cache.has(k)) keys.delete(k);
-      // Still full: evict this exporter's oldest-inserted template (O(1)).
-      const oldest = keys.values().next().value;
-      if (oldest !== undefined) { cache.delete(oldest); keys.delete(oldest); }
+    const existing = idx.get(exporterKey);
+    if (existing && existing.size >= MAX_TEMPLATES_PER_EXPORTER) {
+      // Evict this exporter's oldest-inserted template (Set order, O(1)).
+      const oldest = existing.values().next().value;
+      if (oldest !== undefined) removeTemplate(cache, oldest);
     }
     if (cache.size >= MAX_TEMPLATES_TOTAL) {
       // Map iteration order is insertion order: drop the oldest-inserted entry.
       const first = cache.keys().next().value;
-      if (first !== undefined) cache.delete(first);
+      if (first !== undefined) removeTemplate(cache, first);
     }
+    let keys = idx.get(exporterKey);
+    if (!keys) { keys = new Set(); idx.set(exporterKey, keys); }
     keys.add(key);
   }
   cache.set(key, tpl);
