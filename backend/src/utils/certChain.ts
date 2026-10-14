@@ -26,7 +26,8 @@ export function validateCertificateBundle(certificate: string, privateKey: strin
     }
   }
   for (let i = 0; i + 1 < certs.length; i++) {
-    if (!certs[i].checkIssued(certs[i + 1])) {
+    // checkIssued compares issuer metadata only; verify() checks the signature itself.
+    if (!certs[i].checkIssued(certs[i + 1]) || !certs[i].verify(certs[i + 1].publicKey)) {
       return `Certificate ${i + 1} was not issued by certificate ${i + 2} — put the server certificate first, then its intermediates in order`;
     }
   }

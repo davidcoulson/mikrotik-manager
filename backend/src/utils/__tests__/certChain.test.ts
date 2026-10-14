@@ -32,6 +32,12 @@ describe('validateCertificateBundle', () => {
     expect(validateCertificateBundle(leaf + '-----BEGIN CERTIFICATE-----\nxx', leafKey)).toMatch(/not a valid certificate/);
     expect(validateCertificateBundle(leaf + otherCa, leafKey)).toMatch(/not issued by/);
   });
+  it('rejects a leaf whose signature does not verify against the issuer', () => {
+    const lines = leaf.trimEnd().split('\n');
+    const i = lines.length - 3; // inside the signature, clear of the padding line
+    lines[i] = (lines[i][0] === 'A' ? 'B' : 'A') + lines[i].slice(1);
+    expect(validateCertificateBundle(lines.join('\n') + '\n' + ca, leafKey)).toMatch(/not issued by/);
+  });
   it('rejects a key that does not match the leaf', () => {
     expect(validateCertificateBundle(leaf + ca, otherKey)).toMatch(/does not match/);
   });
