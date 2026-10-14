@@ -47,6 +47,18 @@ describe('app timezone scheduling (M6)', () => {
   });
 });
 
+describe('DST edge cases', () => {
+  it('lands after the gap for a time that does not exist', () => {
+    // 02:30 on 8 Mar 2026 does not exist in Los Angeles; daily from 7 Mar 02:30 PST.
+    const next = computeNextRun('daily', new Date('2026-03-07T10:30:00Z'), 'America/Los_Angeles');
+    expect(next.toISOString()).toBe('2026-03-08T10:30:00.000Z'); // 03:30 PDT
+  });
+  it('picks one instant for an ambiguous time', () => {
+    const next = computeNextRun('daily', new Date('2026-10-31T08:30:00Z'), 'America/Los_Angeles'); // 01:30 PDT
+    expect(next.toISOString()).toBe('2026-11-01T08:30:00.000Z'); // first 01:30 (PDT)
+  });
+});
+
 describe('report HTML escaping (M3)', () => {
   it('escapes client names that came from devices', async () => {
     const query = jest.mocked(mockedDbQuery);

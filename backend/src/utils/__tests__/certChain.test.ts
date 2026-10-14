@@ -28,11 +28,18 @@ describe('validateCertificateBundle', () => {
     const broken = leaf + '-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n';
     expect(validateCertificateBundle(broken, leafKey)).toMatch(/Certificate 2 of 2/);
   });
-  it('rejects stray data and an unrelated intermediate', () => {
-    expect(validateCertificateBundle(leaf + 'junk', leafKey)).toMatch(/not a PEM certificate block/);
+  it('rejects an unterminated block and an unrelated intermediate', () => {
+    expect(validateCertificateBundle(leaf + '-----BEGIN CERTIFICATE-----\nxx', leafKey)).toMatch(/not a valid certificate/);
     expect(validateCertificateBundle(leaf + otherCa, leafKey)).toMatch(/not issued by/);
   });
   it('rejects a key that does not match the leaf', () => {
     expect(validateCertificateBundle(leaf + ca, otherKey)).toMatch(/does not match/);
+  });
+});
+
+describe('validateCertificateBundle with OpenSSL annotations', () => {
+  it('ignores Bag Attributes and subject/issuer lines between blocks', () => {
+    const annotated = `Bag Attributes\n    localKeyID: 01\nsubject=CN = leaf.example\nissuer=CN = Test CA\n${leaf}Bag Attributes\n    friendlyName: ca\n${ca}`;
+    expect(validateCertificateBundle(annotated, leafKey)).toBeNull();
   });
 });
