@@ -48,6 +48,11 @@ export function initOuiDatabase(allowDownload = true): Promise<void> {
   return initPromise;
 }
 
+/** True once a vendor database (fresh or cached) is available to look up in. */
+export function ouiLoaded(): boolean {
+  return db !== null;
+}
+
 export function lookupVendor(mac: string): string {
   if (!db) return '';
   const oui = mac.replace(/[:\-.]/g, '').substring(0, 6).toUpperCase();
