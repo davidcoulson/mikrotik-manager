@@ -27,16 +27,25 @@ function wallClock(date: Date, timeZone: string): WallClock {
   return { y: Number(p.year), mo: Number(p.month), d: Number(p.day), h: Number(p.hour) % 24, mi: Number(p.minute), s: Number(p.second) };
 }
 
-/** The instant at which `timeZone` shows the given wall-clock time. */
+/**
+ * The instant at which `timeZone` shows the given wall-clock time. A time that
+ * does not exist (skipped by the spring-forward change) lands just after the gap.
+ */
 function instantFromWallClock(w: WallClock, timeZone: string): Date {
   const asUtc = Date.UTC(w.y, w.mo - 1, w.d, w.h, w.mi, w.s);
-  let guess = asUtc;
-  // Two passes settle the offset, including across a DST change.
-  for (let i = 0; i < 2; i++) {
-    const seen = wallClock(new Date(guess), timeZone);
-    guess += asUtc - Date.UTC(seen.y, seen.mo - 1, seen.d, seen.h, seen.mi, seen.s);
+  const offsetAt = (ms: number) => {
+    const seen = wallClock(new Date(ms), timeZone);
+    return Date.UTC(seen.y, seen.mo - 1, seen.d, seen.h, seen.mi, seen.s) - Math.floor(ms / 1000) * 1000;
+  };
+  const DAY = 86_400_000;
+  const before = offsetAt(asUtc - DAY);
+  const after = offsetAt(asUtc + DAY);
+  const candidates = [asUtc - before, asUtc - after].sort((a, b) => a - b);
+  for (const c of candidates) {
+    if (offsetAt(c) === asUtc - c) return new Date(c);
   }
-  return new Date(guess);
+  // In the gap: read the time with the pre-transition offset.
+  return new Date(asUtc - before);
 }
 
 /**

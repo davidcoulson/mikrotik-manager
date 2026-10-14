@@ -105,6 +105,8 @@ const EVENT_EMOJI: Record<string, string> = {
   device_cert_renewal_failed: '🔐',
 };
 
+const FAILED_DELIVERY_RETRY_MS = 60_000;
+
 export class AlertService {
   // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -128,9 +130,9 @@ export class AlertService {
       const now = Date.now();
       const until = cooldownUntil.get(cooldownKey) ?? 0;
       if (now < until) return;
-      // Hold the slot while delivery is in flight so a burst cannot double-send;
-      // the real cooldown starts only once something was actually delivered.
-      cooldownUntil.set(cooldownKey, now + 60_000);
+      // Reserve the slot for the whole cooldown while delivery is in flight so a
+      // burst cannot double-send; a total delivery failure shortens it below.
+      cooldownUntil.set(cooldownKey, now + cooldownMs);
 
       // Outbound webhooks fan out on the same (rule-gated, cooldown-respecting)
       // event stream, independent of whether any alert channels are configured.
@@ -166,8 +168,8 @@ export class AlertService {
       );
 
       // A failed delivery must not silence the alert for the whole cooldown.
-      if (notified.length > 0) cooldownUntil.set(cooldownKey, Date.now() + cooldownMs);
-      else cooldownUntil.delete(cooldownKey);
+      // Retry soon, but not on every event: webhooks have already fired for it.
+      if (notified.length === 0) cooldownUntil.set(cooldownKey, Date.now() + Math.min(cooldownMs, FAILED_DELIVERY_RETRY_MS));
 
       // Log to history — use subquery for device_id so a deleted device doesn't cause a FK violation
       await query(
