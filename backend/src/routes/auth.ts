@@ -13,9 +13,9 @@ import { passwordLoginEnabled } from '../utils/passwordLogin';
 import { sealTotpSecret, openTotpSecret } from '../utils/totpSecret';
 import { randomBytes } from 'crypto';
 import {
-  bump, peek, clear, claimOnce, ttlSeconds, accountFailKey, totpUserFailKey, totpTokenFailKey,
+  bump, peek, clear, claimOnce, accountFailKey, totpUserFailKey, totpTokenFailKey,
   ACCOUNT_FAIL_MAX, ACCOUNT_FAIL_WINDOW_SEC, TOTP_USER_FAIL_MAX, TOTP_TOKEN_FAIL_MAX,
-  PARTIAL_TOKEN_TTL_SEC, TOTP_REPLAY_TTL_SEC,
+  PARTIAL_TOKEN_TTL_SEC, TOTP_REPLAY_TTL_SEC, OVER_CAP_SLOT_SEC,
 } from '../utils/authThrottle';
 
 const router = Router();
@@ -95,9 +95,12 @@ router.post('/login', loginRateLimit(), async (req: Request, res: Response) => {
   // Per-account cap on top of the per-IP one: a botnet guessing one account's
   // password is stopped here (auth review M2).
   const failKey = accountFailKey(String(username));
-  if ((await peek(failKey)) >= ACCOUNT_FAIL_MAX) {
-    res.setHeader('Retry-After', String(Math.max(1, await ttlSeconds(failKey))));
-    return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again later.' });
+  // Past the cap the account is slowed to one attempt per OVER_CAP_SLOT_SEC
+  // rather than shut: a hard lock would let anyone who knows a username keep
+  // that user (an admin) out indefinitely.
+  if ((await peek(failKey)) >= ACCOUNT_FAIL_MAX && !(await claimOnce(`afs:${failKey}`, OVER_CAP_SLOT_SEC))) {
+    res.setHeader('Retry-After', String(OVER_CAP_SLOT_SEC));
+    return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again shortly.' });
   }
 
   // An account with no local password (SSO) must fail like a wrong password,
@@ -149,9 +152,9 @@ router.post('/totp/verify', rateLimitRedis({ windowSec: 60, max: 5, keyPrefix: '
   // distributing guesses over addresses does not help.
   const userFailKey = totpUserFailKey(user.id);
   const tokenFailKey = payload.jti ? totpTokenFailKey(payload.jti) : null;
-  if ((await peek(userFailKey)) >= TOTP_USER_FAIL_MAX) {
-    res.setHeader('Retry-After', String(Math.max(1, await ttlSeconds(userFailKey))));
-    return res.status(429).json({ error: 'Too many failed codes for this account. Try again later.' });
+  if ((await peek(userFailKey)) >= TOTP_USER_FAIL_MAX && !(await claimOnce(`tfs:${user.id}`, OVER_CAP_SLOT_SEC))) {
+    res.setHeader('Retry-After', String(OVER_CAP_SLOT_SEC));
+    return res.status(429).json({ error: 'Too many failed codes for this account. Try again shortly.' });
   }
   if (tokenFailKey && (await peek(tokenFailKey)) >= TOTP_TOKEN_FAIL_MAX) {
     return res.status(401).json({ error: 'Invalid or expired TOTP token' });

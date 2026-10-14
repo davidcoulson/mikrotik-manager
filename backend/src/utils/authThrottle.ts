@@ -91,6 +91,8 @@ export const ACCOUNT_FAIL_MAX = 10;
 export const ACCOUNT_FAIL_WINDOW_SEC = 15 * 60;
 export const TOTP_USER_FAIL_MAX = 10;
 export const TOTP_TOKEN_FAIL_MAX = 5;
+/** Past a failure cap, one attempt per this many seconds (not a hard lock: no lockout-DoS). */
+export const OVER_CAP_SLOT_SEC = 30;
 export const PARTIAL_TOKEN_TTL_SEC = 5 * 60;
 /** A TOTP step is 30 s and the window is +-1, so a code is valid for at most 90 s. */
 export const TOTP_REPLAY_TTL_SEC = 120;
