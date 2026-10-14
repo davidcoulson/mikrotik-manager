@@ -55,15 +55,18 @@ describe('POST /login', () => {
     expect(res.body.error).toBe('Invalid credentials');
   });
 
-  it('locks the account after repeated failures, whatever the source address', async () => {
+  it('slows the account to one attempt per slot after repeated failures, whatever the source address', async () => {
     const hash = await bcrypt.hash('right-password', 4);
     mockedQueryOne.mockResolvedValue({ id: 1, username: 'bob', password_hash: hash, role: 'admin', totp_enabled: false, must_change_password: false } as never);
     for (let i = 0; i < 10; i++) {
       expect((await request(app).post('/login').send({ username: 'bob', password: 'bad' })).status).toBe(401);
     }
-    const locked = await request(app).post('/login').send({ username: 'Bob', password: 'right-password' });
-    expect(locked.status).toBe(429);
-    expect(locked.headers['retry-after']).toBeDefined();
+    // The slot lets the owner in (no lockout-DoS) ...
+    expect((await request(app).post('/login').send({ username: 'Bob', password: 'bad' })).status).toBe(401);
+    // ... but a second attempt inside the same slot is refused.
+    const limited = await request(app).post('/login').send({ username: 'Bob', password: 'right-password' });
+    expect(limited.status).toBe(429);
+    expect(limited.headers['retry-after']).toBeDefined();
   });
 
   it('a successful login resets the failure count', async () => {
@@ -115,7 +118,11 @@ describe('POST /totp/verify', () => {
     for (let i = 0; i < 10; i++) {
       await request(app).post('/totp/verify').send({ totp_token: partial(`t${i}`), code: '000000' });
     }
-    const res = await request(app).post('/totp/verify').send({ totp_token: partial('fresh'), code: codeAt() });
-    expect(res.status).toBe(429);
+    // First attempt past the cap gets the slot (and the right code works) ...
+    const res = await request(app).post('/totp/verify').send({ totp_token: partial('fresh'), code: '000000' });
+    expect(res.status).toBe(401);
+    // ... the next one inside the slot is refused.
+    const limited = await request(app).post('/totp/verify').send({ totp_token: partial('fresh2'), code: codeAt() });
+    expect(limited.status).toBe(429);
   });
 });
