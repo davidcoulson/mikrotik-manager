@@ -37,6 +37,12 @@ const IEEE_CSV_URL = 'https://standards-oui.ieee.org/oui/oui.csv';
 
 let db: Map<string, string> | null = null;
 let initPromise: Promise<void> | null = null;
+let generation = 0;
+
+function _setDb(map: Map<string, string>): void {
+  db = map;
+  generation++;
+}
 
 /**
  * @param allowDownload  false on a dark site: use whatever copy is on disk,
@@ -51,6 +57,11 @@ export function initOuiDatabase(allowDownload = true): Promise<void> {
 /** True once a vendor database (fresh or cached) is available to look up in. */
 export function ouiLoaded(): boolean {
   return db !== null;
+}
+
+/** Bumped every time the vendor map is (re)loaded; lets callers drop negative caches. */
+export function ouiGeneration(): number {
+  return generation;
 }
 
 export function lookupVendor(mac: string): string {
@@ -92,8 +103,8 @@ async function _load(allowDownload: boolean): Promise<void> {
       const raw = JSON.parse(fresh) as Record<string, string>;
       const map = new Map(Object.entries(raw));
       if (map.size > 10_000) {
-        db = map;
-        console.log(`OUI database loaded from cache: ${db.size} entries`);
+        _setDb(map);
+        console.log(`OUI database loaded from cache: ${map.size} entries`);
         return;
       }
     }
@@ -101,9 +112,9 @@ async function _load(allowDownload: boolean): Promise<void> {
 
   if (!allowDownload) {
     const stale = _readStaleCache();
-    db = stale ?? new Map();
+    _setDb(stale ?? new Map());
     console.log(stale
-      ? `OUI: download disabled (Dark Site Mode); using cached copy, ${db.size} entries`
+      ? `OUI: download disabled (Dark Site Mode); using cached copy, ${stale.size} entries`
       : 'OUI: download disabled (Dark Site Mode) and no cached copy; vendor lookups will be empty');
     return;
   }
@@ -114,8 +125,8 @@ async function _load(allowDownload: boolean): Promise<void> {
     const csv = await _fetch(IEEE_CSV_URL);
     const map = _parseCsv(csv);
     if (map.size > 10_000) {
-      db = map;
-      console.log(`OUI database downloaded: ${db.size} entries`);
+      _setDb(map);
+      console.log(`OUI database downloaded: ${map.size} entries`);
       // Persist cache. A failed write (disk full, read-only volume) keeps the
       // download in memory; it used to fall into the catch below and replace
       // the fresh list with a stale or empty one (outside review J14).
@@ -128,13 +139,13 @@ async function _load(allowDownload: boolean): Promise<void> {
       }
     } else {
       console.warn('OUI: Downloaded file too small, ignoring');
-      db = new Map();
+      _setDb(new Map());
     }
   } catch (err) {
     const stale = _readStaleCache();
-    db = stale ?? new Map();
+    _setDb(stale ?? new Map());
     console.warn(stale
-      ? `OUI: Download failed (${(err as Error).message}); using older cached copy, ${db.size} entries`
+      ? `OUI: Download failed (${(err as Error).message}); using older cached copy, ${stale.size} entries`
       : `OUI: Download failed (${(err as Error).message}). Vendor lookups will be empty.`);
   }
 }

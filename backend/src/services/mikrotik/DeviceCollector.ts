@@ -10,7 +10,7 @@ import { fit, normalizeMac } from '../../utils/fit';
 import { rosDurationSeconds } from '../../utils/rosDuration';
 import { guestSsidTag, legacyAuthTypes, legacyProfileName, legacyProfileParams } from './legacySecurity';
 import { decrypt } from '../../utils/crypto';
-import { lookupVendor, ouiLoaded } from '../../utils/oui';
+import { lookupVendor, ouiLoaded, ouiGeneration } from '../../utils/oui';
 import { buildServerArpMap } from '../../utils/serverArp';
 import { aggregateBridgeVlans, portVlanMembership, expandVlanIds, rosList } from '../../utils/vlan';
 import {
@@ -75,6 +75,7 @@ interface ClientUpsert {
 
 // MACs the OUI database could not name; not retried every poll.
 const unresolvedVendorMacs = new Set<string>();
+let unresolvedVendorGeneration = -1;
 
 // Fleet-wide / per-site distinct client counts are table-wide scans; one per
 // device per poll multiplied with fleet size. Share the answer for a short while.
@@ -1326,6 +1327,12 @@ export class DeviceCollector {
     try {
       // Nothing can resolve until the OUI database is loaded.
       if (!ouiLoaded()) return;
+      // A reloaded vendor list may name MACs the previous one could not.
+      const gen = ouiGeneration();
+      if (gen !== unresolvedVendorGeneration) {
+        unresolvedVendorMacs.clear();
+        unresolvedVendorGeneration = gen;
+      }
       // Include vendor='' entries: those were set by the old API-based lookup
       // when it was rate-limited and never actually resolved. MACs that already
       // failed to resolve (randomised, MA-M/MA-S) are skipped for the life of

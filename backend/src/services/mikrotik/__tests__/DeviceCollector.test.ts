@@ -521,3 +521,37 @@ describe('legacy CAPsMAN (#250)', () => {
     expect(counts()).toBe(first);
   });
 });
+
+// ── lookupMissingVendors retry after OUI reload ──────────────────────────────
+
+describe('lookupMissingVendors unresolved cache', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const oui = require('../../../utils/oui') as { ouiLoaded: jest.Mock; ouiGeneration: jest.Mock; lookupVendor: jest.Mock };
+  const MAC = 'AA:BB:CC:00:00:01';
+  const skipList = (call: unknown[]) => (call[1] as unknown[])[1] as string[];
+
+  async function run(collector: DeviceCollector): Promise<void> {
+    await (collector as unknown as { lookupMissingVendors(): Promise<void> }).lookupMissingVendors();
+  }
+
+  it('skips an unresolved MAC on later polls but retries it after a generation bump', async () => {
+    const collector = new DeviceCollector(testDevice);
+    let gen = 100;
+    oui.ouiLoaded.mockReturnValue(true);
+    oui.ouiGeneration.mockImplementation(() => gen);
+    oui.lookupVendor.mockReturnValue('');
+    (query as jest.Mock).mockReset();
+    (query as jest.Mock).mockResolvedValue([{ mac_address: MAC }]);
+
+    await run(collector); // MAC fails, remembered
+    await run(collector); // still same generation: passed to SQL as skipped
+    const calls = (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('FROM clients'));
+    expect(skipList(calls[0])).toEqual([]);
+    expect(skipList(calls[1])).toEqual([MAC]);
+
+    gen++; // vendor list reloaded
+    await run(collector);
+    const after = (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('FROM clients'));
+    expect(skipList(after[2])).toEqual([]);
+  });
+});
