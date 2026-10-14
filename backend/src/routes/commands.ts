@@ -39,6 +39,19 @@ async function refuseForeignDevices(req: Request, res: Response, ids: number[], 
   return true;
 }
 
+/**
+ * Device output can carry secrets the device itself printed (/export,
+ * /user print detail, WireGuard keys...), so only accounts that may run
+ * commands read it (auth review M3). Viewers and read-scope tokens still see
+ * status and timing. A site-scoped account needs operator on every device.
+ */
+async function canReadOutput(req: Request, deviceIds: number[]): Promise<boolean> {
+  const role = req.user?.role;
+  if (role !== 'admin' && role !== 'operator') return false;
+  if (!isSiteScoped(req.user)) return true;
+  return deviceIds.length > 0 && (await devicesDenied(req.user!, deviceIds, 'operator')).length === 0;
+}
+
 /** A run is a site-scoped account's only if every device in it is. */
 async function refuseForeignRun(req: Request, res: Response, runId: string | number, min: Role): Promise<boolean> {
   if (!isSiteScoped(req.user)) return false;
@@ -186,7 +199,12 @@ router.get('/runs/:id', async (req: Request, res: Response) => {
       WHERE rd.run_id = $1 ORDER BY rd.wave, d.name`,
     [req.params.id]
   );
-  res.json({ ...run, devices });
+  const showOutput = await canReadOutput(req, (devices as Array<{ device_id: number }>).map((d) => d.device_id));
+  res.json({
+    ...run,
+    output_redacted: !showOutput,
+    devices: showOutput ? devices : (devices as Array<Record<string, unknown>>).map((d) => ({ ...d, output: null, error: null })),
+  });
 });
 
 /**
@@ -202,6 +220,10 @@ router.get('/runs/:id/export', async (req: Request, res: Response) => {
     `SELECT id, name, command, status, created_at FROM command_runs WHERE id = $1`, [req.params.id]
   );
   if (!run) return res.status(404).json({ error: 'Run not found' });
+  const runDevices = await query<{ device_id: number }>(`SELECT device_id FROM command_run_devices WHERE run_id = $1`, [req.params.id]);
+  if (!(await canReadOutput(req, runDevices.map((r) => r.device_id)))) {
+    return res.status(403).json({ error: 'Exporting command output needs operator access.' });
+  }
 
   const rows = await query<{
     device_name: string; ip_address: string; wave: number; status: string;
