@@ -78,6 +78,12 @@ describe('normalizeDeviceAddress', () => {
 });
 
 describe('isBlockedAddress', () => {
+  it('blocks private/loopback IPv4 carried in mapped, compatible and NAT64 IPv6 forms', () => {
+    for (const ip of ['::ffff:7f00:1', '::ffff:a00:1', '::ffff:c0a8:101', '::7f00:1', '64:ff9b::a00:1', '::ffff:10.0.0.1']) {
+      expect(isBlockedAddress(ip)).toBe(true);
+    }
+    expect(isBlockedAddress('::ffff:cb00:709')).toBe(false);
+  });
   it('blocks RFC1918 ranges', () => {
     expect(isBlockedAddress('192.168.1.1')).toBe(true);
     expect(isBlockedAddress('10.0.0.1')).toBe(true);
