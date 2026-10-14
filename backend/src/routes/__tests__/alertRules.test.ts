@@ -27,3 +27,14 @@ describe('PUT /api/alerts/rules/:type cooldown_min (L2)', () => {
     }
   });
 });
+
+describe('POST /api/alerts/channels TLS choice', () => {
+  it('records smtp_allow_self_signed=false on a new email channel', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { query } = jest.requireMock('../../config/database') as { query: jest.Mock };
+    query.mockResolvedValue([{ id: 1, name: 'm', type: 'email' }]);
+    await request(app()).post('/api/alerts/channels').send({ name: 'm', type: 'email', config: { smtp_host: 'h' } });
+    const stored = JSON.parse(query.mock.calls[0][1][3]);
+    expect(stored.smtp_allow_self_signed).toBe(false);
+  });
+});
