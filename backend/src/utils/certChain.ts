@@ -11,8 +11,10 @@ const BLOCK = /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g;
 export function validateCertificateBundle(certificate: string, privateKey: string): string | null {
   const blocks = certificate.match(BLOCK) ?? [];
   if (blocks.length === 0) return 'certificate does not appear to be a valid PEM certificate';
-  if (certificate.replace(BLOCK, '').trim() !== '') {
-    return 'certificate contains data that is not a PEM certificate block';
+  // Text between blocks (OpenSSL "Bag Attributes", subject=/issuer= lines) is
+  // ignored by nginx, but a stray or mangled PEM block is not.
+  if (/-----(BEGIN|END) /.test(certificate.replace(BLOCK, ''))) {
+    return 'certificate contains a PEM block that is not a valid certificate';
   }
 
   const certs: crypto.X509Certificate[] = [];

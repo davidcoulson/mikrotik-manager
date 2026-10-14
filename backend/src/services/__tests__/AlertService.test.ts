@@ -328,14 +328,28 @@ describe('email delivery', () => {
 });
 
 describe('cooldown only after delivery (L2)', () => {
-  it('lets the next alert through when every channel failed', async () => {
+  it('retries after a minute, not after the whole cooldown, when every channel failed', async () => {
+    const service = new AlertService();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sendSpy = jest.spyOn(service as any, 'sendToChannel').mockRejectedValue(new Error('smtp down'));
+    const realNow = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now');
+    for (let i = 0; i < 2; i++) {
+      nowSpy.mockReturnValue(realNow + i * 61_000);
+      mockedQuery.mockResolvedValueOnce([enabledRule]).mockResolvedValueOnce([slackChannel]).mockResolvedValueOnce([]);
+      await service.dispatch('device_offline', 'down', { cooldownKey: 'test-l2-fail' });
+    }
+    nowSpy.mockRestore();
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+  });
+  it('still holds off a rapid third attempt after delivery failed', async () => {
     const service = new AlertService();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sendSpy = jest.spyOn(service as any, 'sendToChannel').mockRejectedValue(new Error('smtp down'));
     for (let i = 0; i < 2; i++) {
       mockedQuery.mockResolvedValueOnce([enabledRule]).mockResolvedValueOnce([slackChannel]).mockResolvedValueOnce([]);
-      await service.dispatch('device_offline', 'down', { cooldownKey: 'test-l2-fail' });
+      await service.dispatch('device_offline', 'down', { cooldownKey: 'test-l2-retry' });
     }
-    expect(sendSpy).toHaveBeenCalledTimes(2);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
   });
 });
