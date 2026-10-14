@@ -1,4 +1,5 @@
 import { computeNextRun, advanceNextRun } from '../ReportService';
+import { query as mockedDbQuery } from '../../config/database';
 
 jest.mock('../../config/database', () => ({ query: jest.fn(), queryOne: jest.fn() }));
 
@@ -48,8 +49,7 @@ describe('app timezone scheduling (M6)', () => {
 
 describe('report HTML escaping (M3)', () => {
   it('escapes client names that came from devices', async () => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { query } = require('../../config/database') as { query: jest.Mock };
+    const query = jest.mocked(mockedDbQuery);
     const { reportService } = await import('../ReportService');
     query
       .mockResolvedValueOnce([{ total: '1', online: '1', updates: '0' }])
