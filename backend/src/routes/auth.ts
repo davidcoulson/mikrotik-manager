@@ -14,9 +14,9 @@ import { totpLockedOut, recordTotpFailure, claimTotpStep } from '../utils/totpGu
 import { sealTotpSecret, openTotpSecret } from '../utils/totpSecret';
 import { randomBytes } from 'crypto';
 import {
-  bump, peek, clear, claimOnce, ttlSeconds, accountFailKey, totpTokenFailKey,
+  bump, peek, clear, claimOnce, accountFailKey, totpTokenFailKey,
   ACCOUNT_FAIL_MAX, ACCOUNT_FAIL_WINDOW_SEC, TOTP_TOKEN_FAIL_MAX,
-  PARTIAL_TOKEN_TTL_SEC,
+  PARTIAL_TOKEN_TTL_SEC, OVER_CAP_SLOT_SEC,
 } from '../utils/authThrottle';
 
 const router = Router();
@@ -96,9 +96,12 @@ router.post('/login', loginRateLimit(), async (req: Request, res: Response) => {
   // Per-account cap on top of the per-IP one: a botnet guessing one account's
   // password is stopped here (auth review M2).
   const failKey = accountFailKey(String(username));
-  if ((await peek(failKey)) >= ACCOUNT_FAIL_MAX) {
-    res.setHeader('Retry-After', String(Math.max(1, await ttlSeconds(failKey))));
-    return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again later.' });
+  // Past the cap the account is slowed to one attempt per OVER_CAP_SLOT_SEC
+  // rather than shut: a hard lock would let anyone who knows a username keep
+  // that user (an admin) out indefinitely.
+  if ((await peek(failKey)) >= ACCOUNT_FAIL_MAX && !(await claimOnce(`afs:${failKey}`, OVER_CAP_SLOT_SEC))) {
+    res.setHeader('Retry-After', String(OVER_CAP_SLOT_SEC));
+    return res.status(429).json({ error: 'Too many failed sign-in attempts for this account. Try again shortly.' });
   }
 
   // An account with no local password (SSO) must fail like a wrong password,
