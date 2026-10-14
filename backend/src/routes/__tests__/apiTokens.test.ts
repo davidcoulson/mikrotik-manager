@@ -4,9 +4,11 @@ jest.mock('../../middleware/auth', () => ({
   requireAuth: (_q: unknown, _s: unknown, next: () => void) => next(),
   requireAdmin: (_q: unknown, _s: unknown, next: () => void) => next(),
   requireWrite: (_q: unknown, _s: unknown, next: () => void) => next(),
+  fleetOnly: (_q: unknown, _s: unknown, next: () => void) => next(),
+  isSiteScoped: () => false,
 }));
 jest.mock('../../services/WebhookService', () => ({ webhookService: {}, WEBHOOK_EVENTS: [] }));
-jest.mock('../../services/ReportService', () => ({ reportService: {}, computeNextRun: jest.fn() }));
+jest.mock('../../services/ReportService', () => ({ reportService: {}, computeNextRun: jest.fn(), appTimezone: jest.fn() }));
 
 import request from 'supertest';
 import express from 'express';
