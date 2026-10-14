@@ -403,6 +403,7 @@ function ServerTable({ servers, protocol, canWrite, conflictDevices, onToggle, o
                           const names = conflictDevices.map(d => d.name as string).join(', ');
                           if (!confirm(`Active ${protocol.toUpperCase()} DHCP server(s) already running on: ${names}.\n\nEnabling another DHCP server on the same network may cause IP address conflicts. Continue?`)) return;
                         }
+                        if (!disabled && !confirm(`Disable DHCP server "${s['name'] || s['.id']}"? Clients on ${s['interface'] || 'its interface'} will stop receiving new leases.`)) return;
                         onToggle(s['.id'], disabled);
                       }} title={disabled ? 'Enable' : 'Disable'}
                         className={clsx('p-1.5 rounded-lg transition-colors', disabled ? 'text-gray-400 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20' : 'text-green-600 hover:text-amber-600 hover:bg-amber-50 dark:hover:bg-amber-900/20')}>
@@ -578,27 +579,27 @@ export default function NetworkServicesDHCPPage() {
   });
 
   const deleteServer = useMutation({
-    mutationFn: ({ id, protocol }: { id: string; protocol: 'ipv4' | 'ipv6' }) =>
-      networkServicesApi.deleteDhcpServer(deviceId, id, protocol),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['ns-dhcp', deviceId] }),
+    mutationFn: ({ deviceId: devId, id, protocol }: { deviceId: number; id: string; protocol: 'ipv4' | 'ipv6' }) =>
+      networkServicesApi.deleteDhcpServer(devId, id, protocol),
+    onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['ns-dhcp', vars.deviceId] }),
   });
 
   const toggleServer = useMutation({
-    mutationFn: ({ id, disabled, protocol }: { id: string; disabled: boolean; protocol: 'ipv4' | 'ipv6' }) =>
-      networkServicesApi.toggleDhcpServer(deviceId, id, disabled, protocol),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['ns-dhcp', deviceId] }),
+    mutationFn: ({ deviceId: devId, id, disabled, protocol }: { deviceId: number; id: string; disabled: boolean; protocol: 'ipv4' | 'ipv6' }) =>
+      networkServicesApi.toggleDhcpServer(devId, id, disabled, protocol),
+    onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['ns-dhcp', vars.deviceId] }),
   });
 
   const deletePool = useMutation({
-    mutationFn: ({ id, protocol }: { id: string; protocol: 'ipv4' | 'ipv6' }) =>
-      networkServicesApi.deleteDhcpPool(deviceId, id, protocol),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['ns-dhcp', deviceId] }),
+    mutationFn: ({ deviceId: devId, id, protocol }: { deviceId: number; id: string; protocol: 'ipv4' | 'ipv6' }) =>
+      networkServicesApi.deleteDhcpPool(devId, id, protocol),
+    onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['ns-dhcp', vars.deviceId] }),
   });
 
   const deleteLease = useMutation({
-    mutationFn: ({ id, protocol }: { id: string; protocol: 'ipv4' | 'ipv6' }) =>
-      networkServicesApi.deleteStaticLease(deviceId, id, protocol),
-    onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['ns-leases', deviceId, vars.protocol] }),
+    mutationFn: ({ deviceId: devId, id, protocol }: { deviceId: number; id: string; protocol: 'ipv4' | 'ipv6' }) =>
+      networkServicesApi.deleteStaticLease(devId, id, protocol),
+    onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['ns-leases', vars.deviceId, vars.protocol] }),
   });
 
   // Cross-device conflict detection
@@ -706,16 +707,16 @@ export default function NetworkServicesDHCPPage() {
             action={canWrite ? <button onClick={() => setServerForm({ protocol: 'ipv4' })} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <ServerTable servers={dhcp.ipv4} protocol="ipv4" canWrite={canWrite}
               conflictDevices={conflictDevicesV4 as { name: unknown }[]}
-              onToggle={(id, cur) => toggleServer.mutate({ id, disabled: !cur, protocol: 'ipv4' })}
+              onToggle={(id, cur) => toggleServer.mutate({ deviceId, id, disabled: !cur, protocol: 'ipv4' })}
               onEdit={(s) => setServerForm({ protocol: 'ipv4', existing: s })}
-              onDelete={(id) => deleteServer.mutate({ id, protocol: 'ipv4' })} />
+              onDelete={(id) => deleteServer.mutate({ deviceId, id, protocol: 'ipv4' })} />
           </Section>
 
           {/* IPv4 Pools */}
           <Section color="text-cyan-500" title="IPv4 Address Pools" count={dhcp.pools_v4.length}
             action={canWrite ? <button onClick={() => setPoolForm('ipv4')} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <PoolTable pools={dhcp.pools_v4} protocol="ipv4" canWrite={canWrite}
-              onDelete={(id) => deletePool.mutate({ id, protocol: 'ipv4' })} />
+              onDelete={(id) => deletePool.mutate({ deviceId, id, protocol: 'ipv4' })} />
           </Section>
 
           {/* IPv4 static leases only: dynamic ones are on Clients, with far more
@@ -723,7 +724,7 @@ export default function NetworkServicesDHCPPage() {
           <Section color="text-sky-500" title="IPv4 Static Leases" count={staticV4.length}
             action={canWrite ? <button onClick={() => setLeaseForm('ipv4')} className="flex items-center gap-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Static</button> : undefined}>
             <LeaseTable leases={staticV4} canWrite={canWrite}
-              onDelete={(id) => deleteLease.mutate({ id, protocol: 'ipv4' })} />
+              onDelete={(id) => deleteLease.mutate({ deviceId, id, protocol: 'ipv4' })} />
             <div className="px-5 py-2.5 border-t border-gray-100 dark:border-slate-800 text-xs text-gray-500 dark:text-slate-400">
               Dynamic leases ({leasesV4.length - staticV4.length}) are on <Link to="/clients" className="text-blue-600 dark:text-blue-400 hover:underline">Clients</Link>.
             </div>
@@ -734,23 +735,23 @@ export default function NetworkServicesDHCPPage() {
             action={canWrite ? <button onClick={() => setServerForm({ protocol: 'ipv6' })} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <ServerTable servers={dhcp.ipv6} protocol="ipv6" canWrite={canWrite}
               conflictDevices={conflictDevicesV6 as { name: unknown }[]}
-              onToggle={(id, cur) => toggleServer.mutate({ id, disabled: !cur, protocol: 'ipv6' })}
+              onToggle={(id, cur) => toggleServer.mutate({ deviceId, id, disabled: !cur, protocol: 'ipv6' })}
               onEdit={(s) => setServerForm({ protocol: 'ipv6', existing: s })}
-              onDelete={(id) => deleteServer.mutate({ id, protocol: 'ipv6' })} />
+              onDelete={(id) => deleteServer.mutate({ deviceId, id, protocol: 'ipv6' })} />
           </Section>
 
           {/* IPv6 Pools */}
           <Section color="text-violet-500" title="IPv6 Address Pools" count={dhcp.pools_v6.length}
             action={canWrite ? <button onClick={() => setPoolForm('ipv6')} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Add</button> : undefined}>
             <PoolTable pools={dhcp.pools_v6} protocol="ipv6" canWrite={canWrite}
-              onDelete={(id) => deletePool.mutate({ id, protocol: 'ipv6' })} />
+              onDelete={(id) => deletePool.mutate({ deviceId, id, protocol: 'ipv6' })} />
           </Section>
 
           {/* IPv6 Leases */}
           <Section color="text-purple-500" title="IPv6 Bindings" count={leasesV6.length}
             action={canWrite ? <button onClick={() => setLeaseForm('ipv6')} className="flex items-center gap-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium rounded-lg transition-colors"><Plus className="w-3 h-3" />Static</button> : undefined}>
             <LeaseTable leases={leasesV6} canWrite={canWrite}
-              onDelete={(id) => deleteLease.mutate({ id, protocol: 'ipv6' })} />
+              onDelete={(id) => deleteLease.mutate({ deviceId, id, protocol: 'ipv6' })} />
           </Section>
         </>
       )}
