@@ -29,6 +29,7 @@ import { decrypt } from '../../utils/crypto';
 import { query, queryOne } from '../../config/database';
 import { redis } from '../../config/redis';
 import { heldLockToken, restoreHeldLock } from './deviceLock';
+import { backupBeforeChange } from './preChangeBackup';
 import { isPartialApply, PartialApplyRevertError } from './partialApply';
 import { restoreScopeFor, captureScope, buildRestorePlan, type RestorePlan } from './scriptRestore';
 
