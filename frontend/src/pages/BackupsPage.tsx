@@ -22,6 +22,7 @@ const TYPE_LABEL: Record<string, string> = {
   scheduled: 'Scheduled',
   manual: 'Manual',
   'pre-upgrade': 'Pre-upgrade',
+  'pre-change': 'Pre-change',
 };
 
 function formatBytes(bytes?: number): string {

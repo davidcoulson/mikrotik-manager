@@ -29,6 +29,7 @@ import { decrypt } from '../../utils/crypto';
 import { query, queryOne } from '../../config/database';
 import { redis } from '../../config/redis';
 import { heldLockToken, restoreHeldLock } from './deviceLock';
+import { backupBeforeChange } from './preChangeBackup';
 import { isPartialApply, PartialApplyRevertError } from './partialApply';
 import { restoreScopeFor, captureScope, buildRestorePlan, type RestorePlan } from './scriptRestore';
 
@@ -484,6 +485,8 @@ export async function withSafeApply<T>(
   let holdFor = 0;
 
   try {
+    await backupBeforeChange(device.id, meta.kind, meta.summary);
+
     // ── Arm ────────────────────────────────────────────────────────────────
     try {
       await client.connect();
