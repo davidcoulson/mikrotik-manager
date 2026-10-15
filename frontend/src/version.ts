@@ -1,6 +1,18 @@
 export const APP_VERSION = 'v0.75.0 Beta';
 
 /**
+ * Commit and date of a non-release build ("a1b2c3d · 2026-10-15"), or '' for a
+ * release build, which passes no build info. Shown under the version so a test
+ * image can be told apart from the release it was cut from.
+ */
+export const BUILD_LABEL: string = (() => {
+  const env = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {};
+  const sha = String(env.VITE_BUILD_SHA ?? '').slice(0, 7);
+  const date = String(env.VITE_BUILD_DATE ?? '');
+  return [sha, date].filter(Boolean).join(' · ');
+})();
+
+/**
  * Documentation for *this* build.
  *
  * The site is published per release series with mike, so a reader running

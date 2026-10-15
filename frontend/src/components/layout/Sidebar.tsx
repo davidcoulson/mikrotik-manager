@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import SiteSelector from './SiteSelector';
-import { APP_VERSION } from '../../version';
+import { APP_VERSION, BUILD_LABEL } from '../../version';
 import { devicesApi } from '../../services/api';
 
 const monitorItems = [
@@ -263,6 +263,7 @@ export default function Sidebar({ mobileOpen, onMobileClose }: SidebarProps) {
         <div className={clsx(isCollapsed && 'md:hidden')}>
           <div className="text-[14px] font-semibold leading-none" style={{ color: 'var(--ink)' }}>MikroTik Manager</div>
           <div className="text-[11px] leading-none mt-[3px]" style={{ color: 'var(--ink-3)' }}>{APP_VERSION}</div>
+          {BUILD_LABEL && <div className="mono text-[10px] leading-none mt-[3px]" style={{ color: 'var(--ink-4)' }} title="Non-release build">{BUILD_LABEL}</div>}
         </div>
         <button
           onClick={onMobileClose}
