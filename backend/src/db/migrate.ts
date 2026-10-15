@@ -1825,7 +1825,8 @@ const DEFAULT_SETTINGS = [
   { key: 'polling_logs_interval', value: 60 },
   { key: 'retention_events_days', value: 30 },
   { key: 'retention_proxy_days', value: 30 },
-  { key: 'backup_schedule_enabled', value: false },
+  { key: 'backup_schedule_enabled', value: true },
+  { key: 'pre_change_backup_enabled', value: true },
   { key: 'backup_schedule_cron', value: '0 2 * * *' },
   // Scheduled work was evaluated against the container clock, which is UTC in
   // the shipped image. A "02:00" backup therefore fired at 02:00 UTC regardless
