@@ -745,6 +745,10 @@ export const devicesApi = {
     api.get<IpAddress[]>(`/devices/${id}/ip-addresses`, { params: opts.includeIpv6 ? { include: 'ipv6' } : undefined }),
   addIpAddress: (id: number, data: { address: string; interface: string; confirm_lockout?: boolean }) =>
     api.post<IpAddress[]>(`/devices/${id}/ip-addresses`, data),
+  /** Edit an address in place (#285); only the fields sent change. */
+  updateIpAddress: (id: number, addrId: string,
+    data: { address?: string; interface?: string; comment?: string; disabled?: boolean }, confirmLockout = false) =>
+    api.put(`/devices/${id}/ip-addresses/${encodeURIComponent(addrId)}`, confirmLockout ? { ...data, confirm_lockout: true } : data),
   removeIpAddress: (id: number, addrId: string, confirmLockout = false) =>
     api.delete(`/devices/${id}/ip-addresses/${encodeURIComponent(addrId)}`,
       confirmLockout ? { data: { confirm_lockout: true } } : undefined),
@@ -826,12 +830,16 @@ export const devicesApi = {
   // Firewall: reorder + counters (order is decisive in RouterOS)
   moveFirewallRule: (id: number, ruleId: string, destination?: string, confirmLockout = false) =>
     api.post(`/devices/${id}/firewall/move`, { id: ruleId, destination, ...(confirmLockout ? { confirm_lockout: true } : {}) }),
+  /** Count "outages this week" from now on (#85); history is kept. */
+  resetOutages: (id: number) => api.post<{ message: string; outages_reset_at: string }>(`/devices/${id}/outages/reset`),
   resetFirewallCounters: (id: number) =>
     api.post<Record<string, string>[]>(`/devices/${id}/firewall/reset-counters`),
   moveNatRule: (id: number, ruleId: string, destination?: string) =>
     api.post<Record<string, string>[]>(`/devices/${id}/nat/move`, { id: ruleId, destination }),
   // Firewall address lists (reusable address objects)
   getAddressLists: (id: number) => api.get<Record<string, string>[]>(`/devices/${id}/address-lists`),
+  /** The switch chip's own VLAN table, on older chips (#278). Read-only. */
+  getSwitchVlans: (id: number) => api.get<SwitchVlanView>(`/devices/${id}/switch-vlans`),
   /** L3 hardware offloading on the switch chip (#254). */
   getL3Hw: (id: number) => api.get<L3HwView>(`/devices/${id}/l3hw`),
   setL3Hw: (id: number, enabled: boolean, acknowledgeFirewall = false) =>
@@ -1334,6 +1342,8 @@ export interface OpsAttentionItem {
   body: string;
   action: string;
   path: string;
+  /** A device whose outage count this item reports, so it can be reset (#85). */
+  resetOutagesDeviceId?: number;
   /** Stable identity used to dismiss an item that is otherwise recomputed. */
   fingerprint?: string;
 }
@@ -2414,6 +2424,16 @@ export interface ClientAddressListView {
 }
 
 /** L3 hardware offloading on a device's switch chip (#254). */
+/** The switch chip's own VLAN table and port VLAN settings (#278). */
+export interface SwitchVlanView {
+  supported: boolean;
+  switches: { name: string; type: string }[];
+  vlans: { id: string; switch: string; vlanId: number; ports: string[]; independentLearning: boolean; disabled: boolean }[];
+  ports: { name: string; switch: string; vlanMode: string; vlanHeader: string; defaultVlanId: string }[];
+  inUse: boolean;
+  filteringBridges: string[];
+}
+
 export interface L3HwView {
   supported: boolean;
   switch: { id: string; name: string; type: string } | null;

@@ -36,6 +36,8 @@ let deviceScripts: Record<string, string>[];
 /** What the scheduler would run, captured for the script-mode tests. */
 let lastOnEvent: string;
 let rosVersion: string;
+/** A command that lands on the device but whose reply is lost, once. */
+let lostReplyOn: string | null;
 
 function installClientMock() {
   commands = [];
@@ -45,6 +47,7 @@ function installClientMock() {
   deviceScripts = [];
   lastOnEvent = '';
   rosVersion = '7.24.5 (stable)';
+  lostReplyOn = null;
   MockedClient.mockImplementation(() => {
     const client = {
       connect: jest.fn(async () => {
@@ -55,6 +58,15 @@ function installClientMock() {
       isConnected: jest.fn(() => true),
       execute: jest.fn(async (cmd: string, params: Record<string, string> = {}) => {
         commands.push(cmd);
+        const result = answer(cmd, params);
+        if (cmd === lostReplyOn) {
+          lostReplyOn = null;
+          throw new Error('Read timeout waiting for API response');
+        }
+        return result;
+      }),
+    };
+    function answer(cmd: string, params: Record<string, string>): Record<string, string>[] {
         switch (cmd) {
           case '/system/backup/save':
             deviceFiles.push({ '.id': `*f${deviceFiles.length}`, name: `${params.name}.backup` });
@@ -78,6 +90,10 @@ function installClientMock() {
             return [{ '.id': '*1', interface: 'ether2', bridge: 'bridge', pvid: '10', dynamic: 'false' }];
           case '/interface/bridge/vlan/print':
             return [{ '.id': '*2', bridge: 'bridge', 'vlan-ids': '10', tagged: 'bridge', untagged: 'ether2', dynamic: 'false' }];
+          case '/system/scheduler/set':
+            deviceSchedulers = deviceSchedulers.map((x) => x['.id'] === params['.id']
+              ? { ...x, ...(params.disabled ? { disabled: params.disabled === 'yes' ? 'true' : 'false' } : {}) } : x);
+            return [];
           case '/system/scheduler/remove':
             deviceSchedulers = deviceSchedulers.filter((s) => s['.id'] !== params['.id']);
             return [];
@@ -91,8 +107,7 @@ function installClientMock() {
           case '/system/identity/print': return [{ name: 'sw1' }];
           default: return [];
         }
-      }),
-    };
+    }
     return client as unknown as RouterOSClient;
   });
 }
@@ -287,6 +302,59 @@ describe('withSafeApply', () => {
     expect(ran).toBe(false);
   });
 
+  it('runs a change marked requireProtectionOnlyWhenEnabled unprotected when Change Guard is turned off', async () => {
+    mockedQuery.mockResolvedValueOnce([{ key: 'change_guard_enabled', value: false }] as never);
+    const out = await withSafeApply(device,
+      { kind: 'backup.restore', summary: 's', requireProtection: true, requireProtectionOnlyWhenEnabled: true },
+      async () => 'ok');
+    expect(out.result).toBe('ok');
+    expect(out.unprotectedReason).toMatch(/disabled/);
+    expect(commands).toHaveLength(0);
+  });
+
+  it('takes and releases the device lock for an unprotected restore, and refuses while it is held', async () => {
+    const meta = { kind: 'backup.restore', summary: 's', requireProtection: true, requireProtectionOnlyWhenEnabled: true };
+    mockedQuery.mockResolvedValueOnce([{ key: 'change_guard_enabled', value: false }] as never);
+    await withSafeApply(device, meta, async () => 'ok');
+    expect(setCalls().some((c) => String(c[0]).startsWith('changeguard:lock:'))).toBe(true);
+    expect(redis.del).toHaveBeenCalled();
+
+    mockedQuery.mockResolvedValueOnce([{ key: 'change_guard_enabled', value: false }] as never);
+    jest.mocked(redis.set).mockResolvedValueOnce(null as never); // lock already held
+    let ran = false;
+    await expect(withSafeApply(device, meta, async () => { ran = true; return 'ok'; })).rejects.toThrow(/already in progress/);
+    expect(ran).toBe(false);
+  });
+
+  it('keeps the device locked after an unprotected restore fails ambiguously', async () => {
+    const meta = { kind: 'backup.restore', summary: 's', requireProtection: true, requireProtectionOnlyWhenEnabled: true };
+    mockedQuery.mockResolvedValueOnce([{ key: 'change_guard_enabled', value: false }] as never);
+    jest.mocked(redis.del).mockClear();
+    jest.mocked(redis.set).mockClear();
+    await expect(withSafeApply(device, meta, async () => { throw new PartialApplyError('import timed out'); }))
+      .rejects.toBeInstanceOf(PartialApplyError);
+    expect(redis.del).not.toHaveBeenCalled();
+    const holds = setCalls().filter((c) => c[0] === `changeguard:lock:${device.id}` && c[2] === 'EX' && Number(c[3]) >= 300);
+    expect(holds.length).toBeGreaterThan(0);
+  });
+
+  it('still refuses a change marked requireProtectionOnlyWhenEnabled when the guard is on but cannot arm', async () => {
+    MockedClient.mockImplementation(() => ({
+      connect: jest.fn(async () => {}),
+      disconnect: jest.fn(),
+      isConnected: jest.fn(() => true),
+      execute: jest.fn(async (cmd: string) => {
+        if (cmd === '/system/backup/save') throw new Error('not enough permissions');
+        return [];
+      }),
+    }) as unknown as RouterOSClient);
+    let ran = false;
+    await expect(withSafeApply(device,
+      { kind: 'backup.restore', summary: 's', requireProtection: true, requireProtectionOnlyWhenEnabled: true },
+      async () => { ran = true; return 'ok'; })).rejects.toBeInstanceOf(GuardRequiredError);
+    expect(ran).toBe(false);
+  });
+
   // ── Disarm must be proven (P2-5, P2-6) ────────────────────────────────────
 
   it('does not record a commit when the scheduler cannot be read back after the change', async () => {
@@ -366,10 +434,44 @@ describe('review fixes: revert/commit race and partial apply (H1, M1)', () => {
     });
     expect(out.confirmed).toBe(false);
     expect(out.autoReverting).toBe(true);
+    expect(out.revertMayHaveFired).toBe(true);
     expect(statuses()).toContain('uncertain');
     expect(statuses()).not.toContain('committed');
     // The restore steps may be mid-way: they must not be deleted.
     expect(deviceScripts.length).toBeGreaterThan(0);
+  });
+
+  // PR #282 review: a remove that lands with its reply lost looked, on the
+  // retry, exactly like a revert that had removed its own scheduler.
+  it('disables the scheduler before removing it', async () => {
+    await withSafeApply(device, { kind: 'test', summary: 's' }, async () => { applyDone = true; return 'ok'; });
+    const tail = commands.slice(commands.indexOf('/system/scheduler/set'));
+    expect(tail.indexOf('/system/scheduler/set')).toBeLessThan(tail.indexOf('/system/scheduler/remove'));
+  });
+
+  it('commits when the remove landed but its reply was lost', async () => {
+    const out = await withSafeApply(device, { kind: 'test', summary: 's' }, async () => {
+      applyDone = true;
+      lostReplyOn = '/system/scheduler/remove';
+      return 'ok';
+    });
+    expect(out.confirmed).toBe(true);
+    expect(out.autoReverting).toBe(false);
+    expect(out.revertMayHaveFired).toBeUndefined();
+    expect(statuses()).toContain('committed');
+    expect(deviceSchedulers).toHaveLength(0);
+    expect(deviceFiles).toHaveLength(0);
+  });
+
+  it('commits when the disable landed but its reply was lost', async () => {
+    const out = await withSafeApply(device, { kind: 'test', summary: 's' }, async () => {
+      applyDone = true;
+      lostReplyOn = '/system/scheduler/set';
+      return 'ok';
+    });
+    expect(out.confirmed).toBe(true);
+    expect(statuses()).toContain('committed');
+    expect(deviceSchedulers).toHaveLength(0);
   });
 
   it('H1: nothing is committed when apply + verify ran into the revert timer', async () => {
@@ -408,11 +510,11 @@ describe('review fixes: revert/commit race and partial apply (H1, M1)', () => {
     expect(statuses()).not.toContain('failed');
   });
 
-  it('H1: a removal that returns at the fire time is not trusted as a commit', async () => {
+  it('H1: a disable that returns at the fire time is not trusted as a commit', async () => {
     const realNow = Date.now.bind(Date);
-    // The clock jumps past the fire time while the scheduler is being removed.
+    // The clock jumps past the fire time while the scheduler is being disabled.
     const spy = jest.spyOn(Date, 'now')
-      .mockImplementation(() => realNow() + (commands.includes('/system/scheduler/remove') ? 200_000 : 0));
+      .mockImplementation(() => realNow() + (commands.includes('/system/scheduler/set') ? 200_000 : 0));
     try {
       const out = await withSafeApply(device, { kind: 'test', summary: 's', timeoutSec: 120 }, async () => {
         applyDone = true;

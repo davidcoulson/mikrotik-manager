@@ -260,6 +260,11 @@ Two columns show how the manager reaches each device, and each has a filter:
 
 The list updates by itself as polls finish; there is no need to reload.
 
+**Columns** at the end of the filter bar shows or hides columns, apart from the status dot,
+the name and the action buttons (#283). Drag a column header's right edge to make it wider or
+narrower, and double-click that edge to put it back. **Reset columns** restores the
+defaults. The choice is remembered in your browser.
+
 ### Device names
 
 A device's name follows its RouterOS identity (`/system identity`): rename a router on the
@@ -323,6 +328,15 @@ powered devices, or anything else that drops out normally. Such a device:
 - alerts once if it stays offline longer than its limit (24 hours by default; 0 means never),
   and then sends a recovery alert when it returns
 
+### Resetting a device's outage count
+
+The dashboard lists a device that went offline several times in the last week as *had N
+outages this week*. Once you've dealt with the cause, or the drops were expected (an LTE link
+reconnecting, say), **Reset count** on that item counts the device's outages from now on, so
+the item goes away until it drops again (#85). Only the count is reset: the availability
+history, uptime figures and reports keep every outage. **Snooze** instead hides the item for
+24 hours.
+
 ## Device tabs
 
 | Tab | What it is for |
@@ -359,6 +373,25 @@ other one. Before 0.24.39 an emptied field was left out of the save and the devi
 value, while the page showed it gone.
 
 On a switch port, changing flow control in one direction leaves the other direction alone.
+
+### IP addresses
+
+The **Config** tab's **IP Addresses** card lists the device's IPv4 addresses. Add one with the
+form below the list, remove one with the bin, or click the pencil to edit it in place: the
+address and prefix, the interface, the comment, and whether it's enabled (#285). Only the
+fields you change are sent. Dynamic addresses (from a DHCP client, say) can't be edited.
+
+Every change runs through [Change Guard](change-guard.md). Changing, disabling or moving the
+address the manager connects to is predicted as a lockout and stops for confirmation, and
+moving it to another interface counts too, since the manager reaches it through the old one.
+
+### Bandwidth queues and FastTrack
+
+The **Queues** tab, and **Limit this client** on a client's page, create a RouterOS simple
+queue. FastTracked connections skip simple queues, so on a device with an enabled FastTrack
+rule a queue only limits traffic that isn't FastTracked. When the device has one, the queue
+dialog says so (#280). To limit a target, exclude it from FastTrack (for example, an accept rule
+for it above the FastTrack rule) or turn FastTrack off.
 
 ## Ports and the faceplate
 
@@ -430,6 +463,19 @@ with no ports, addresses, VLAN interfaces or DHCP server can be deleted.
 Moving ports and deleting bridges run through [Change Guard](change-guard.md): moving the port
 management traffic arrives on out of its bridge is predicted as a lockout before anything is
 applied.
+
+### VLANs in the switch chip's table
+
+Older switch chips, such as the Atheros 8327 in a hAP ac² and the chips in the RB951 and hEX
+lite, can't hardware-switch a bridge with VLAN filtering on: turning it on moves that bridge's
+switching to the CPU. On these chips VLANs belong in the switch chip's own table (**Switch,
+VLAN** in WinBox), with each port's VLAN mode, VLAN header and default VLAN.
+
+On such a device the **VLANs** tab shows a **Switch chip VLANs** card with that table and the
+port settings (#278), and no longer suggests turning on bridge VLAN filtering. The card is
+read-only for now: change these settings in WinBox or with a command. Chips that do VLAN
+filtering in hardware on RouterOS 7 (CRS3xx and other Marvell switches, and the hEX's MT7621)
+use bridge VLAN filtering as described above and don't show the card.
 
 ## Routing between VLANs in hardware
 

@@ -14,7 +14,7 @@
  * (which is why effective `current-*` membership is what we test).
  */
 import { evaluateInputChain } from './firewallPath';
-import { vlanMembership, bareGateway, routeFor, routeActive, routeDiscards, type DeviceSnapshot, type ManagementPath } from './pathModel';
+import { vlanMembership, routeFor, routeActive, routeDiscards, type DeviceSnapshot, type ManagementPath } from './pathModel';
 import type { GuardDevice } from './ChangeGuard';
 import { managementService } from '../../utils/apiTls';
 
@@ -67,6 +67,27 @@ export const INVARIANTS: Invariant[] = [
       return found
         ? ok()
         : { ok: false, detail: `No enabled IP address ${path.mgmtIp} would remain on the device — the manager connects to exactly that address.` };
+    },
+  },
+
+  {
+    // A check of its own, not part of mgmt-ip-present: a violation already
+    // present would otherwise hide that one (an address on a bridge port is
+    // held by the bridge, which this compares by actual-interface).
+    id: 'mgmt-ip-interface',
+    title: 'The management address stays on the interface the manager reaches it through',
+    check(snap, path) {
+      if (!path.mgmtInterface) return ok();
+      const rows = snap.addresses.filter(
+        (a) => !isTrue(a['disabled']) && !isTrue(a['invalid']) && stripCidr(a['address']) === path.mgmtIp
+      );
+      if (rows.length === 0) return ok(); // mgmt-ip-present reports that
+      if (rows.some((a) => (a['actual-interface'] || a['interface']) === path.mgmtInterface)) return ok();
+      const now = rows[0]['actual-interface'] || rows[0]['interface'];
+      return {
+        ok: false,
+        detail: `${path.mgmtIp} would move from ${path.mgmtInterface} to ${now} (#285). The manager reaches the device through ${path.mgmtInterface}, so the address would stop answering there.`,
+      };
     },
   },
 
@@ -386,9 +407,9 @@ export const INVARIANTS: Invariant[] = [
       // route pointing somewhere else entirely.
       const target = path.managerIp ?? '0.0.0.0';
       const best = path.managerIp
-        ? routeFor(snap, path.managerIp, path.mgmtTable)
+        ? routeFor(snap, path.managerIp)
         : snap.routes
-          .filter((r) => (r['dst-address'] || '') === '0.0.0.0/0' && routeActive(r, path.mgmtTable))
+          .filter((r) => (r['dst-address'] || '') === '0.0.0.0/0' && routeActive(r))
           .sort((x, y) => (parseInt(x['distance'] || '255', 10) || 255) - (parseInt(y['distance'] || '255', 10) || 255))[0] ?? null;
       if (!best) {
         return path.managerIp
@@ -401,17 +422,14 @@ export const INVARIANTS: Invariant[] = [
           detail: `The route that would carry traffic back to the manager (${best['dst-address']}) discards it (${best['type'] || 'blackhole'}).`,
         };
       }
-      const gw = bareGateway(best['gateway']);
-      const via = [gw, bareGateway(best['immediate-gw'])];
+      const gw = (best['gateway'] || '').split('%')[0].trim();
+      const via = [gw, (best['immediate-gw'] || '').split('%')[0].trim()];
       if (!via.includes(path.managerGateway)) {
         return {
           ok: true,
           uncertain: true,
           detail: `The route back toward the manager would go through ${gw || best['dst-address']} instead of ${path.managerGateway}. That may be fine, but the model cannot confirm the manager is reachable that way.`,
         };
-      }
-      if (!path.mgmtTableCertain) {
-        return { ok: true, uncertain: true, detail: `A route in ${path.mgmtTable} remains, but the routing table management uses could not be confirmed.` };
       }
       return ok();
     },

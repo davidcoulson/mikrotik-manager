@@ -64,6 +64,8 @@ import { parseAllowedList, configuredServices, allowedFromKey, managerPeer, addr
 import { portErrorSummaries, thresholds } from '../services/interfaceErrors';
 import { clientAddressListView } from '../utils/addressLists';
 import { l3hwView } from '../utils/l3hw';
+import { switchVlanView } from '../utils/switchVlans';
+import { ipAddressEdit } from '../utils/ipAddressEdit';
 import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
 
 const router = Router();
@@ -731,6 +733,16 @@ router.delete('/:id', requireWrite, async (req: Request, res: Response) => {
 });
 
 // POST /api/devices/:id/sync - run a full resync and wait for it to complete
+// POST /api/devices/:id/outages/reset — start the "had N outages this week"
+// count again from now (#85), e.g. after a known run of LTE reconnects. The
+// availability history and uptime figures are left alone.
+router.post('/:id/outages/reset', requireWrite, async (req: Request, res: Response) => {
+  const row = await queryOne<{ outages_reset_at: string }>(
+    `UPDATE devices SET outages_reset_at = NOW() WHERE id = $1 RETURNING outages_reset_at`, [req.params.id]);
+  if (!row) return res.status(404).json({ error: 'Device not found' });
+  return res.json({ message: 'Outage count reset', outages_reset_at: row.outages_reset_at });
+});
+
 router.post('/:id/sync', requireWrite, async (req: Request, res: Response) => {
   const deviceRow = await queryOne<DeviceRow>(
     `SELECT * FROM devices WHERE id = $1`,
@@ -1472,6 +1484,25 @@ router.get('/:id/l3hw', async (req, res) => {
   });
 });
 
+// GET /api/devices/:id/switch-vlans — the switch chip's own VLAN table and
+// port VLAN settings (#278), read live. Only older chips (Atheros 8327,
+// QCA8337 and similar) have them; elsewhere the menu doesn't exist and
+// supported is false. Read-only.
+router.get('/:id/switch-vlans', async (req, res) => {
+  await withCollector(req.params.id, res, async (c) => {
+    const run = c.commandRunner();
+    const none = () => [] as Record<string, string>[];
+    const [switches, vlanTable, ports, bridges] = await Promise.all([
+      run.execute('/interface/ethernet/switch/print').catch(none),
+      // null, not [], when the menu doesn't exist on this chip.
+      run.execute('/interface/ethernet/switch/vlan/print').catch(() => null),
+      run.execute('/interface/ethernet/switch/port/print').catch(none),
+      run.execute('/interface/bridge/print').catch(none),
+    ]);
+    return switchVlanView(switches, vlanTable, ports, bridges);
+  });
+});
+
 // PUT /api/devices/:id/l3hw { enabled, acknowledge_firewall? } — turn L3
 // hardware offloading on or off (#254), under Change Guard: the switch chip
 // reprograms its tables, which can interrupt forwarding briefly. Turning it on
@@ -2082,6 +2113,30 @@ router.post('/:id/ip-addresses', requireWrite, async (req: Request, res: Respons
     async (c) => {
       await c.addIpAddress(address, iface);
       return { message: `Address ${address} added` };
+    },
+    async (c) => { await c.collectIpAddressesCache(); }
+  );
+});
+
+// PUT /api/devices/:id/ip-addresses/:addrId { address?, interface?, comment?, disabled? }
+// Edit an address in place (#285). Guarded and predicted: changing, moving or
+// disabling the address the manager connects to cuts it off.
+router.put('/:id/ip-addresses/:addrId', requireWrite, async (req: Request, res: Response) => {
+  const parsed = ipAddressEdit(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const fields = parsed.fields;
+  await withGuardedChange(
+    req.params.id,
+    req,
+    res,
+    {
+      kind: 'ip.set',
+      summary: `Edit IP address ${fields.address ?? req.params.addrId}`,
+      change: { kind: 'ip.set', addressId: req.params.addrId, fields },
+    },
+    async (c) => {
+      await c.updateIpAddress(req.params.addrId, fields);
+      return { message: 'IP address updated' };
     },
     async (c) => { await c.collectIpAddressesCache(); }
   );

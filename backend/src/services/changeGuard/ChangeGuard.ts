@@ -29,7 +29,6 @@ import { decrypt } from '../../utils/crypto';
 import { query, queryOne } from '../../config/database';
 import { redis } from '../../config/redis';
 import { heldLockToken, restoreHeldLock } from './deviceLock';
-import { backupBeforeChange } from './preChangeBackup';
 import { isPartialApply, PartialApplyRevertError } from './partialApply';
 import { restoreScopeFor, captureScope, buildRestorePlan, type RestorePlan } from './scriptRestore';
 
@@ -66,6 +65,13 @@ export interface ChangeMeta {
    * auto-revert, and without it a mistake strands the device.
    */
   requireProtection?: boolean;
+  /**
+   * With `requireProtection`: still refuse when the guard is on but cannot arm,
+   * but run unprotected when the operator has turned Change Guard off in
+   * Settings, as unflagged changes do. For changes that are risky but carry no
+   * lockout warning the user confirmed past (a backup restore).
+   */
+  requireProtectionOnlyWhenEnabled?: boolean;
 }
 
 /** Thrown, before anything is applied, when a change requires protection it cannot have. */
@@ -87,6 +93,12 @@ export interface GuardOutcome<T> {
    * reboot, in binary mode) at about this time.
    */
   revertMayFireAt?: string;
+  /**
+   * The revert's scheduler was gone before the commit could disable it: the
+   * revert may have fired (or it was removed by hand), so the change may or
+   * may not still be on the device.
+   */
+  revertMayHaveFired?: boolean;
   guardId?: number;
   /** The restore actually armed: script mode falls back to binary for changes it can't cover. */
   mode?: GuardMode;
@@ -375,6 +387,9 @@ async function verifyReachable(device: GuardDevice, attempts = VERIFY_ATTEMPTS):
   return false;
 }
 
+/** How long an unprotected restore's device lock outlives an ambiguous failure. */
+const UNPROTECTED_HOLD_SEC = 300;
+
 async function acquireLock(deviceId: number): Promise<boolean> {
   // The request already holds this device's write lock (deviceLock.ts); the
   // guarded change runs under it.
@@ -462,13 +477,33 @@ export async function withSafeApply<T>(
   const timeoutSec = Math.max(meta.minTimeoutSec ?? 0, meta.timeoutSec ?? settings.timeoutSec);
 
   if (!settings.enabled) {
-    if (meta.requireProtection) {
+    if (meta.requireProtection && !meta.requireProtectionOnlyWhenEnabled) {
       throw new GuardRequiredError(
         'Change Guard is turned off in Settings, so this change would have no auto-revert. ' +
         'It could cut off management, so it was not applied. Turn Change Guard on to apply it.'
       );
     }
-    return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason: 'Change Guard is disabled in settings' };
+    const unprotectedReason = 'Change Guard is disabled in settings';
+    if (!meta.requireProtectionOnlyWhenEnabled) {
+      return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason };
+    }
+    // A restore that runs without a revert still must not overlap another
+    // import or a revert that is still armed: serialisation is not optional.
+    if (!(await acquireLock(device.id))) {
+      throw new Error('Another change is already in progress on this device. Please wait for it to finish.');
+    }
+    let hold = false;
+    try {
+      return { result: await applyFn(), confirmed: false, autoReverting: false, unprotectedReason };
+    } catch (err) {
+      // An import that failed after dispatch may still be running on the
+      // device; keep it locked until it can no longer overlap a retry.
+      hold = isPartialApply(err);
+      throw err;
+    } finally {
+      if (hold) await holdLock(device.id, Math.max(timeoutSec, UNPROTECTED_HOLD_SEC));
+      else await releaseLock(device.id);
+    }
   }
   if (!(await acquireLock(device.id))) {
     throw new Error('Another protected change is already in progress on this device. Please wait for it to finish.');
@@ -651,12 +686,13 @@ export async function withSafeApply<T>(
     phase('disarm');
     armed = false;
     if (!d.disarmed && d.alreadyGone) {
-      // Not removed by us: the on-event ran. Its restore steps may be mid-way, so
+      // Gone before we disabled it, so not our doing: the on-event probably ran
+      // (or someone removed it by hand). Its restore steps may be mid-way, so
       // they are left where they are and the change is not reported as kept.
       holdFor = LOCK_AFTER_FIRE_SEC;
-      await setGuardStatus(guardId, 'uncertain', `The revert had already fired (${d.reason}); the device may have restored its previous configuration`);
+      await setGuardStatus(guardId, 'uncertain', `The revert may already have fired (${d.reason}); the device may have restored its previous configuration`);
       return {
-        result: result as T, confirmed: false, autoReverting: true, guardId,
+        result: result as T, confirmed: false, autoReverting: true, revertMayHaveFired: true, guardId,
         revertMayFireAt: fireAt.toISOString(), mode, modeNote, timings,
       };
     }
@@ -686,7 +722,8 @@ const DISARM_ATTEMPTS = 3;
 const DISARM_CUTOFF_MS = 3_000;
 
 /**
- * Disarm: remove the scheduler, prove it is gone, then remove the restore point.
+ * Disarm: disable the scheduler and see it disabled, remove it, prove it is
+ * gone, then remove the restore point.
  *
  * Every attempt uses a fresh connection (the change may have left the old one
  * poisoned), and a failed read is a failure, not an empty list. The restore
@@ -698,36 +735,65 @@ async function disarm(
   opts: { requirePresent?: boolean; fireAtMs?: number } = {}
 ): Promise<{ disarmed: boolean; reason?: string; alreadyGone?: boolean }> {
   let reason = 'unknown';
-  /** We issued a successful remove ourselves, so a later absence is our doing. */
-  let removedByUs = false;
-  /** Past this, a removal can no longer be told apart from one the revert beat. */
+  /**
+   * The scheduler was seen disabled before the cutoff. A disabled scheduler
+   * never runs its on-event, so from then on an absent one is our own removal
+   * (its reply lost), never the revert.
+   */
+  let disabledConfirmed = false;
+  /** Past this, a disable can no longer be told apart from one the revert beat. */
   const cutoff = opts.fireAtMs !== undefined ? opts.fireAtMs - DISARM_CUTOFF_MS : Infinity;
   for (let attempt = 0; attempt < DISARM_ATTEMPTS; attempt++) {
-    if (Date.now() >= cutoff) {
+    if (Date.now() >= cutoff && !disabledConfirmed) {
       return { disarmed: false, reason: 'the revert timer was about to fire, so the disarm was abandoned' };
     }
     const client = newClient(device, VERIFY_CONNECT_TIMEOUT_MS);
     try {
       await client.connect();
-      const scheds = await client.execute('/system/scheduler/print');
-      const present = scheds.filter((s) => s['name'] === schedulerName && s['.id']);
-      // After a commit attempt the scheduler must still be there: the revert's
-      // on-event removes it before restoring, so an absent one means it fired.
-      if (present.length === 0 && opts.requirePresent && !removedByUs) {
-        return {
-          disarmed: false, alreadyGone: true,
-          reason: 'the revert scheduler was no longer on the device before it was removed',
-        };
+      const find = async () => (await client.execute('/system/scheduler/print'))
+        .filter((s) => s['name'] === schedulerName && s['.id']);
+      let present = await find();
+      if (opts.requirePresent && !disabledConfirmed) {
+        // After a commit attempt the scheduler must still be there. The revert's
+        // on-event removes it before restoring (script mode) or loads a backup
+        // that predates it (binary), so an absent one means it may have fired,
+        // or someone removed it by hand. Its restore steps may be mid-way.
+        if (present.length === 0) {
+          return {
+            disarmed: false, alreadyGone: true,
+            reason: 'the revert scheduler was gone before it could be disabled',
+          };
+        }
+        // Disable first, then remove. A lost reply on a bare remove left a
+        // retry unable to tell our removal from the revert's own; a disabled
+        // scheduler stays visible and cannot fire, so the retry can.
+        const live = present.filter((s) => s['disabled'] !== 'true');
+        if (live.length > 0) {
+          for (const s of live) {
+            await client.execute('/system/scheduler/set', { '.id': s['.id'], disabled: 'yes' });
+          }
+          present = await find();
+          if (present.length === 0) {
+            return {
+              disarmed: false, alreadyGone: true,
+              reason: 'the revert scheduler disappeared while it was being disabled',
+            };
+          }
+          if (present.some((s) => s['disabled'] !== 'true')) {
+            reason = 'the scheduler was still enabled after disabling it';
+            continue;
+          }
+        }
+        // Seen disabled only after the cutoff: the disable may have landed after
+        // the on-event began (binary mode loads the backup without removing the
+        // scheduler first). Keep the restore point.
+        if (Date.now() >= cutoff) {
+          return { disarmed: false, reason: 'the scheduler was disabled too close to its fire time to prove it had not started' };
+        }
+        disabledConfirmed = true;
       }
       for (const s of present) {
         await client.execute('/system/scheduler/remove', { '.id': s['.id'] });
-        removedByUs = true;
-      }
-      // A removal that returned this close to the fire time may have landed
-      // after the on-event began (binary mode loads the backup without removing
-      // the scheduler first), and "gone" proves nothing then. Keep the restore point.
-      if (removedByUs && Date.now() >= cutoff) {
-        return { disarmed: false, reason: 'the scheduler was removed too close to its fire time to prove it had not started' };
       }
       const after = await client.execute('/system/scheduler/print');
       if (after.some((s) => s['name'] === schedulerName)) {

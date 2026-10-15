@@ -274,21 +274,11 @@ export function vlanMembership(
   };
 }
 
-export const MAIN_TABLE = 'main';
-
-/** Routing table a route lives in; RouterOS 6 rows and fixtures leave it blank (main). */
-export function routeTable(r: RosRow): string {
-  return (r['routing-table'] || '').trim() || MAIN_TABLE;
-}
-
-/**
- * An active route in `table` (default main): one the device can select for
- * forwarding traffic in that table. A route in another table never carries the
- * management session, so it doesn't count either way.
- */
-export function routeActive(r: RosRow, table: string = MAIN_TABLE): boolean {
+/** An active route in the main table: one the device can select for forwarding. */
+export function routeActive(r: RosRow): boolean {
   if (isTrue(r['disabled']) || r['active'] === 'false') return false;
-  return routeTable(r) === (table || MAIN_TABLE);
+  const table = (r['routing-table'] || '').trim();
+  return table === '' || table === 'main';
 }
 
 /** A route that wins selection but throws traffic away rather than forwarding it. */
@@ -297,27 +287,22 @@ export function routeDiscards(r: RosRow): boolean {
 }
 
 /** Can this route carry the manager's traffic? */
-export function routeUsable(r: RosRow, table: string = MAIN_TABLE): boolean {
-  return routeActive(r, table) && !routeDiscards(r);
-}
-
-/** Gateway address with an interface (`%if`) or table (`@vrf`) qualifier removed. */
-export function bareGateway(gw: string | undefined): string {
-  return (gw || '').split(/[%@]/)[0].trim();
+export function routeUsable(r: RosRow): boolean {
+  return routeActive(r) && !routeDiscards(r);
 }
 
 /**
- * Longest-prefix match (then lowest distance) in `table`: the route the device
- * would use for `ip`. Discard routes take part in the selection, because that is
- * what the device does: a covering blackhole beats a default route, and the
- * caller must treat a winning discard as no way back (`routeDiscards`).
+ * Longest-prefix match (then lowest distance): the route the device would use for
+ * `ip`. Discard routes take part in the selection, because that is what the device
+ * does: a covering blackhole beats a default route, and the caller must treat a
+ * winning discard as no way back (`routeDiscards`).
  */
-export function routeFor(snap: DeviceSnapshot, ip: string, table: string = MAIN_TABLE): RosRow | null {
+export function routeFor(snap: DeviceSnapshot, ip: string): RosRow | null {
   let best: RosRow | null = null;
   let bestLen = -1;
   let bestDist = Infinity;
   for (const r of snap.routes) {
-    if (!routeActive(r, table)) continue;
+    if (!routeActive(r)) continue;
     const dst = r['dst-address'] || '';
     const [net, lenStr] = dst.split('/');
     const len = parseInt(lenStr ?? '32', 10);
@@ -551,8 +536,8 @@ export function resolveManagementPath(snap: DeviceSnapshot, device: GuardDevice)
     lookupIp = onLink ? managerIp : gw;
     if (!onLink && gw && ipToInt(gw) !== null) managerGateway = gw;
   } else {
-    const defaultRoute = snap.routes.find((r) => (r['dst-address'] || '') === '0.0.0.0/0' && routeUsable(r, mgmtTable));
-    const gw = defaultRoute?.['gateway'] ? bareGateway(defaultRoute['gateway']) || null : null;
+    const defaultRoute = snap.routes.find((r) => (r['dst-address'] || '') === '0.0.0.0/0' && routeUsable(r));
+    const gw = defaultRoute?.['gateway'] ? defaultRoute['gateway'].split('%')[0].trim() : null;
     if (gw && ipToInt(gw) !== null) { lookupIp = gw; viaDefaultGw = true; managerGateway = gw; }
   }
 
