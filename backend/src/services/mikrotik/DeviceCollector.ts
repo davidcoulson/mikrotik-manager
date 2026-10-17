@@ -1,3 +1,5 @@
+import type { BgpConnectionInput } from '../../utils/bgpConnection';
+import { routingPeersFrom } from '../../utils/routingPeers';
 import { PartialApplyError, stepFailure } from '../changeGuard/partialApply';
 import { createHash } from 'crypto';
 import { ApiNotEnabledError } from '../../utils/sshOnly';
@@ -379,6 +381,7 @@ export class DeviceCollector {
     await this.collectLte();
     if (this.modules.certificates) await this.collectCertificates();
     await this.collectWireGuardPeers();
+    await this.collectRoutingPeers();
     if (this.shouldCollectWireless()) {
       await this.collectWirelessInterfaces();
       await this.collectSecurityProfiles();
@@ -486,6 +489,78 @@ export class DeviceCollector {
     }
   }
 
+  /**
+   * BGP peers and OSPF neighbours (#279). Two cheap reads on a device without
+   * either; the sessions and neighbours only where something is configured. A
+   * failed read keeps what was stored, as for WireGuard.
+   */
+  async collectRoutingPeers(): Promise<void> {
+    const none = () => [] as Record<string, string>[];
+    let bgpConnections: Record<string, string>[];
+    let ospfInstances: Record<string, string>[];
+    try {
+      [bgpConnections, ospfInstances] = await Promise.all([
+        // RouterOS 7: connection; 6: peer. A device without either answers with a trap.
+        this.client.execute('/routing/bgp/connection/print', { detail: '' })
+          .catch((e) => (e instanceof RouterOSTrapError
+            ? this.client.execute('/routing/bgp/peer/print', { detail: '' }).catch((e2) => (e2 instanceof RouterOSTrapError ? none() : Promise.reject(e2)))
+            : Promise.reject(e))),
+        this.client.execute('/routing/ospf/instance/print').catch((e) => (e instanceof RouterOSTrapError ? none() : Promise.reject(e))),
+      ]);
+    } catch {
+      return;
+    }
+    if (bgpConnections.length === 0 && ospfInstances.length === 0) {
+      await query(`DELETE FROM routing_peers WHERE device_id = $1`, [this.device.id]).catch(() => {});
+      return;
+    }
+    try {
+      const [bgpSessions, ospfNeighbors] = await Promise.all([
+        bgpConnections.length ? this.client.execute('/routing/bgp/session/print', { detail: '' }).catch(none) : none(),
+        ospfInstances.length ? this.client.execute('/routing/ospf/neighbor/print', { detail: '' }) : none(),
+      ]);
+      const peers = routingPeersFrom({ bgpConnections, bgpSessions, ospfNeighbors });
+      for (const p of peers) {
+        await query(
+          `INSERT INTO routing_peers (device_id, protocol, peer_key, name, remote_address, remote_as, remote_id, instance,
+                                      detail, state, up, disabled, uptime, prefix_count, last_up_at, last_change_at, last_seen_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, CASE WHEN $11 THEN NOW() END, NOW(), NOW(), NOW())
+           ON CONFLICT (device_id, protocol, peer_key) DO UPDATE SET
+             name = EXCLUDED.name, remote_address = EXCLUDED.remote_address, remote_as = EXCLUDED.remote_as,
+             remote_id = EXCLUDED.remote_id, instance = EXCLUDED.instance, detail = EXCLUDED.detail,
+             state = EXCLUDED.state, disabled = EXCLUDED.disabled, uptime = EXCLUDED.uptime,
+             prefix_count = EXCLUDED.prefix_count,
+             last_change_at = CASE WHEN routing_peers.up <> EXCLUDED.up THEN NOW() ELSE routing_peers.last_change_at END,
+             last_up_at = CASE WHEN EXCLUDED.up THEN NOW() ELSE routing_peers.last_up_at END,
+             up = EXCLUDED.up, last_seen_at = NOW(), updated_at = NOW()`,
+          [this.device.id, p.protocol, fit(p.key, 160), fit(p.name, 128), fit(p.remoteAddress, 64), fit(p.remoteAs, 16),
+           fit(p.remoteId, 64), fit(p.instance, 64), fit(p.detail, 160), fit(p.state, 32), p.up, p.disabled,
+           fit(p.uptime, 32), p.prefixCount]
+        );
+      }
+      const bgpKeys = peers.filter((p) => p.protocol === 'bgp').map((p) => fit(p.key, 160));
+      const ospfKeys = peers.filter((p) => p.protocol === 'ospf').map((p) => fit(p.key, 160));
+      // A BGP connection that's gone was removed on purpose.
+      await query(`DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'bgp' AND NOT (peer_key = ANY($2::text[]))`, [this.device.id, bgpKeys]);
+      if (ospfInstances.length === 0) {
+        await query(`DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'ospf'`, [this.device.id]);
+      } else {
+        // An OSPF neighbour that vanished has gone down: keep it, marked down,
+        // for a week, then forget it (a neighbour removed for good).
+        await query(
+          `UPDATE routing_peers SET up = FALSE, state = 'down', uptime = NULL,
+                  last_change_at = CASE WHEN up THEN NOW() ELSE last_change_at END, updated_at = NOW()
+            WHERE device_id = $1 AND protocol = 'ospf' AND NOT (peer_key = ANY($2::text[]))`,
+          [this.device.id, ospfKeys]);
+        await query(
+          `DELETE FROM routing_peers WHERE device_id = $1 AND protocol = 'ospf' AND last_seen_at < NOW() - INTERVAL '7 days'`,
+          [this.device.id]);
+      }
+    } catch (err) {
+      console.error(`[${this.device.name}] Failed to store routing peers:`, (err as Error).message);
+    }
+  }
+
   // ─── Log poll (every 60s) ─────────────────────────────────────────────────
 
   /** Collect new log lines; returns the ones actually stored, for log alerts. */
@@ -513,6 +588,10 @@ export class DeviceCollector {
     // refreshed on the five-minute slow poll (#131).
     await this.collectStp();
     await this.collectLte();
+    // WireGuard and routing peers too, so Sync shows a tunnel or BGP session
+    // that just came up or dropped (#279) rather than waiting for the slow poll.
+    await this.collectWireGuardPeers();
+    await this.collectRoutingPeers();
     // Wireless data belongs in a full resync too — without this, a manual sync
     // never refreshed radios/SSIDs (or pruned ones deleted on the device), so
     // the UI could only catch up on the 5-minute slow poll.
@@ -4129,6 +4208,17 @@ export class DeviceCollector {
     }
   }
 
+  /**
+   * Cut a port's PoE output for `seconds`, then restore it (#291): restarts
+   * an AP or camera powered from it. An action, not a configuration change.
+   */
+  async poePowerCycle(name: string, seconds: number): Promise<void> {
+    const ports = await this.client.execute('/interface/ethernet/poe/print', {}, [`?name=${name}`])
+      .catch((e) => (e instanceof RouterOSTrapError ? [] : Promise.reject(e)));
+    if (!ports[0]?.['.id']) throw new Error(`${name} doesn't supply PoE on this device.`);
+    await this.client.execute('/interface/ethernet/poe/power-cycle', { numbers: ports[0]['.id'], duration: `${seconds}s` });
+  }
+
   async getPoEStatus(name: string): Promise<Record<string, string> | null> {
     const result = await this.client
       .execute('/interface/ethernet/poe/print', {}, [`?name=${name}`])
@@ -4142,8 +4232,14 @@ export class DeviceCollector {
 
   async collectPoePower(): Promise<void> {
     try {
+      // monitor needs the ports named (`monitor ether9`, or `[find]` for all).
+      // Called without, it failed on every PoE switch, so no readings were
+      // ever stored and the PoE power-cycle button never appeared (#291).
+      const poe = await this.client.execute('/interface/ethernet/poe/print').catch(() => [] as Record<string, string>[]);
+      const ids = poe.map((p) => p['.id']).filter(Boolean);
+      if (ids.length === 0) return;
       const ports = await this.client
-        .execute('/interface/ethernet/poe/monitor', { once: '' })
+        .execute('/interface/ethernet/poe/monitor', { numbers: ids.join(','), once: '' })
         .catch(() => [] as Record<string, string>[]);
       if (ports.length === 0) return;
 
@@ -4151,7 +4247,11 @@ export class DeviceCollector {
       for (const port of ports) {
         const name = port['name'] || port['port-name'] || '';
         if (!name) continue;
-        const watts = parseFloat(port['poe-out-voltage'] || '0') * parseFloat(port['poe-out-current'] || '0') / 1000;
+        // RouterOS reports poe-out-power itself ("24.3W"); work it out from
+        // voltage and current only where it doesn't.
+        const watts = port['poe-out-power'] !== undefined
+          ? parseFloat(port['poe-out-power']) || 0
+          : parseFloat(port['poe-out-voltage'] || '0') * parseFloat(port['poe-out-current'] || '0') / 1000;
         const currentMa = parseFloat(port['poe-out-current'] || '0');
         const voltageV = parseFloat(port['poe-out-voltage'] || '0');
         writeApi.writePoint(
@@ -4789,6 +4889,58 @@ export class DeviceCollector {
 
   async removeIpAddress(id: string): Promise<void> {
     await this.client.execute('/ip/address/remove', { numbers: id });
+  }
+
+  // ─── Bridges tab (#284) ─────────────────────────────────────────────────
+
+  /** Every bridge with its ports, VLAN entries and addresses, read live. */
+  async getBridgesDetail(): Promise<{
+    bridges: Record<string, string>[]; ports: Record<string, string>[];
+    vlans: Record<string, string>[]; addresses: Record<string, string>[];
+  }> {
+    const none = () => [] as Record<string, string>[];
+    const [bridges, ports, vlans, addresses] = await Promise.all([
+      this.client.execute('/interface/bridge/print', { detail: '' }),
+      this.client.execute('/interface/bridge/port/print', { detail: '' }).catch(none),
+      this.client.execute('/interface/bridge/vlan/print', { detail: '' }).catch(none),
+      this.client.execute('/ip/address/print', { detail: '' }).catch(none),
+    ]);
+    return { bridges, ports, vlans, addresses };
+  }
+
+  async addBridge(fields: Record<string, string>): Promise<void> {
+    await this.client.execute('/interface/bridge/add', fields);
+  }
+
+  /** Rename, spanning tree, comment, disabled, by bridge name. */
+  async updateBridge(name: string, fields: Record<string, string>): Promise<void> {
+    const bridge = (await this.client.execute('/interface/bridge/print')).find((b) => b['name'] === name);
+    if (!bridge?.['.id']) throw new Error(`There is no bridge called ${name} on this device.`);
+    await this.setItem('/interface/bridge', bridge['.id'], fields);
+  }
+
+  // ─── Switch chip VLAN table (#278) ───────────────────────────────────────
+  // Older chips (Atheros 8327, QCA8337…) keep VLANs here rather than in a
+  // VLAN-filtering bridge. Fields are already checked (utils/switchVlanEdit).
+
+  async addSwitchVlan(fields: Record<string, string>): Promise<void> {
+    await this.client.execute('/interface/ethernet/switch/vlan/add', fields);
+  }
+
+  async updateSwitchVlan(id: string, fields: Record<string, string>): Promise<void> {
+    await this.setItem('/interface/ethernet/switch/vlan', id, fields);
+  }
+
+  async removeSwitchVlan(id: string): Promise<void> {
+    await this.client.execute('/interface/ethernet/switch/vlan/remove', { '.id': id });
+  }
+
+  /** A switch port's vlan-mode, vlan-header and default-vlan-id, by port name. */
+  async setSwitchPortVlan(name: string, fields: Record<string, string>): Promise<void> {
+    const port = (await this.client.execute('/interface/ethernet/switch/port/print'))
+      .find((p) => p['name'] === name);
+    if (!port?.['.id']) throw new Error(`Switch port ${name} not found`);
+    await this.setItem('/interface/ethernet/switch/port', port['.id'], fields);
   }
 
   /** Edit an address in place (#285): address, interface, comment, disabled; '' clears. */
@@ -5474,6 +5626,8 @@ export class DeviceCollector {
     connections: Record<string, string>[];
     sessions: Record<string, string>[];
     templates: Record<string, string>[];
+    /** RouterOS 7.20+ (and 6): the instances, which carry the local AS. */
+    instances: Record<string, string>[];
   }> {
     // ROS7 uses /routing/bgp/connection, ROS6 uses /routing/bgp/peer
     const [connections, sessions, templates] = await Promise.all([
@@ -5483,13 +5637,52 @@ export class DeviceCollector {
       this.client.execute('/routing/bgp/template/print', { detail: '' })
         .catch(() => this.client.execute('/routing/bgp/instance/print', { detail: '' }).catch(() => [] as Record<string, string>[])),
     ]);
-    return { connections, sessions, templates };
+    const instances = await this.client.execute('/routing/bgp/instance/print').catch(() => [] as Record<string, string>[]);
+    return { connections, sessions, templates, instances };
   }
 
-  async addBgpConnection(params: Record<string, string>): Promise<void> {
-    // Try ROS7 path first, then ROS6
-    await this.client.execute('/routing/bgp/connection/add', params)
-      .catch(() => this.client.execute('/routing/bgp/peer/add', params));
+  /**
+   * Add a BGP connection the way this RouterOS version wants it:
+   *  - 7.20+: connections belong to an instance, which carries the local AS.
+   *    The named or only instance is used; with none, one is created from the
+   *    local AS given.
+   *  - 7.0–7.19: no instance menu; the local AS goes on the connection.
+   *  - 6: a peer, under the default instance.
+   * The old version tried a 7 add and fell back to a 6 one on any error, so a
+   * 7.20+ device got "missing =instance=" reported as a peer error.
+   */
+  async addBgpConnection(c: BgpConnectionInput): Promise<{ instanceCreated?: string }> {
+    const trapOr = <T>(fallback: T) => (e: unknown) => (e instanceof RouterOSTrapError ? fallback : Promise.reject(e));
+    const ros7 = await this.client.execute('/routing/bgp/connection/print').then(() => true, trapOr(false));
+    if (!ros7) {
+      await this.client.execute('/routing/bgp/peer/add', {
+        name: c.name, 'remote-address': c.remoteAddress, 'remote-as': c.remoteAs,
+      });
+      return {};
+    }
+    const base = { name: c.name, 'remote.address': c.remoteAddress, 'remote.as': c.remoteAs, 'local.role': c.role };
+    const instances = await this.client.execute('/routing/bgp/instance/print').then((r) => r, trapOr(null));
+    if (instances === null) {
+      if (!c.localAs) throw new Error('Enter the local AS: this RouterOS version sets it on each connection.');
+      await this.client.execute('/routing/bgp/connection/add', { ...base, as: c.localAs });
+      return {};
+    }
+    let instance = c.instance;
+    let instanceCreated: string | undefined;
+    if (instance) {
+      if (!instances.some((i) => i['name'] === instance)) throw new Error(`There's no BGP instance called ${instance} on this device.`);
+    } else if (instances.length === 1) {
+      instance = instances[0]['name'];
+    } else if (instances.length > 1) {
+      throw new Error(`This device has ${instances.length} BGP instances; choose which one the connection belongs to.`);
+    } else {
+      if (!c.localAs) throw new Error('Enter the local AS: this device has no BGP instance yet, and one is created with it.');
+      instance = 'default';
+      await this.client.execute('/routing/bgp/instance/add', { name: instance, as: c.localAs, comment: 'created by MikroTik Manager' });
+      instanceCreated = instance;
+    }
+    await this.client.execute('/routing/bgp/connection/add', { ...base, instance: instance! });
+    return { instanceCreated };
   }
 
   async removeBgpConnection(id: string): Promise<void> {

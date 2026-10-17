@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import ReviewChangesButton from '../common/ReviewChangesButton';
 import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { RefreshCw, X, Check, AlertCircle, Activity, Link2, Trash2, Network, Users, Wifi, ShieldCheck, AlertTriangle, LayoutGrid, ExternalLink } from 'lucide-react';
+import { RefreshCw, X, Check, AlertCircle, Activity, Link2, Trash2, Network, Users, Wifi, ShieldCheck, AlertTriangle, LayoutGrid, ExternalLink, Zap } from 'lucide-react';
 import { devicesApi, metricsApi, type PortErrorSummary, type OpticStatus } from '../../services/api';
 import { chartTooltip } from '../common/chartTooltip';
 import FloatingWindow from '../common/FloatingWindow';
@@ -114,7 +114,7 @@ function PortTile({
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       onDoubleClick={onDoubleClick}
-      title={`${port.name}${port.comment ? ` — ${port.comment}` : ''}${port.link_rate || port.speed ? ` · ${port.link_rate || port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}${problems ? ` · ${problems}` : ''}`}
+      title={`${port.name}${port.comment || port.bridgeInfo?.config_json?.comment ? ` — ${port.comment || port.bridgeInfo?.config_json?.comment}` : ''}${port.link_rate || port.speed ? ` · ${port.link_rate || port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}${problems ? ` · ${problems}` : ''}`}
       style={{
         width: 46, height: 46, borderRadius: 4, position: 'relative', flexShrink: 0,
         background: bg, border: errTone && !selected ? `2px solid ${errTone}` : `1px solid ${border}`,
@@ -739,6 +739,25 @@ function PortClientsCard({ deviceId, portName }: { deviceId: number; portName: s
 export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, autoOpenBridge, onBridgeOpened }: Props) {
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
+  // PoE power-cycle (#291): which port is cycling, and how it went.
+  const [poeBusy, setPoeBusy] = useState<string | null>(null);
+  const [poeNote, setPoeNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const powerCycle = async (name: string) => {
+    if (!confirm(`Power-cycle PoE on ${name}? The device it powers loses power for 5 seconds and restarts.`)) return;
+    setPoeBusy(name); setPoeNote(null);
+    const run = async (confirmManagement: boolean): Promise<void> => {
+      try {
+        const r = await devicesApi.poePowerCycle(deviceId, name, 5, confirmManagement);
+        setPoeNote({ ok: true, text: r.data.message });
+      } catch (e) {
+        const d = (e as { response?: { status?: number; data?: { error?: string; needs_confirmation?: boolean } } }).response;
+        if (d?.status === 409 && d.data?.needs_confirmation && confirm(`${d.data.error}\n\nPower-cycle it anyway?`)) return run(true);
+        setPoeNote({ ok: false, text: d?.data?.error || 'Power-cycle failed' });
+      }
+    };
+    await run(false);
+    setPoeBusy(null);
+  };
   const [selectedPorts, setSelectedPorts] = useState<Set<string>>(new Set());
   const [hoveredPort, setHoveredPort] = useState<string | null>(null);
   const [editingPort, setEditingPort] = useState<SwitchPort | null>(null);
@@ -827,6 +846,15 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
   const poeWattsMap = Object.fromEntries(
     (poeMetrics?.ports ?? []).map(p => [p.port, p.watts])
   );
+  // Where PoE can be power-cycled (#291): the device's own list of PoE ports,
+  // not just the ones with power readings (an idle port has none).
+  const { data: poePortList } = useQuery({
+    queryKey: ['poe-ports', deviceId],
+    queryFn: () => devicesApi.getPoePorts(deviceId).then((r) => r.data.ports),
+    staleTime: 300_000,
+    retry: false,
+  });
+  const poeCapable = new Set<string>([...(poePortList ?? []).map((p) => p.name), ...Object.keys(poeWattsMap)]);
 
   // Auto-open bridge config panel when navigated from the VLANs tab warning
   useEffect(() => {
@@ -1328,6 +1356,17 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                 onClick={() => openEditPanel(singlePort)}
               >Configure</button>
             )}
+            {canWrite && singlePort && poeCapable.has(singlePort.name) && (
+              <button
+                className="btn-secondary text-[11px] flex items-center gap-[6px]"
+                style={{ padding: '5px 10px' }}
+                disabled={poeBusy !== null}
+                onClick={() => void powerCycle(singlePort.name)}
+                title="Turn PoE off for 5 seconds, then back on"
+              >
+                <Zap className="w-3 h-3" /> {poeBusy === singlePort.name ? 'Power-cycling…' : 'Power-cycle PoE'}
+              </button>
+            )}
             {canWrite && selectedPorts.size >= 2 && allEligible && (
               <button
                 className="btn-secondary text-[11px] flex items-center gap-[6px]"
@@ -1364,6 +1403,14 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
         );
       })()}
       </div>
+
+      {poeNote && (
+        <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-[12px]"
+          style={{ background: poeNote.ok ? 'var(--good-bg)' : 'var(--bad-bg, #fee2e2)', color: poeNote.ok ? 'var(--good)' : 'var(--bad)' }}>
+          <Zap className="w-3.5 h-3.5" /><span className="flex-1">{poeNote.text}</span>
+          <button type="button" onClick={() => setPoeNote(null)} style={{ opacity: 0.7 }}><X className="w-3.5 h-3.5" /></button>
+        </div>
+      )}
 
       {/* Faceplate card */}
       <div className="card" style={{ padding: '22px 26px', position: 'relative', overflow: 'hidden' }}>
@@ -1698,8 +1745,29 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                       ) : <span className="mono text-[11.5px]" style={{ color: 'var(--ink-4)' }}>—</span>}
                     </td>
                     <td className="px-4 py-[10px]"><span className="mono text-[11px]" style={{ color: 'var(--ink-4)' }}>{port.mac_address || '—'}</span></td>
-                    <td className="px-4 py-[10px]"><span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>{port.comment || '—'}</span></td>
+                    {/* The interface's own comment, or else the bridge port's (Bridge → Ports in
+                        WinBox), which is where many people put them (#290). */}
                     <td className="px-4 py-[10px]">
+                      {port.comment
+                        ? <span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>{port.comment}</span>
+                        : port.bridgeInfo?.config_json?.comment
+                          ? <span className="text-[12px]" style={{ color: 'var(--ink-3)' }} title="Comment on the bridge port (Bridge → Ports)">{port.bridgeInfo.config_json.comment}</span>
+                          : <span className="text-[12px]" style={{ color: 'var(--ink-3)' }}>—</span>}
+                    </td>
+                    <td className="px-4 py-[10px] whitespace-nowrap">
+                      {canWrite && poeCapable.has(port.name) && (
+                        <button
+                          className="p-1 rounded transition-colors disabled:opacity-40"
+                          style={{ color: poeBusy === port.name ? 'var(--warn)' : 'var(--ink-4)' }}
+                          onMouseEnter={e => (e.currentTarget.style.color = 'var(--warn)')}
+                          onMouseLeave={e => (e.currentTarget.style.color = poeBusy === port.name ? 'var(--warn)' : 'var(--ink-4)')}
+                          disabled={poeBusy !== null}
+                          onClick={(e) => { e.stopPropagation(); void powerCycle(port.name); }}
+                          title="Power-cycle PoE: off for 5 seconds, then back on"
+                        >
+                          <Zap className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       {canWrite && (
                         <button
                           className="p-1 rounded transition-colors"
@@ -1765,6 +1833,12 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                       onChange={(e) => setEditForm((f) => ({ ...f, comment: e.target.value }))}
                       placeholder="Port description..."
                     />
+                    {/* This edits the interface's comment; say so when the bridge port has its own (#290). */}
+                    {editingPort?.bridgeInfo?.config_json?.comment && (
+                      <p className="text-[11px] mt-1" style={{ color: 'var(--ink-4)' }}>
+                        The bridge port also has a comment: <span className="mono">{editingPort.bridgeInfo.config_json.comment}</span>. This field is the interface&apos;s own comment.
+                      </p>
+                    )}
                   </div>
 
                   <div>

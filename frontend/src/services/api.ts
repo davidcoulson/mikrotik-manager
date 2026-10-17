@@ -664,6 +664,8 @@ export interface PollSettings {
   overrides: Record<string, number | boolean>;
   site?: { id: number | null; name: string | null; overrides: Record<string, number | boolean> };
   effective: Record<string, { value: number | boolean; source: 'device' | 'site' | 'global' }>;
+  /** Device settings only: each value without this device's own override (#261). */
+  inherited?: Record<string, { value: number | boolean; source: 'device' | 'site' | 'global' }>;
 }
 
 export const devicesApi = {
@@ -789,6 +791,12 @@ export const devicesApi = {
     api.post<{ results?: Array<{ vlan_id: number; action: string; success: boolean; error?: string }>; guard?: { protected: boolean; confirmed: boolean; auto_reverting: boolean; unprotected_reason: string | null; revert_may_fire_at?: string | null }; message?: string }>(
       `/devices/${id}/vlans/copy`, { operations, ...(confirmLockout ? { confirm_lockout: true } : {}) }),
   reboot: (id: number) => api.post<{ message: string }>(`/devices/${id}/reboot`),
+  /** Ports that can supply PoE, read live (#291). */
+  getPoePorts: (id: number) => api.get<{ ports: { name: string; poeOut: string | null }[] }>(`/devices/${id}/poe`),
+  /** Cut a port's PoE output for a few seconds, then restore it (#291). */
+  poePowerCycle: (id: number, port: string, seconds = 5, confirmManagement = false) =>
+    api.post<{ message: string }>(`/devices/${id}/ports/${encodeURIComponent(port)}/poe-power-cycle`,
+      { seconds, ...(confirmManagement ? { confirm_management: true } : {}) }),
   getInterfaceErrors: (id: number) => api.get<InterfaceErrorsResponse>(`/devices/${id}/interface-errors`),
   getOptics: (id: number) => api.get<OpticsResponse>(`/devices/${id}/optics`),
   getOpticHistory: (id: number, port: string, days = 7) =>
@@ -817,6 +825,13 @@ export const devicesApi = {
   deleteBridge: (id: number, bridgeName: string, confirmLockout = false) =>
     api.delete(`/devices/${id}/bridges/${encodeURIComponent(bridgeName)}`,
       { ...GUARDED, ...(confirmLockout ? { data: { confirm_lockout: true } } : {}) }),
+  /** Bridges tab (#284): every bridge with ports, VLAN entries and addresses. */
+  getBridgesDetail: (id: number) => api.get<BridgeView[]>(`/devices/${id}/bridges`),
+  addBridge: (id: number, data: { name: string; protocol_mode?: string; priority?: string; vlan_filtering?: boolean; comment?: string }) =>
+    api.post(`/devices/${id}/bridges`, data, GUARDED),
+  updateBridge: (id: number, bridgeName: string,
+    data: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean }, confirmLockout = false) =>
+    api.put(`/devices/${id}/bridges/${encodeURIComponent(bridgeName)}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
   setBridgeVlanFiltering: (id: number, bridgeName: string, enabled: boolean, confirmLockout = false) =>
     api.put(`/devices/${id}/bridge/${encodeURIComponent(bridgeName)}/vlan-filtering`,
       { enabled, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
@@ -840,6 +855,15 @@ export const devicesApi = {
   getAddressLists: (id: number) => api.get<Record<string, string>[]>(`/devices/${id}/address-lists`),
   /** The switch chip's own VLAN table, on older chips (#278). Read-only. */
   getSwitchVlans: (id: number) => api.get<SwitchVlanView>(`/devices/${id}/switch-vlans`),
+  /** Switch chip VLAN edits (#278); each requires Change Guard's auto-revert. */
+  addSwitchVlan: (id: number, data: { switch: string; vlan_id: number; ports: string[]; disabled?: boolean }) =>
+    api.post(`/devices/${id}/switch-vlans`, data, { timeout: 120_000 }),
+  updateSwitchVlan: (id: number, entryId: string, data: { vlan_id?: number; ports?: string[]; disabled?: boolean }) =>
+    api.put(`/devices/${id}/switch-vlans/${encodeURIComponent(entryId)}`, data, { timeout: 120_000 }),
+  removeSwitchVlan: (id: number, entryId: string) =>
+    api.delete(`/devices/${id}/switch-vlans/${encodeURIComponent(entryId)}`, { timeout: 120_000 }),
+  setSwitchPortVlan: (id: number, port: string, data: { vlan_mode?: string; vlan_header?: string; default_vlan_id?: string }) =>
+    api.put(`/devices/${id}/switch-ports/${encodeURIComponent(port)}/vlan`, data, { timeout: 120_000 }),
   /** L3 hardware offloading on the switch chip (#254). */
   getL3Hw: (id: number) => api.get<L3HwView>(`/devices/${id}/l3hw`),
   setL3Hw: (id: number, enabled: boolean, acknowledgeFirewall = false) =>
@@ -2424,6 +2448,43 @@ export interface ClientAddressListView {
 }
 
 /** L3 hardware offloading on a device's switch chip (#254). */
+/** One bridge as the Bridges tab shows it (#284). */
+export interface BridgeView {
+  id: string; name: string; protocolMode: string; priority: string | null; vlanFiltering: boolean;
+  running: boolean; disabled: boolean; dynamic: boolean; comment: string | null; mtu: string | null; macAddress: string | null;
+  ports: { name: string; hw: boolean; pvid: string | null; disabled: boolean; inactive: boolean; dynamic: boolean; role: string | null }[];
+  vlans: string[];
+  addresses: string[];
+}
+
+/** A BGP peer or OSPF neighbour, as the slow polls last found it (#279). */
+export interface RoutingPeerRow {
+  device_id: number;
+  device_name: string;
+  device_status: string;
+  protocol: 'bgp' | 'ospf';
+  peer_key: string;
+  name: string | null;
+  remote_address: string | null;
+  remote_as: string | null;
+  remote_id: string | null;
+  instance: string | null;
+  detail: string | null;
+  state: string;
+  up: boolean;
+  disabled: boolean;
+  uptime: string | null;
+  prefix_count: number | null;
+  last_up_at: string | null;
+  last_change_at: string;
+  last_seen_at: string;
+  updated_at: string;
+}
+
+export const routingApi = {
+  peers: (deviceId?: number) => api.get<RoutingPeerRow[]>('/routing/peers', { params: deviceId ? { deviceId } : undefined }),
+};
+
 /** The switch chip's own VLAN table and port VLAN settings (#278). */
 export interface SwitchVlanView {
   supported: boolean;

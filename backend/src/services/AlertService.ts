@@ -26,7 +26,8 @@ export type AlertEventType =
   | 'wireguard_stale'
   | 'interface_errors'
   | 'interface_flapping'
-  | 'optic_degraded';
+  | 'optic_degraded'
+  | 'routing_peer_down';
 
 export interface AlertContext {
   deviceId?: number;
@@ -73,6 +74,7 @@ const EVENT_LABELS: Record<string, string> = {
   interface_errors:         'Interface Errors',
   interface_flapping:       'Interface Flapping',
   optic_degraded:           'Optic Light Level',
+  routing_peer_down:        'Routing Peer Down (BGP/OSPF)',
 };
 
 const EVENT_EMOJI: Record<string, string> = {
@@ -93,6 +95,7 @@ const EVENT_EMOJI: Record<string, string> = {
   interface_errors:         '📉',
   interface_flapping:       '🔁',
   optic_degraded:           '🔦',
+  routing_peer_down:        '🛣️',
 };
 
 const FAILED_DELIVERY_RETRY_MS = 60_000;

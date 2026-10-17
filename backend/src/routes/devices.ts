@@ -65,7 +65,11 @@ import { portErrorSummaries, thresholds } from '../services/interfaceErrors';
 import { clientAddressListView } from '../utils/addressLists';
 import { l3hwView } from '../utils/l3hw';
 import { switchVlanView } from '../utils/switchVlans';
+import { switchVlanEntry, switchPortVlan, validPortName } from '../utils/switchVlanEdit';
 import { ipAddressEdit } from '../utils/ipAddressEdit';
+import { parseBgpConnection } from '../utils/bgpConnection';
+import { parseBridgeCreate, parseBridgeUpdate } from '../utils/bridgeEdit';
+import { bridgesView } from '../utils/bridgesView';
 import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
 
 const router = Router();
@@ -95,6 +99,9 @@ router.get('/', async (req: Request, res: Response) => {
   const where = andSite('', siteScopeDevices(activeSite(req)));
   const devices = await query(
     `SELECT ${DEVICE_BASE_COLUMNS},
+            -- The Edit dialog opened from the list fills its SSH fields from
+            -- these; without them a save wiped the SSH username and port (#261).
+            ssh_port, ssh_username,
             latest_ros_version, firmware_update_available,
             routerboard_upgrade_available, upgrade_firmware_version,
             location_address, location_lat::float8 AS location_lat, location_lng::float8 AS location_lng,
@@ -1503,6 +1510,50 @@ router.get('/:id/switch-vlans', async (req, res) => {
   });
 });
 
+// Switch chip VLAN edits (#278). Change Guard can't simulate the switch chip,
+// so it can't predict a lockout here: every change requires auto-revert, and
+// is refused rather than run unprotected when the device can't arm it.
+const ROS_ID = /^\*[0-9A-Fa-f]+$/;
+
+// POST /api/devices/:id/switch-vlans { switch, vlan_id, ports[], independent_learning?, disabled? }
+router.post('/:id/switch-vlans', requireWrite, async (req: Request, res: Response) => {
+  const parsed = switchVlanEntry(req.body ?? {}, true);
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const f = parsed.fields;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'switch-vlan.add', summary: `Add switch VLAN ${f['vlan-id']} on ${f.switch}`, requireProtection: true },
+    async (c) => { await c.addSwitchVlan(f); return { message: `Switch VLAN ${f['vlan-id']} added` }; });
+});
+
+// PUT /api/devices/:id/switch-vlans/:entryId { vlan_id?, ports?, independent_learning?, disabled? }
+router.put('/:id/switch-vlans/:entryId', requireWrite, async (req: Request, res: Response) => {
+  if (!ROS_ID.test(req.params.entryId)) return res.status(400).json({ error: 'Not a switch VLAN entry id' });
+  const parsed = switchVlanEntry(req.body ?? {}, false);
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'switch-vlan.set', summary: `Edit switch VLAN entry ${req.params.entryId}`, requireProtection: true },
+    async (c) => { await c.updateSwitchVlan(req.params.entryId, parsed.fields); return { message: 'Switch VLAN updated' }; });
+});
+
+// DELETE /api/devices/:id/switch-vlans/:entryId
+router.delete('/:id/switch-vlans/:entryId', requireWrite, async (req: Request, res: Response) => {
+  if (!ROS_ID.test(req.params.entryId)) return res.status(400).json({ error: 'Not a switch VLAN entry id' });
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'switch-vlan.remove', summary: `Remove switch VLAN entry ${req.params.entryId}`, requireProtection: true },
+    async (c) => { await c.removeSwitchVlan(req.params.entryId); return { message: 'Switch VLAN removed' }; });
+});
+
+// PUT /api/devices/:id/switch-ports/:name/vlan { vlan_mode?, vlan_header?, default_vlan_id? }
+router.put('/:id/switch-ports/:name/vlan', requireWrite, async (req: Request, res: Response) => {
+  const name = req.params.name;
+  if (!validPortName(name)) return res.status(400).json({ error: 'Not a valid port name' });
+  const parsed = switchPortVlan(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'switch-port.vlan', summary: `Set switch VLAN settings on ${name}`, requireProtection: true },
+    async (c) => { await c.setSwitchPortVlan(name, parsed.fields); return { message: `VLAN settings on ${name} updated` }; });
+});
+
 // PUT /api/devices/:id/l3hw { enabled, acknowledge_firewall? } — turn L3
 // hardware offloading on or off (#254), under Change Guard: the switch chip
 // reprograms its tables, which can interrupt forwarding briefly. Turning it on
@@ -2478,6 +2529,50 @@ router.post('/:id/reboot', requireWrite, async (req: Request, res: Response) => 
   }
 });
 
+// GET /api/devices/:id/poe — the ports that can supply PoE, read live (#291):
+// where the power-cycle button belongs, whether or not anything is drawing
+// power right now. Empty on a device without PoE-out.
+router.get('/:id/poe', async (req: Request, res: Response) => {
+  await withCollector(req.params.id, res, async (c) => ({
+    ports: (await c.getAllPoEStatus()).map((p) => ({ name: p['name'] ?? '', poeOut: p['poe-out'] ?? null })).filter((p) => p.name),
+  }));
+});
+
+// POST /api/devices/:id/ports/:name/poe-power-cycle { seconds?, confirm_management? }
+// Cut a port's PoE output briefly and restore it (#291). Nothing to revert, so
+// not under Change Guard; but when management arrives on this port, the device
+// it powers may carry the manager's connection, so that asks first (409).
+router.post('/:id/ports/:name/poe-power-cycle', requireWrite, async (req: Request, res: Response) => {
+  const name = req.params.name;
+  if (!IFACE_NAME.test(name)) return res.status(400).json({ error: 'Invalid port name.' });
+  const seconds = req.body?.seconds === undefined ? 5 : Number(req.body.seconds);
+  if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) return res.status(400).json({ error: 'seconds must be a whole number from 1 to 60' });
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  if (req.body?.confirm_management !== true) {
+    try {
+      const path = resolveManagementPath(await captureSnapshot(deviceRow as unknown as GuardDevice), deviceRow as unknown as GuardDevice);
+      if (path.ingressPort === name) {
+        return res.status(409).json({
+          needs_confirmation: true,
+          error: `Management traffic reaches this device through ${name}. If the device it powers carries that traffic, the manager will lose contact for about ${seconds} seconds plus its boot time.`,
+        });
+      }
+    } catch { /* can't tell; the power-cycle itself is harmless to this device */ }
+  }
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    await collector.poePowerCycle(name, seconds);
+    console.log(`[poe] ${logSafe(deviceRow.name)}: power-cycled ${logSafe(name)} for ${seconds}s`);
+    return res.json({ message: `PoE on ${name} is off for ${seconds} seconds, then back on.` });
+  } catch (err) {
+    return res.status(500).json({ error: (err as Error).message });
+  } finally {
+    collector.disconnect();
+  }
+});
+
 // GET /api/devices/:id/clock
 router.get('/:id/clock', async (req: Request, res: Response) => {
   const deviceRow = await queryOne<any>(
@@ -2640,8 +2735,14 @@ router.get('/:id/routing/bgp', async (req: Request, res: Response) => {
 });
 
 router.post('/:id/routing/bgp/connection', requireWrite, async (req: Request, res: Response) => {
-  await withGuardedChange(req.params.id, req, res, { kind: 'routing.bgp.connection.post', summary: 'Add routing bgp connection' },
-    async (collector) => { await collector.addBgpConnection(req.body); return { success: true }; });
+  const parsed = parseBgpConnection(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'routing.bgp.connection.post', summary: `Add BGP connection ${parsed.name} to ${parsed.remoteAddress} (AS ${parsed.remoteAs})` },
+    async (collector) => {
+      const r = await collector.addBgpConnection(parsed);
+      return { success: true, ...(r.instanceCreated ? { instance_created: r.instanceCreated } : {}) };
+    });
 });
 
 router.delete('/:id/routing/bgp/connection/:itemId', requireWrite, async (req: Request, res: Response) => {
@@ -2977,7 +3078,7 @@ router.put('/:id/bridge/:bridgeName/vlan-filtering', requireWrite, async (req: R
 router.get('/:id/poll-settings', async (req: Request, res: Response) => {
   const s = await deviceSettings(Number(req.params.id));
   if (!s) return res.status(404).json({ error: 'Device not found' });
-  return res.json({ overrides: s.device, site: { id: s.siteId, name: s.siteName, overrides: s.site }, effective: s.effective });
+  return res.json({ overrides: s.device, site: { id: s.siteId, name: s.siteName, overrides: s.site }, effective: s.effective, inherited: s.inherited });
 });
 
 router.put('/:id/poll-settings', requireSiteAdmin, async (req: Request, res: Response) => {
@@ -2988,7 +3089,7 @@ router.put('/:id/poll-settings', requireSiteAdmin, async (req: Request, res: Res
   await query(`UPDATE devices SET poll_overrides = $2, updated_at = NOW() WHERE id = $1`,
     [Number(req.params.id), Object.keys(v.value).length ? JSON.stringify(v.value) : null]);
   const s = await deviceSettings(Number(req.params.id));
-  return res.json({ overrides: s!.device, site: { id: s!.siteId, name: s!.siteName, overrides: s!.site }, effective: s!.effective });
+  return res.json({ overrides: s!.device, site: { id: s!.siteId, name: s!.siteName, overrides: s!.site }, effective: s!.effective, inherited: s!.inherited });
 });
 
 // ─── Bridge membership for any port (#258) ──────────────────────────────────
@@ -3069,6 +3170,51 @@ router.post('/:id/bridge-ports/move', requireWrite, async (req: Request, res: Re
 });
 
 // DELETE /api/devices/:id/bridges/:bridgeName — only an empty, unused bridge.
+// GET /api/devices/:id/bridges — every bridge, its ports (hardware or CPU),
+// VLAN entries and addresses, for the Bridges tab (#284). Read live.
+router.get('/:id/bridges', async (req: Request, res: Response) => {
+  await withCollector(req.params.id, res, async (c) => bridgesView(await c.getBridgesDetail()));
+});
+
+// POST /api/devices/:id/bridges { name, protocol_mode?, priority?, vlan_filtering?, comment? }
+// A new, empty bridge changes nothing that's forwarding; it still runs under
+// Change Guard like every write.
+router.post('/:id/bridges', requireWrite, async (req: Request, res: Response) => {
+  const parsed = parseBridgeCreate(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const f = parsed.fields;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'bridge.add', summary: `Create bridge '${f.name}'` },
+    async (c) => { await c.addBridge(f); return { message: `Bridge ${f.name} created` }; },
+    async (c) => { await c.collectInterfaces(); });
+});
+
+// PUT /api/devices/:id/bridges/:bridgeName { name?, protocol_mode?, priority?, comment?, disabled? }
+// Renaming or changing spanning tree on the bridge management runs through
+// can't be simulated, so it requires auto-revert; disabling it is predicted
+// as a lockout. VLAN filtering has its own route with its own analysis.
+router.put('/:id/bridges/:bridgeName', requireWrite, async (req: Request, res: Response) => {
+  const name = req.params.bridgeName;
+  if (!IFACE_NAME.test(name)) return res.status(400).json({ error: 'Invalid bridge name.' });
+  const parsed = parseBridgeUpdate(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const f = parsed.fields;
+  const changes: PlannedChange[] = [];
+  if (f.name && f.name !== name) changes.push({ kind: 'path-object.change', name, what: `Renaming the bridge to ${f.name}` });
+  if (f['protocol-mode'] || f.priority) changes.push({ kind: 'path-object.change', name, what: 'Changing spanning tree' });
+  if (f.disabled) changes.push({ kind: 'interface.disable', name, disabled: f.disabled === 'yes' });
+  const what = [f.name && f.name !== name ? `rename to '${f.name}'` : '', f['protocol-mode'] ? `protocol ${f['protocol-mode']}` : '',
+    f.priority ? `priority ${f.priority}` : '', f.disabled ? (f.disabled === 'yes' ? 'disable' : 'enable') : '',
+    f.comment !== undefined ? 'comment' : ''].filter(Boolean).join(', ');
+  await withGuardedChange(req.params.id, req, res,
+    {
+      kind: 'bridge.set', summary: `Bridge '${name}': ${what}`,
+      ...(changes.length ? { change: changes.length === 1 ? changes[0] : { kind: 'batch', changes } } : {}),
+    },
+    async (c) => { await c.updateBridge(name, f); return { message: `Bridge ${f.name ?? name} updated` }; },
+    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); });
+});
+
 router.delete('/:id/bridges/:bridgeName', requireWrite, async (req: Request, res: Response) => {
   const name = req.params.bridgeName;
   if (!IFACE_NAME.test(name)) return res.status(400).json({ error: 'Invalid bridge name.' });

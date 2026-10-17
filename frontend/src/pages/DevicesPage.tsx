@@ -4,7 +4,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Plus, RefreshCw, Router, Trash2, ChevronRight,
-  Radar, Pencil, ShieldQuestion, Upload} from 'lucide-react';
+  Radar, Pencil, ShieldQuestion, Upload, Power} from 'lucide-react';
 import { devicesApi, topologyApi, metricsApi, tagsApi, adoptionApi} from '../services/api';
 import type { Device } from '../types';
 import type { DiscoveredDevice, AdoptionCandidate} from '../services/api';
@@ -25,7 +25,8 @@ import DeviceTypePill from '../components/devices/DeviceTypePill';
 import SortableHeader, { type SortDir } from '../components/common/SortableHeader';
 import { FilterBar, FilterSearch, FilterSelect } from '../components/common/FilterBar';
 
-type DeviceSortKey = 'name' | 'ip_address' | 'model' | 'serial_number' | 'ros_version' | 'status' | 'last_seen' | 'rack_name' | 'location_address';
+type DeviceSortKey = 'name' | 'ip_address' | 'model' | 'serial_number' | 'ros_version' | 'status' | 'last_seen' | 'rack_name' | 'location_address'
+  | 'device_type' | 'api' | 'login';
 type DiscoveredSortKey = 'identity' | 'address' | 'mac_address' | 'seen_by' | 'discovered_at';
 
 
@@ -220,6 +221,14 @@ export default function DevicesPage() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['devices'] }),
   });
 
+  // Reboot from the row (#292), with a confirmation naming the device.
+  const [rowNote, setRowNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const rebootMutation = useMutation({
+    mutationFn: (d: Device) => devicesApi.reboot(d.id).then((r) => ({ d, msg: r.data.message })),
+    onSuccess: ({ d }) => setRowNote({ ok: true, text: `${d.name}: reboot sent. It will be unreachable for a minute or two while it restarts.` }),
+    onError: (e: unknown, d) => setRowNote({ ok: false, text: `${d.name}: ${(e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'reboot failed'}` }),
+  });
+
   const deleteMutation = useMutation({
     mutationFn: (id: number) => devicesApi.delete(id),
     onSuccess: () => {
@@ -292,6 +301,10 @@ export default function DevicesPage() {
           case 'ros_version': return x.ros_version || '';
           case 'status': return x.status || '';
           case 'last_seen': return x.last_seen ? new Date(x.last_seen).getTime() : 0;
+          // Sortable too (#85): by what the column shows.
+          case 'device_type': return x.device_type || '';
+          case 'api': return apiKind(x);
+          case 'login': return LOGIN_LABEL[loginKind(x)];
           default: return '';
         }
       };
@@ -407,6 +420,14 @@ export default function DevicesPage() {
         )}
       </div>
 
+      {rowNote && (
+        <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-[12.5px]"
+          style={{ background: rowNote.ok ? 'var(--good-bg)' : 'var(--bad-bg, #fee2e2)', color: rowNote.ok ? 'var(--good)' : 'var(--bad)' }}>
+          <Power className="w-3.5 h-3.5" /><span className="flex-1">{rowNote.text}</span>
+          <button type="button" onClick={() => setRowNote(null)} className="text-[11px]" style={{ opacity: 0.7 }}>Dismiss</button>
+        </div>
+      )}
+
       {/* Filter bar */}
       <FilterBar>
         <FilterSearch value={search} onChange={setSearch} placeholder="Filter devices…" />
@@ -435,20 +456,25 @@ export default function DevicesPage() {
           <option value="key">SSH key only</option>
           <option value="both">Password + SSH key</option>
         </FilterSelect>
-        {(['all', 'online', 'offline', 'updates'] as const).map(f => (
+        {(['all', 'online', 'offline', 'updates'] as const).map(f => {
+          // "All" clears the AP/SW/RTR filter too, and only reads as selected
+          // when nothing is filtered by status or type (#85).
+          const active = f === 'all' ? statusFilter === 'all' && !typeFilter : statusFilter === f;
+          return (
           <button
             key={f}
-            onClick={() => setStatusFilter(f)}
+            onClick={() => { setStatusFilter(f); if (f === 'all') setTypeFilter(null); }}
             className="mono text-[11.5px] px-[10px] py-[4px] rounded-[5px] transition-colors capitalize"
             style={{
-              background: statusFilter === f ? 'var(--surface-3)' : 'transparent',
-              color: statusFilter === f ? 'var(--ink)' : 'var(--ink-3)',
+              background: active ? 'var(--surface-3)' : 'transparent',
+              color: active ? 'var(--ink)' : 'var(--ink-3)',
               border: 'none',
             }}
           >
             {f}
           </button>
-        ))}
+          );
+        })}
         <div className="w-px h-[18px] mx-1" style={{ background: 'var(--line)' }} />
         {(['AP', 'SW', 'RTR'] as const).map(t => {
           const colors: Record<string, string> = { AP: 'var(--info)', SW: 'var(--accent)', RTR: 'var(--violet)' };
@@ -456,6 +482,8 @@ export default function DevicesPage() {
             <button
               key={t}
               onClick={() => setTypeFilter(typeFilter === t ? null : t)}
+              title={typeFilter === t ? 'Show every type' : `Show only ${t === 'AP' ? 'access points' : t === 'SW' ? 'switches' : 'routers'}`}
+              aria-pressed={typeFilter === t}
               className="mono text-[11px] px-[8px] py-[4px] rounded-[5px] transition-colors"
               style={{
                 background: typeFilter === t ? 'var(--surface-3)' : 'transparent',
@@ -724,6 +752,24 @@ export default function DevicesPage() {
                               >
                                 <RefreshCw className={clsx('w-3.5 h-3.5', syncMutation.isPending && 'animate-spin')} />
                               </button>
+                              {!device.ssh_only && (
+                                <button
+                                  onClick={() => {
+                                    if (confirm(`Reboot ${device.name}? It will be unreachable for a minute or two while it restarts.`)) {
+                                      setRowNote(null);
+                                      rebootMutation.mutate(device);
+                                    }
+                                  }}
+                                  disabled={rebootMutation.isPending && rebootMutation.variables?.id === device.id}
+                                  className="p-1.5 rounded transition-colors disabled:opacity-40"
+                                  style={{ color: 'var(--ink-4)' }}
+                                  title="Reboot"
+                                  onMouseEnter={e => (e.currentTarget.style.color = 'var(--warn)')}
+                                  onMouseLeave={e => (e.currentTarget.style.color = 'var(--ink-4)')}
+                                >
+                                  <Power className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                               <button
                                 onClick={() => setEditDevice(device)}
                                 className="p-1.5 rounded transition-colors"

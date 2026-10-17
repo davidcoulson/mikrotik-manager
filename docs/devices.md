@@ -248,7 +248,8 @@ for a `write` user.
 ## The device list
 
 Filter by status, type, tag, rack or location, and sort by any column. The search box matches
-name, address, serial and MAC.
+name, address, serial and MAC. **All** clears the status and the AP/SW/RTR type filter; clicking
+the selected type again also clears it.
 
 Two columns show how the manager reaches each device, and each has a filter:
 
@@ -259,6 +260,9 @@ Two columns show how the manager reaches each device, and each has a filter:
   verified [SSH key](ssh-keys.md) (SSH then uses the key), **KEY** for a key without a password.
 
 The list updates by itself as polls finish; there is no need to reload.
+
+The power icon on a device's row reboots it, after a confirmation (#292). It isn't offered
+for a device added over SSH only.
 
 **Columns** at the end of the filter bar shows or hides columns, apart from the status dot,
 the name and the action buttons (#283). Drag a column header's right edge to make it wider or
@@ -343,6 +347,7 @@ history, uptime figures and reports keep every outage. **Snooze** instead hides 
 |---|---|
 | **Overview** | Status, uptime, model, firmware, resource graphs, location |
 | **Ports** | The switch faceplate, per-port configuration, bonds, VLAN membership |
+| **Bridges** | Every bridge, its ports, VLAN filtering and spanning tree; create, rename, edit, delete |
 | **VLANs** | The bridge VLAN table, and copying VLANs between switches |
 | **Radios** | Wireless interfaces, SSIDs, channels, connected clients |
 | **Firewall** | Filter, NAT and mangle rules, with reordering and counters |
@@ -406,10 +411,22 @@ Negotiated link rate and SFP module details — type, connector, vendor part num
 from the device rather than guessed from the port's name, which also distinguishes an empty
 cage from a copper port.
 
+A port's **Comment** is its interface comment, or, where that's empty, the comment on its
+bridge port (Bridge → Ports in WinBox), which is where many people put them (#290). Editing a
+port's comment here sets the interface comment.
+
 Use **ports per row** in the faceplate header if the default does not suit your hardware;
 the setting is remembered. Next to it, **top row** says which ports are on top: `1 3 5` (most
 models) or `2 4 6`, for models whose front panel has the even ports on top (#277). It appears
 when the Ethernet ports sit in two rows, and is remembered per model in your browser.
+
+### Power-cycling a PoE port
+
+On a port that supplies PoE, **Power-cycle PoE** turns its power off for 5 seconds and back on,
+which restarts the access point, camera or phone it powers (#291). It's in the selection bar
+when that port is selected, and as a lightning icon on the port's row in the port table. If
+management traffic reaches the device through that port, it asks first: the device being
+powered may be carrying the manager's connection.
 
 ### Changing a port's VLAN
 
@@ -472,10 +489,45 @@ switching to the CPU. On these chips VLANs belong in the switch chip's own table
 VLAN** in WinBox), with each port's VLAN mode, VLAN header and default VLAN.
 
 On such a device the **VLANs** tab shows a **Switch chip VLANs** card with that table and the
-port settings (#278), and no longer suggests turning on bridge VLAN filtering. The card is
-read-only for now: change these settings in WinBox or with a command. Chips that do VLAN
+port settings (#278), and no longer suggests turning on bridge VLAN filtering or offers to add
+bridge VLANs. You can edit it there:
+
+- **Add switch VLAN** adds an entry: a VLAN ID and its member ports. Include the CPU port
+  (`switch1-cpu`) for a VLAN the router itself needs to reach, such as one with a VLAN interface
+  on it; it's ticked to start with.
+- The pencil on an entry changes its ports or turns it on or off; the bin removes it.
+- Each port's **VLAN mode**, **VLAN header** and **default VLAN** are set in the table below,
+  with a save button that appears once you change a value. Hover a mode or header to see what
+  it does. `secure` with `always-strip` and a default VLAN is a typical access port;
+  `add-if-missing` a typical trunk.
+
+Every change runs through [Change Guard](change-guard.md) with auto-revert required. The
+lockout check can't model the switch chip, so it can't tell you in advance that a change is
+safe; instead, if the device stops answering, it restores its previous configuration. These
+changes use a binary restore point, so a revert also restarts the device. Where auto-revert
+can't be armed (Change Guard turned off, or a login without the `policy` permission), the
+change is refused rather than run unprotected. Chips that do VLAN
 filtering in hardware on RouterOS 7 (CRS3xx and other Marvell switches, and the hEX's MT7621)
 use bridge VLAN filtering as described above and don't show the card.
+
+## Bridges
+
+The **Bridges** tab lists every bridge on the device (#284): whether it's running, its spanning
+tree mode and priority, its comment, its ports, whether VLAN filtering is on and which VLANs
+have entries, and the addresses on it. A port switched by the CPU rather than the switch chip
+has a small chip icon; hover a port for its PVID and spanning tree role.
+
+- **New bridge** creates an empty one, with RSTP unless you choose otherwise. Add ports to it
+  on the **Ports** tab (see [Moving ports between bridges](#moving-ports-between-bridges)).
+- **Edit** renames it, changes its spanning tree mode or priority (0 to 61440 in steps of
+  4096; the lowest wins the root election), changes its comment, or turns it off. Renaming
+  keeps its ports, VLANs and addresses.
+- **turn on / turn off** next to VLAN filtering works as it does from the faceplate.
+- The bin deletes a bridge with no ports, addresses or VLAN entries.
+
+Everything runs through [Change Guard](change-guard.md). Renaming the bridge the manager
+connects through, or changing its spanning tree, can't be simulated, so it runs with
+auto-revert required; turning that bridge off is predicted as a lockout and asks first.
 
 ## Routing between VLANs in hardware
 
