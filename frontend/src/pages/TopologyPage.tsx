@@ -24,7 +24,6 @@ import { nodesWithinHops } from '../utils/topologyFocus';
 import type { TopologyDevice, TopologyNode, HandLinkEnd } from '../types';
 import clsx from 'clsx';
 import { useThemeStore } from '../store/themeStore';
-import { useSiteStore } from '../store/siteStore';
 import { buildTopologyGraph, endFor, type GraphEdge, type StpUpstream } from '../utils/topologyGraph';
 import type { BridgeInfo } from '../utils/stpRoot';
 import type { Side } from '../utils/topologyGeometry';
