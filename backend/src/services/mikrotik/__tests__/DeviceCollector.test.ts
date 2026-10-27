@@ -375,17 +375,6 @@ describe('legacy wireless security', () => {
 
 import { legacyFixture } from '../__fixtures__/legacyCapsman';
 
-// updateClients writes one bulk unnest() upsert; this recovers the per-client row
-// (positions as in the single-row statement) from its parallel arrays.
-function clientRow(mac: string): unknown[] | undefined {
-  for (const [sql, p] of (query as jest.Mock).mock.calls) {
-    if (!String(sql).includes('INSERT INTO clients')) continue;
-    const i = (p[1] as string[]).indexOf(mac);
-    if (i >= 0) return [p[0], mac, p[2][i], p[3][i], p[4][i], p[5][i], p[6][i], p[7][i], p[8][i], p[9][i], p[10][i], p[11][i]];
-  }
-  return undefined;
-}
-
 describe('legacy CAPsMAN (#250)', () => {
   const noMenu = () => { throw Object.create(RouterOSTrapError.prototype, { message: { value: 'no such command' } }); };
   const on = (responses: Record<string, Record<string, string>[] | (() => never)>, device: Partial<DeviceRow> = {}) => {
@@ -495,11 +484,12 @@ describe('legacy CAPsMAN (#250)', () => {
     }, { capsman_flavor: 'legacy' } as Partial<DeviceRow>);
     await collector.updateClients();
     expect(calls.find((c) => c.cmd === '/caps-man/registration-table/print')?.params).toEqual({ stats: '' });
-    const iphone = clientRow('38:9c:b2:3d:9b:19');
+    const inserts = (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('INSERT INTO clients'));
+    const iphone = inserts.find(([, params]) => params[1] === '38:9c:b2:3d:9b:19');
     expect(iphone).toBeDefined();
-    expect(iphone![2]).toBe("Matt's iPhone 15");      // hostname
-    expect(iphone![4]).toBe('BonusRoom 2.4Ghz');       // interface
-    expect(iphone![8]).toBeNull();                     // no signal without stats
+    expect(iphone![1][2]).toBe("Matt's iPhone 15");      // hostname
+    expect(iphone![1][4]).toBe('BonusRoom 2.4Ghz');       // interface
+    expect(iphone![1][8]).toBeNull();                     // no signal without stats
   });
 
   it('takes signal, address and traffic from the stats the reporter sent', async () => {
@@ -507,7 +497,8 @@ describe('legacy CAPsMAN (#250)', () => {
       '/interface/wifi/print': [], '/caps-man/registration-table/print': legacyFixture.registrationsStats,
     }, { capsman_flavor: 'legacy' } as Partial<DeviceRow>);
     await collector.updateClients();
-    const fireTv = clientRow('9c:c8:e9:53:ba:f0')!;
+    const inserts = (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('INSERT INTO clients'));
+    const fireTv = inserts.find(([, params]) => params[1] === '9c:c8:e9:53:ba:f0')![1];
     expect(fireTv[2]).toBe('BonusRoom FireTV Stick 4k Max');
     expect(fireTv[3]).toBe('110.87.22.10');               // last-ip: the CHR isn't the DHCP server
     expect(fireTv[6]).toBe(150684303);                    // tx: what the AP sent the streaming stick
@@ -515,20 +506,6 @@ describe('legacy CAPsMAN (#250)', () => {
     expect(fireTv[8]).toBe(-70);
     expect(fireTv[10]).toBe(130_000_000);                 // tx rate "130Mbps-20MHz/2S" (#252)
     expect(fireTv[11]).toBe(1_000_000);                   // rx rate "1Mbps"
-  });
-  it('updateClients writes every client in one statement and does not recount per device twice within the TTL', async () => {
-    const { collector } = on({
-      '/interface/wifi/print': [], '/caps-man/registration-table/print': legacyFixture.registrations,
-    }, { capsman_flavor: 'legacy' } as Partial<DeviceRow>);
-    (query as jest.Mock).mockClear();
-    await collector.updateClients();
-    const inserts = (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('INSERT INTO clients'));
-    expect(inserts).toHaveLength(1);
-    expect((inserts[0][1][1] as string[]).length).toBeGreaterThan(1);
-    const counts = () => (query as jest.Mock).mock.calls.filter(([sql]) => String(sql).includes('COUNT(DISTINCT')).length;
-    const first = counts();
-    await collector.updateClients();
-    expect(counts()).toBe(first);
   });
 });
 

@@ -2,8 +2,7 @@ import { seal } from '../utils/sealed';
 import { Router, Request, Response } from 'express';
 import { randomBytes, createHash } from 'crypto';
 import { query, queryOne } from '../config/database';
-import { requireAuth, requireAdmin, requireWrite, fleetOnly } from '../middleware/auth';
-import { canSeeDeviceSecrets, maskUrl } from '../utils/redactSecrets';
+import { requireAuth, requireAdmin, requireWrite, fleetOnly, isSiteScoped } from '../middleware/auth';
 import { webhookService, WEBHOOK_EVENTS } from '../services/WebhookService';
 import { reportService, computeNextRun, appTimezone } from '../services/ReportService';
 
@@ -107,9 +106,10 @@ router.get('/webhooks', async (req: Request, res: Response) => {
     `SELECT id, name, url, (secret IS NOT NULL AND secret != '') AS has_secret,
             events, enabled, last_status, last_fired_at, created_at
      FROM webhooks ORDER BY created_at DESC`);
-  // A webhook URL often is the credential (a token in its path or query), so
-  // read-only accounts see only where it points (GHSA-28hr-v457-cc6g).
-  const webhooks = canSeeDeviceSecrets(req.user) ? rows : rows.map((r) => ({ ...r, url: maskUrl(r.url) }));
+  // Webhook URLs usually embed a secret token: only fleet admins read the full
+  // URL (GHSA-28hr-v457-cc6g).
+  const fleetAdmin = req.user?.role === 'admin' && !isSiteScoped(req.user);
+  const webhooks = fleetAdmin ? rows : rows.map((w) => ({ ...w, url: maskWebhookUrl(w.url) }));
   res.json({ webhooks, availableEvents: WEBHOOK_EVENTS });
 });
 

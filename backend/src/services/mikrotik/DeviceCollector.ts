@@ -18,7 +18,7 @@ import { fit, normalizeMac } from '../../utils/fit';
 import { rosDurationSeconds } from '../../utils/rosDuration';
 import { guestSsidTag, legacyAuthTypes, legacyProfileName, legacyProfileParams } from './legacySecurity';
 import { decrypt } from '../../utils/crypto';
-import { lookupVendor, ouiLoaded } from '../../utils/oui';
+import { lookupVendor } from '../../utils/oui';
 import { buildServerArpMap } from '../../utils/serverArp';
 import { aggregateBridgeVlans, portVlanMembership, expandVlanIds, rosList } from '../../utils/vlan';
 import {
@@ -89,35 +89,6 @@ const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
  * learned to abandon a timed-out connection, desynchronised the session (#137).
  */
 const LOG_READ_TIMEOUT_MS = 120_000;
-
-interface ClientUpsert {
-  mac: string;
-  hostname: string | null;
-  ip: string | null;
-  iface: string | null;
-  vlan: number | null;
-  tx: number;
-  rx: number;
-  signal: number | null;
-  type: 'wireless' | 'wired';
-  txRate: number | null;
-  rxRate: number | null;
-}
-
-// MACs the OUI database could not name; not retried every poll.
-const unresolvedVendorMacs = new Set<string>();
-
-// Fleet-wide / per-site distinct client counts are table-wide scans; one per
-// device per poll multiplied with fleet size. Share the answer for a short while.
-const COUNT_TTL_MS = 30_000;
-const countCache = new Map<string, { at: number; value: number }>();
-async function cachedCount(key: string, load: () => Promise<number>): Promise<number> {
-  const hit = countCache.get(key);
-  if (hit && Date.now() - hit.at < COUNT_TTL_MS) return hit.value;
-  const value = await load();
-  countCache.set(key, { at: Date.now(), value });
-  return value;
-}
 import { rememberManagerAddress } from '../../utils/managerAddresses';
 import { selectNewLogLines, highestStoredId, surrogateLogId, storedLogId, resumePoint, bufferMark, type RawLogLine } from '../../utils/logDedup';
 import {
@@ -1389,7 +1360,6 @@ export class DeviceCollector {
 
       let totalClients = 0;
       const seenMacs: string[] = [];
-      const pending: ClientUpsert[] = [];
       for (const mac of allMacs) {
         if (!normalizeMac(mac)) continue; // not a MAC address; nothing to key a client on
         const isWireless = mac in wifiSignal;
@@ -1486,12 +1456,10 @@ export class DeviceCollector {
       // Write a global deduplicated metric so the dashboard graph shows the true
       // unique client count across all devices (not a per-device sum that double-counts
       // clients visible from multiple devices simultaneously).
-      const globalTotal = await cachedCount('global', async () => {
-        const dedupedRows = await query<{ count: string }>(
-          `SELECT COUNT(DISTINCT mac_address) AS count FROM clients WHERE active = TRUE`
-        );
-        return parseInt(dedupedRows[0]?.count || '0', 10);
-      });
+      const dedupedRows = await query<{ count: string }>(
+        `SELECT COUNT(DISTINCT mac_address) AS count FROM clients WHERE active = TRUE`
+      );
+      const globalTotal = parseInt(dedupedRows[0]?.count || '0', 10);
       const globalPoint = new Point('client_counts')
         .tag('device_id', '_global')
         .tag('device_name', '_global')
@@ -1503,25 +1471,22 @@ export class DeviceCollector {
       // Summing the per-device series instead would double-count a client seen
       // by two access points -- which is the exact error the global series was
       // introduced to avoid, so the site series has to be deduplicated too.
-      const siteIdRow = await query<{ site_id: number | null }>(
-        `SELECT site_id FROM devices WHERE id = $1`, [this.device.id]);
-      const siteId = siteIdRow[0]?.site_id ?? null;
+      const siteRows = await query<{ site_id: number | null; count: string }>(
+        `SELECT d0.site_id,
+                (SELECT COUNT(DISTINCT c.mac_address)
+                   FROM clients c
+                   JOIN devices d ON d.id = c.device_id
+                  WHERE c.active = TRUE AND d.site_id = d0.site_id) AS count
+           FROM devices d0 WHERE d0.id = $1`,
+        [this.device.id]
+      );
+      const siteId = siteRows[0]?.site_id ?? null;
       if (siteId != null) {
-        const siteTotal = await cachedCount(`site:${siteId}`, async () => {
-          const siteRows = await query<{ count: string }>(
-            `SELECT COUNT(DISTINCT c.mac_address) AS count
-               FROM clients c
-               JOIN devices d ON d.id = c.device_id
-              WHERE c.active = TRUE AND d.site_id = $1`,
-            [siteId]
-          );
-          return parseInt(siteRows[0]?.count || '0', 10);
-        });
         writeApi.writePoint(
           new Point('client_counts')
             .tag('device_id', `_site_${siteId}`)
             .tag('device_name', `_site_${siteId}`)
-            .intField('total_clients', siteTotal)
+            .intField('total_clients', parseInt(siteRows[0]?.count || '0', 10))
             .timestamp(new Date())
         );
       }
@@ -1532,98 +1497,22 @@ export class DeviceCollector {
     }
   }
 
-  /**
-   * Upsert this cycle's clients, one statement per chunk instead of one per
-   * client. A chunk that fails falls back to row-by-row so one bad row still
-   * costs only itself (P2-20). Returns the MACs that were stored.
-   */
-  private async upsertClients(rows: ClientUpsert[]): Promise<string[]> {
-    const stored: string[] = [];
-    const SET = `
-               hostname=COALESCE(EXCLUDED.hostname, clients.hostname),
-               ip_address=COALESCE(NULLIF(EXCLUDED.ip_address,''), clients.ip_address),
-               interface_name=COALESCE(EXCLUDED.interface_name, clients.interface_name),
-               vlan_id=COALESCE(EXCLUDED.vlan_id, clients.vlan_id),
-               tx_bytes=EXCLUDED.tx_bytes,
-               rx_bytes=EXCLUDED.rx_bytes,
-               signal_strength=EXCLUDED.signal_strength,
-               client_type=EXCLUDED.client_type,
-               tx_rate_bps=EXCLUDED.tx_rate_bps,
-               rx_rate_bps=EXCLUDED.rx_rate_bps,
-               active=TRUE,
-               last_seen=NOW(),
-               first_seen=COALESCE(clients.first_seen, NOW())`;
-    const CHUNK = 500;
-    for (let i = 0; i < rows.length; i += CHUNK) {
-      const chunk = rows.slice(i, i + CHUNK);
-      try {
-        await query(
-          `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes, signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
-           SELECT $1, t.mac, t.hostname, t.ip, t.iface, t.vlan, t.tx, t.rx, t.signal, t.type, t.tx_rate, t.rx_rate, TRUE, NOW(), NOW()
-             FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::int[], $7::bigint[], $8::bigint[], $9::int[], $10::text[], $11::bigint[], $12::bigint[])
-                  AS t(mac, hostname, ip, iface, vlan, tx, rx, signal, type, tx_rate, rx_rate)
-           ON CONFLICT (device_id, mac_address) DO UPDATE SET${SET}`,
-          [
-            this.device.id,
-            chunk.map((r) => r.mac), chunk.map((r) => r.hostname), chunk.map((r) => r.ip),
-            chunk.map((r) => r.iface), chunk.map((r) => r.vlan), chunk.map((r) => r.tx),
-            chunk.map((r) => r.rx), chunk.map((r) => r.signal), chunk.map((r) => r.type),
-            chunk.map((r) => r.txRate), chunk.map((r) => r.rxRate),
-          ]
-        );
-        for (const r of chunk) stored.push(r.mac);
-        continue;
-      } catch (err) {
-        console.error(`[${this.device.name}] Bulk client upsert failed, retrying per row:`, (err as Error).message);
-      }
-      for (const r of chunk) {
-        try {
-          await query(
-            `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes, signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW(),NOW())
-             ON CONFLICT (device_id, mac_address) DO UPDATE SET${SET}`,
-            [this.device.id, r.mac, r.hostname, r.ip, r.iface, r.vlan, r.tx, r.rx, r.signal, r.type, r.txRate, r.rxRate]
-          );
-          stored.push(r.mac);
-        } catch (err) {
-          console.error(`[${this.device.name}] Skipped client ${r.mac}:`, (err as Error).message);
-        }
-      }
-    }
-    return stored;
-  }
-
   private async lookupMissingVendors(): Promise<void> {
     try {
-      // Nothing can resolve until the OUI database is loaded.
-      if (!ouiLoaded()) return;
       // Include vendor='' entries: those were set by the old API-based lookup
-      // when it was rate-limited and never actually resolved. MACs that already
-      // failed to resolve (randomised, MA-M/MA-S) are skipped for the life of
-      // the process instead of being re-read and re-written every poll.
+      // when it was rate-limited and never actually resolved.
       const rows = await query<{ mac_address: string }>(
-        `SELECT DISTINCT mac_address FROM clients
-          WHERE device_id = $1 AND (vendor IS NULL OR vendor = '') AND active = TRUE
-            AND NOT (mac_address = ANY($2::text[]))
-          LIMIT 200`,
-        [this.device.id, [...unresolvedVendorMacs]]
+        `SELECT mac_address FROM clients
+         WHERE device_id = $1 AND (vendor IS NULL OR vendor = '') AND active = TRUE`,
+        [this.device.id]
       );
-      const macs: string[] = [];
-      const vendors: string[] = [];
       for (const row of rows) {
         const vendor = lookupVendor(row.mac_address);
-        if (vendor) { macs.push(row.mac_address); vendors.push(vendor); }
-        else {
-          if (unresolvedVendorMacs.size >= 5000) unresolvedVendorMacs.clear();
-          unresolvedVendorMacs.add(row.mac_address);
-        }
-      }
-      if (macs.length) {
+        // Always write the result (even empty) so it's consistent across all
+        // device rows for the same MAC.
         await query(
-          `UPDATE clients c SET vendor = t.vendor
-             FROM unnest($2::text[], $3::text[]) AS t(mac, vendor)
-            WHERE c.device_id = $1 AND c.mac_address = t.mac`,
-          [this.device.id, macs, vendors]
+          `UPDATE clients SET vendor = $1 WHERE device_id = $2 AND mac_address = $3`,
+          [vendor, this.device.id, row.mac_address]
         );
       }
     } catch {

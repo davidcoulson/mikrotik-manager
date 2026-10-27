@@ -31,12 +31,16 @@ describe('webhook access (M4)', () => {
     const res = await request(app({ role: 'admin' })).get('/api/automation/webhooks');
     expect(res.body.webhooks[0].url).toBe(URL_WITH_TOKEN);
   });
-  it('masks the token for viewers, operators and site admins', async () => {
-    for (const user of [{ role: 'viewer' }, { role: 'operator' }, { role: 'admin', siteRoles: { 1: 'admin' } }]) {
+  it('masks the token for viewers and operators; site-scoped accounts are refused', async () => {
+    for (const user of [{ role: 'viewer' }, { role: 'operator' }]) {
       const res = await request(app(user)).get('/api/automation/webhooks');
       expect(JSON.stringify(res.body)).not.toContain('SECRETTOKEN');
       expect(res.body.webhooks[0].url).toMatch(/^https:\/\/hooks\.slack\.com\//);
     }
+  });
+  it('refuses a site-scoped admin the webhook list', async () => {
+    const res = await request(app({ role: 'admin', siteRoles: { 1: 'admin' } })).get('/api/automation/webhooks');
+    expect(res.status).toBe(403);
   });
   it('refuses site-scoped accounts on every webhook write', async () => {
     const scoped = app({ role: 'operator', siteRoles: { 1: 'operator' } });
