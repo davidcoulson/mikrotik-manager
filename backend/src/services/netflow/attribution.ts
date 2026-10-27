@@ -170,6 +170,32 @@ export function attributionDestination(flow: { dstAddr: string; natDstAddr?: str
   return flow.dstAddr;
 }
 
+/**
+ * The MAC embedded in a modified EUI-64 IPv6 address (SLAAC without privacy
+ * extensions: interface id xx:xx:xx:ff:fe:xx:xx:xx, universal/local bit
+ * flipped), or null. Clients are only known by IPv4 via ARP/DHCP, so this is
+ * what lets a native IPv6 flow reach its client.
+ */
+export function macFromEui64(ip: string): string | null {
+  if (!isIPv6(ip)) return null;
+  const head = ip.toLowerCase().split('::');
+  if (head.length > 2) return null;
+  const left = head[0] ? head[0].split(':') : [];
+  const right = head.length === 2 && head[1] ? head[1].split(':') : [];
+  if (head.length === 1 && left.length !== 8) return null;
+  const fill = head.length === 2 ? 8 - left.length - right.length : 0;
+  if (fill < 0) return null;
+  const groups = [...left, ...Array(fill).fill('0'), ...right].map((g) => parseInt(g, 16));
+  if (groups.length !== 8 || groups.some((g) => Number.isNaN(g))) return null;
+  // Interface id: g4 = (b0^2):b1, g5 = b2:ff, g6 = fe:b3, g7 = b4:b5
+  if ((groups[5] & 0xff) !== 0xff || (groups[6] >> 8) !== 0xfe) return null;
+  const bytes = [
+    (groups[4] >> 8) ^ 0x02, groups[4] & 0xff, groups[5] >> 8,
+    groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff,
+  ];
+  return bytes.map((x) => x.toString(16).padStart(2, '0')).join(':');
+}
+
 /** Private, link-local, CGNAT, loopback or ULA: where a NAT gateway would be. */
 export function isLocalAddress(ip: string): boolean {
   if (ip.includes(':')) {
