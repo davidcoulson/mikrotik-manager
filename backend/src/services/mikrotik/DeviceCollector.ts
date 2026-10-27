@@ -89,6 +89,35 @@ const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
  * learned to abandon a timed-out connection, desynchronised the session (#137).
  */
 const LOG_READ_TIMEOUT_MS = 120_000;
+
+interface ClientUpsert {
+  mac: string;
+  hostname: string | null;
+  ip: string | null;
+  iface: string | null;
+  vlan: number | null;
+  tx: number;
+  rx: number;
+  signal: number | null;
+  type: 'wireless' | 'wired';
+  txRate: number | null;
+  rxRate: number | null;
+}
+
+// MACs the OUI database could not name; not retried every poll.
+const unresolvedVendorMacs = new Set<string>();
+
+// Fleet-wide / per-site distinct client counts are table-wide scans; one per
+// device per poll multiplied with fleet size. Share the answer for a short while.
+const COUNT_TTL_MS = 30_000;
+const countCache = new Map<string, { at: number; value: number }>();
+async function cachedCount(key: string, load: () => Promise<number>): Promise<number> {
+  const hit = countCache.get(key);
+  if (hit && Date.now() - hit.at < COUNT_TTL_MS) return hit.value;
+  const value = await load();
+  countCache.set(key, { at: Date.now(), value });
+  return value;
+}
 import { rememberManagerAddress } from '../../utils/managerAddresses';
 import { selectNewLogLines, highestStoredId, surrogateLogId, storedLogId, resumePoint, bufferMark, type RawLogLine } from '../../utils/logDedup';
 import {

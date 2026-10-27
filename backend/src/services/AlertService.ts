@@ -6,7 +6,6 @@ import { query } from '../config/database';
 import { buildGotifyRequest } from '../utils/gotify';
 import { openConfig } from '../utils/alertChannelSecrets';
 import { resolveAlertTarget } from '../utils/alertTarget';
-import { escapeHtml } from '../utils/escapeHtml';
 import { isDeviceInMaintenance } from '../routes/maintenanceWindows';
 
 export type AlertEventType =

@@ -7,7 +7,6 @@ import { outageOverlapsSql, outageSecondsSql } from '../utils/outageWindow';
 import { openConfig } from '../utils/alertChannelSecrets';
 import nodemailer from 'nodemailer';
 import { query, queryOne } from '../config/database';
-import { escapeHtml } from '../utils/escapeHtml';
 
 interface ScheduleRow {
   id: number; name: string; frequency: 'daily' | 'weekly' | 'monthly';
