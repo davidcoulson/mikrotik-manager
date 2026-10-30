@@ -388,13 +388,21 @@ export function buildTopology(
   // that merely share an address in disconnected segments stay two nodes.
   const externalMap = new Map<string, ExternalNode>();
   const nameless = (l: LinkRow) => !l.neighbor_identity?.trim() && !l.neighbor_caps?.trim();
-  const usedExternalIds = new Set<string>();
   // Ids must stay [a-z0-9] (routes/topology.ts EXTERNAL_REF). Stripping punctuation
-  // can map two distinct keys to one id ('a:10.0.0.1@15' / 'a:10.0.0.11@5'); the
-  // first keeps the historic id (saved positions), a later collision gets a hash.
+  // can map two distinct keys to one id ('a:10.0.0.1@15' / 'a:10.0.0.11@5'). A key
+  // keeps the historic id (saved positions) only when no other key shares it; the
+  // colliding keys all get a hash of their full key, so ids don't depend on link order.
+  const baseId = (key: string): string => `ext-${key.replace(/[^a-z0-9]/gi, '')}`;
+  const baseKeys = new Map<string, Set<string>>();
+  for (const link of links) {
+    const key = link.to_device_id ? null : neighborKey(link);
+    if (!key) continue;
+    const b = baseId(key);
+    (baseKeys.get(b) ?? baseKeys.set(b, new Set()).get(b)!).add(key);
+  }
   const externalId = (key: string): string => {
-    const base = `ext-${key.replace(/[^a-z0-9]/gi, '')}`;
-    if (base.length <= 140 && !usedExternalIds.has(base)) return base;
+    const base = baseId(key);
+    if (base.length <= 140 && baseKeys.get(base)!.size === 1) return base;
     return `${base.slice(0, 120)}h${createHash('sha1').update(key).digest('hex').slice(0, 16)}`;
   };
   for (const link of links) {
@@ -404,7 +412,6 @@ export function buildTopology(
     const seen = externalMap.get(key);
     if (!seen) {
       const id = externalId(key);
-      usedExternalIds.add(id);
       externalMap.set(key, {
         id,
         name: link.neighbor_identity || link.neighbor_address || 'Unknown',
