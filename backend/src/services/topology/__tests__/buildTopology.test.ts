@@ -402,4 +402,15 @@ describe('external node ids stay unique', () => {
     expect(new Set(ext.map((n) => n.id)).size).toBe(2);
     for (const n of ext) expect(n.id).toMatch(/^ext-[a-z0-9]{1,150}$/i);
   });
+
+  it('gives colliding neighbours the same ids whatever order the links arrive in', () => {
+    const links = [
+      link({ from_device_id: 1, from_interface: 'ether1', neighbor_identity: 'ap-1' }),
+      link({ from_device_id: 1, from_interface: 'ether2', neighbor_identity: 'ap1' }),
+    ];
+    const ids = (ls: typeof links) => Object.fromEntries(
+      buildTopology([dev(1, 'alpha', '192.168.1.10')], ls, []).externalNodes
+        .filter((n) => n.caps !== 'segment').map((n) => [n.name, n.id]));
+    expect(ids([...links].reverse())).toEqual(ids(links));
+  });
 });
