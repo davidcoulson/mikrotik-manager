@@ -1440,7 +1440,7 @@ export default function DashboardPage() {
                   <span key={d.id}>
                     {i > 0 && <span style={{ color: 'var(--ink-3)' }}> · </span>}
                     <button
-                      onClick={() => navigate(`/devices/${d.id}?tab=firmware`)}
+                      onClick={() => navigate('/firmware')}
                       className="underline underline-offset-2"
                     >
                       {d.name}
@@ -1465,7 +1465,7 @@ export default function DashboardPage() {
                   <span key={d.id}>
                     {i > 0 && <span style={{ color: 'var(--ink-3)' }}> · </span>}
                     <button
-                      onClick={() => navigate(`/devices/${d.id}?tab=firmware`)}
+                      onClick={() => navigate('/firmware')}
                       className="underline underline-offset-2"
                     >
                       {d.name}
