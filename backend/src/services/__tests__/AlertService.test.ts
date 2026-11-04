@@ -315,7 +315,7 @@ describe('email delivery', () => {
     expect((await run({})).opts.tls.rejectUnauthorized).toBe(true);
   });
   it('accepts self-signed relays only when the channel opts out', async () => {
-    expect((await run({ smtp_allow_self_signed: true })).opts.tls.rejectUnauthorized).toBe(false);
+    expect((await run({ smtp_tls_verify: false })).opts.tls.rejectUnauthorized).toBe(false);
   });
   it('escapes message, device name and details', async () => {
     const { sendMail } = await run({}, { deviceName: '<img src=x onerror=1>', details: '</pre><a href="//evil">go</a>' });

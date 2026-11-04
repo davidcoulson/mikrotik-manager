@@ -7,7 +7,7 @@ jest.mock('../../middleware/auth', () => ({
   isSiteScoped: (u?: { siteRoles?: unknown }) => !!u?.siteRoles,
 }));
 jest.mock('../../middleware/site', () => ({ activeSite: () => null }));
-jest.mock('../../utils/siteAccess', () => ({ devicesDenied: jest.fn().mockResolvedValue([]) }));
+jest.mock('../../utils/siteAccess', () => ({ ...jest.requireActual('../../utils/siteAccess'), devicesDenied: jest.fn().mockResolvedValue([]) }));
 
 import request from 'supertest';
 import express from 'express';
