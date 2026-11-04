@@ -7,7 +7,6 @@ import { existsSync } from 'fs';
 import crypto from 'crypto';
 import path from 'path';
 import { requireAuth, requireAdmin } from '../middleware/auth';
-import { validateCertificateBundle } from '../utils/certChain';
 
 const router = Router();
 router.use(requireAuth);

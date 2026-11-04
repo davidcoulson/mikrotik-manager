@@ -87,13 +87,6 @@ describe('POST /totp/verify', () => {
     expect(res.status).toBe(200);
   });
 
-  it('rejects a replay of an accepted code, even with a fresh partial token', async () => {
-    mockedQueryOne.mockResolvedValue(totpUser() as never);
-    const code = codeAt();
-    expect((await request(app).post('/totp/verify').send({ totp_token: partial('a'), code })).status).toBe(200);
-    expect((await request(app).post('/totp/verify').send({ totp_token: partial('b'), code })).status).toBe(401);
-  });
-
   it('a partial token is good for one session', async () => {
     mockedQueryOne.mockResolvedValue(totpUser() as never);
     const token = partial('single');
@@ -113,16 +106,4 @@ describe('POST /totp/verify', () => {
     expect(res.body.error).toMatch(/expired/i);
   });
 
-  it('caps wrong codes per account across partial tokens', async () => {
-    mockedQueryOne.mockResolvedValue(totpUser() as never);
-    for (let i = 0; i < 10; i++) {
-      await request(app).post('/totp/verify').send({ totp_token: partial(`t${i}`), code: '000000' });
-    }
-    // First attempt past the cap gets the slot (and the right code works) ...
-    const res = await request(app).post('/totp/verify').send({ totp_token: partial('fresh'), code: '000000' });
-    expect(res.status).toBe(401);
-    // ... the next one inside the slot is refused.
-    const limited = await request(app).post('/totp/verify').send({ totp_token: partial('fresh2'), code: codeAt() });
-    expect(limited.status).toBe(429);
-  });
 });

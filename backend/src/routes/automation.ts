@@ -2,6 +2,7 @@ import { seal } from '../utils/sealed';
 import { Router, Request, Response } from 'express';
 import { randomBytes, createHash } from 'crypto';
 import { query, queryOne } from '../config/database';
+import { maskUrl } from '../utils/redactSecrets';
 import { requireAuth, requireAdmin, requireWrite, fleetOnly, isSiteScoped } from '../middleware/auth';
 import { webhookService, WEBHOOK_EVENTS } from '../services/WebhookService';
 import { reportService, computeNextRun, appTimezone } from '../services/ReportService';
@@ -89,16 +90,6 @@ router.delete('/tokens/:id', requireAdmin, async (req: Request, res: Response) =
   res.json({ ok: true });
 });
 
-/** scheme://host only: the path and query are where tokens live. */
-export function maskWebhookUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    return `${u.protocol}//${u.host}/••••••••`;
-  } catch {
-    return '••••••••';
-  }
-}
-
 // ─── Webhooks ──────────────────────────────────────────────────────────────────
 
 router.get('/webhooks', async (req: Request, res: Response) => {
@@ -109,7 +100,7 @@ router.get('/webhooks', async (req: Request, res: Response) => {
   // Webhook URLs usually embed a secret token: only fleet admins read the full
   // URL (GHSA-28hr-v457-cc6g).
   const fleetAdmin = req.user?.role === 'admin' && !isSiteScoped(req.user);
-  const webhooks = fleetAdmin ? rows : rows.map((w) => ({ ...w, url: maskWebhookUrl(w.url) }));
+  const webhooks = fleetAdmin ? rows : rows.map((w) => ({ ...w, url: maskUrl(w.url) }));
   res.json({ webhooks, availableEvents: WEBHOOK_EVENTS });
 });
 
