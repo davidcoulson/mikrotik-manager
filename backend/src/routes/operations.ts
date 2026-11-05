@@ -220,7 +220,7 @@ router.get('/insights', async (req: Request, res: Response) => {
         sev: 'warn', category: 'updates',
         title: `RouterOS update available for ${d.name}`,
         body: `Running ${d.ros_version}${d.latest_ros_version ? `, ${d.latest_ros_version} available` : ''}.`,
-        action: 'Review update', path: `/devices/${d.id}?tab=config`,
+        action: 'Review update', path: `/devices/${d.id}?tab=firmware`,
       });
     }
     if (d.routerboard_upgrade_available) {
@@ -228,7 +228,7 @@ router.get('/insights', async (req: Request, res: Response) => {
         sev: 'info', category: 'updates',
         title: `RouterBOOT upgrade available for ${d.name}`,
         body: `Firmware ${d.firmware_version}${d.upgrade_firmware_version ? ` → ${d.upgrade_firmware_version}` : ''}.`,
-        action: 'Review upgrade', path: `/devices/${d.id}?tab=config`,
+        action: 'Review upgrade', path: `/devices/${d.id}?tab=firmware`,
       });
     }
   }
