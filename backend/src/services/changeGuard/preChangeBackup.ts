@@ -35,10 +35,10 @@ export async function backupBeforeChange(deviceId: number, kind: string, summary
     const device = await queryOne<{
       id: number; name: string; ip_address: string; ssh_port: number;
       ssh_username: string; ssh_password_encrypted: string;
-      api_username: string; api_password_encrypted: string;
+      api_username: string; api_password_encrypted: string; jump_host_id: number | null;
     }>(
       `SELECT id, name, ip_address, ssh_port, ssh_username, ssh_password_encrypted,
-              api_username, api_password_encrypted FROM devices WHERE id = $1`,
+              api_username, api_password_encrypted, jump_host_id FROM devices WHERE id = $1`,
       [deviceId]
     );
     if (!device) return;
