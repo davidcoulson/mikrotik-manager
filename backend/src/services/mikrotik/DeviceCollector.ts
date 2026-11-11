@@ -1,3 +1,4 @@
+import { ZONE_HOST_COMMENT } from '../../utils/zoneFirewall';
 import { compareRosVersions } from '../../utils/rosVersion';
 import type { BgpConnectionInput } from '../../utils/bgpConnection';
 import { routingPeersFrom } from '../../utils/routingPeers';
@@ -118,6 +119,7 @@ import { readRevocation } from '../../utils/certRecord';
 import { managerAddressFromActive, stripOwnSessionNoise } from '../../utils/logNoise';
 import { ALL_MODULES, type PollModules } from '../../utils/pollModules';
 import { planVlanWrite, frameTypesFor, planTaggedRemovals, planAccessRemovals } from '../../utils/bridgeVlanPlan';
+import { arpSighting, ARP_STALE_GRACE_MINUTES } from '../../utils/arpPresence';
 import { planBridgePortMove, bridgeDeleteRefusal } from '../../utils/bridgePortMove';
 import { normalizeHealth, evaluateHealth, type HealthVerdict, type HealthIssue } from '../../utils/deviceHealth';
 import { resolveChannel } from '../../utils/updateChannel';
@@ -1628,19 +1630,32 @@ export class DeviceCollector {
       }
 
       // ARP table — IP enrichment and activity validation.
-      // Only accept entries where ARP resolution succeeded (status != failed).
-      // RouterOS v7 marks stale/unreachable entries with status=failed.
+      // Any entry that still has a MAC fills in an address, but only a live one
+      // is a sighting (#363): stale and failed entries linger for days, and
+      // counting them kept phones online all weekend. A stale entry only holds
+      // an online client for a short grace period, below.
       const arpIPs: Record<string, string> = {};
       const arpInterfaces: Record<string, string> = {};
+      const arpLive = new Set<string>();
+      const arpStale = new Set<string>();
       const arpFailed = new Set<string>(); // MACs confirmed offline by this device's ARP
       for (const arp of arpEntries) {
         const mac = (arp['mac-address'] || '').toLowerCase();
         if (!mac) continue;
-        if (arp['incomplete'] === 'true') continue;
         if (arp['BCAST'] === 'true') continue;
-        if (arp['status'] === 'failed') { arpFailed.add(mac); continue; }
-        arpIPs[mac] = arp['address'] || '';
-        arpInterfaces[mac] = arp['interface'] || '';
+        const seen = arpSighting(arp);
+        if (seen === 'none') {
+          if (arp['status'] === 'failed') arpFailed.add(mac);
+          continue;
+        }
+        // A live entry's address wins over a stale one for the same MAC
+        // (vrrp20 stale, vlan20 reachable).
+        if (seen === 'live' || !arpLive.has(mac)) {
+          arpIPs[mac] = arp['address'] || '';
+          arpInterfaces[mac] = arp['interface'] || '';
+        }
+        if (seen === 'live') { arpLive.add(mac); arpStale.delete(mac); }
+        else if (!arpLive.has(mac)) arpStale.add(mac);
       }
 
 
@@ -1672,7 +1687,7 @@ export class DeviceCollector {
 
       const allMacs = new Set<string>([
         ...Object.keys(wifiSignal),
-        ...Object.keys(arpIPs),
+        ...arpLive,
         ...Object.keys(bridgeHostMap),
       ]);
 
@@ -1735,10 +1750,21 @@ export class DeviceCollector {
 
       // Clients this device no longer sees go inactive, but only when every
       // read succeeded; after a failed read their absence means nothing (P2-21).
+      // A client this device sees only in a stale ARP entry stays online for a
+      // few minutes after its last live sighting, without that counting as a
+      // sighting itself (last_seen isn't moved), so it can't hold itself up.
       if (complete) {
+        const staleOnly = [...arpStale].filter((m) => !allMacs.has(m) && normalizeMac(m));
+        const held = staleOnly.length
+          ? (await query<{ mac_address: string }>(
+            `SELECT mac_address FROM clients
+              WHERE device_id = $1 AND active AND mac_address = ANY($2::text[])
+                AND last_seen > NOW() - make_interval(mins => $3)`,
+            [this.device.id, staleOnly, ARP_STALE_GRACE_MINUTES])).map((r) => r.mac_address)
+          : [];
         await query(
           `UPDATE clients SET active = FALSE WHERE device_id = $1 AND active AND NOT (mac_address = ANY($2::text[]))`,
-          [this.device.id, seenMacs]);
+          [this.device.id, [...seenMacs, ...held]]);
       }
 
       // OUI vendor lookup: fill in up to 10 clients that are missing vendor per cycle
@@ -4287,6 +4313,7 @@ export class DeviceCollector {
     filter: Record<string, string>[]; nat: Record<string, string>[]; addressLists: Record<string, string>[];
     interfaceLists: string[]; interfaces: string[]; services: Record<string, string>[]; rosMajor: number;
     vpn: { l2tp: boolean; pptp: boolean; ovpn: boolean; sstp: boolean; ovpnPort: string | null };
+    fasttrackHwOffload: boolean;
   }> {
     const res = await this.client.executeMany([
       { command: `${firewallMenu(family, 'filter')}/print` },
@@ -4301,6 +4328,7 @@ export class DeviceCollector {
       { command: '/interface/pptp-server/server/print' },
       { command: '/interface/ovpn-server/server/print' },
       { command: '/interface/sstp-server/server/print' },
+      filterAddArgs(family === 'ipv6' ? 'ipv6' : 'ip'),
     ]);
     if (res[0].error) throw res[0].error;
     const rows = (i: number) => res[i]?.rows ?? [];
@@ -4312,7 +4340,55 @@ export class DeviceCollector {
       services: rows(5),
       rosMajor: Number((rows(6)[0]?.version ?? '7').split('.')[0]) || 7,
       vpn: { l2tp: enabled(7), pptp: enabled(8), ovpn: enabled(9), sstp: enabled(10), ovpnPort: rows(9)[0]?.port || null },
+      fasttrackHwOffload: hasArg(rows(11), 'hw-offload'),
     };
+  }
+
+  /**
+   * What zone mode (#369) plans against, in one round trip: the IPv4 filter
+   * table, interface lists and members, interfaces, addresses, services and
+   * the RouterOS version.
+   */
+  async getZoneContext(): Promise<{
+    filter: Record<string, string>[]; lists: Record<string, string>[]; members: Record<string, string>[];
+    interfaces: Record<string, string>[]; addresses: Record<string, string>[]; services: Record<string, string>[]; rosMajor: number;
+    fasttrackHwOffload: boolean;
+    /** The address-list entries zones keep for hostnames in rules (#369), found by their comment. */
+    hostEntries: Record<string, string>[];
+  }> {
+    const res = await this.client.executeMany([
+      { command: '/ip/firewall/filter/print' },
+      { command: '/interface/list/print' },
+      { command: '/interface/list/member/print' },
+      { command: '/interface/print', params: { '.proplist': 'name,type,running,disabled,slave,comment' } },
+      { command: '/ip/address/print', params: { '.proplist': 'address,interface,actual-interface,disabled,invalid,dynamic' } },
+      { command: '/ip/service/print', params: { '.proplist': 'name,port,disabled' } },
+      { command: '/system/resource/print', params: { '.proplist': 'version' } },
+      filterAddArgs('ip'),
+      // By the comment only zones write, so a device with a large blocklist
+      // isn't read whole.
+      { command: '/ip/firewall/address-list/print', params: { '.proplist': '.id,list,address,comment,dynamic' }, queries: [`?comment=${ZONE_HOST_COMMENT}`] },
+    ]);
+    for (const r of res.slice(0, 3)) if (r.error) throw r.error;
+    const rows = (i: number) => res[i]?.rows ?? [];
+    return {
+      filter: rows(0), lists: rows(1), members: rows(2), interfaces: rows(3), addresses: rows(4), services: rows(5),
+      rosMajor: Number((rows(6)[0]?.version ?? '7').split('.')[0]) || 7,
+      fasttrackHwOffload: hasArg(rows(7), 'hw-offload'),
+      hostEntries: rows(8).filter((r) => r['dynamic'] !== 'true'),
+    };
+  }
+
+  async addInterfaceList(name: string): Promise<void> {
+    await this.client.execute('/interface/list/add', { name });
+  }
+
+  async addInterfaceListMember(list: string, iface: string): Promise<void> {
+    await this.client.execute('/interface/list/member/add', { list, interface: iface });
+  }
+
+  async removeInterfaceListMember(id: string): Promise<void> {
+    await this.client.execute('/interface/list/member/remove', { '.id': id });
   }
 
   async addFirewallRule(params: Record<string, string>, family: FirewallFamily = 'ip'): Promise<void> {
@@ -4880,6 +4956,57 @@ export class DeviceCollector {
     await this.client.execute('/ip/service/set', { '.id': id, disabled: disabled ? 'yes' : 'no' });
   }
 
+  /**
+   * The settings a template can be captured from (Discussion #85), in one
+   * round trip. A menu the device lacks comes back undefined.
+   */
+  async readForCapture(): Promise<{ dns?: Record<string, string>; ntp?: Record<string, string>; services?: Record<string, string>[];
+    snmp?: Record<string, string>; loggingActions?: Record<string, string>[]; clock?: Record<string, string> }> {
+    const replies = await this.client.executeMany([
+      { command: '/ip/dns/print' },
+      { command: '/system/ntp/client/print' },
+      { command: '/ip/service/print', params: { detail: '' } },
+      { command: '/snmp/print', params: { '.proplist': 'enabled,contact,location' } },
+      { command: '/system/logging/action/print' },
+      { command: '/system/clock/print' },
+    ]);
+    const one = (i: number) => (replies[i]?.error ? undefined : replies[i]?.rows?.[0]);
+    const all = (i: number) => (replies[i]?.error ? undefined : replies[i]?.rows ?? []);
+    return { dns: one(0), ntp: one(1), services: all(2), snmp: one(3), loggingActions: all(4), clock: one(5) };
+  }
+
+  // ─── PPP (Hector, Discussion #85) ─────────────────────────────────────────
+
+  /**
+   * PPP users, PPPoE servers and active sessions, live, in one round trip.
+   * Secrets are read by .proplist so the password never leaves the router.
+   * A device without PPP has three empty lists.
+   */
+  async getPpp(): Promise<{ secrets: Record<string, string>[]; servers: Record<string, string>[]; sessions: Record<string, string>[] }> {
+    const replies = await this.client.executeMany([
+      { command: '/ppp/secret/print', params: { '.proplist': '.id,name,service,profile,remote-address,disabled,comment,last-logged-out,last-caller-id,last-disconnect-reason' } },
+      { command: '/interface/pppoe-server/server/print', params: { '.proplist': '.id,service-name,interface,disabled,default-profile' } },
+      { command: '/ppp/active/print', params: { '.proplist': '.id,name,service,caller-id,address,uptime,encoding' } },
+    ]);
+    const bad = replies.find((r) => r.error && !isNoSuchCommand(r.error));
+    if (bad?.error) throw bad.error;
+    const [secrets, servers, sessions] = replies.map((r) => r.rows ?? []);
+    return { secrets: secrets!, servers: servers!, sessions: sessions! };
+  }
+
+  async setPppSecretDisabled(id: string, disabled: boolean): Promise<void> {
+    await this.client.execute('/ppp/secret/set', { '.id': id, disabled: disabled ? 'yes' : 'no' });
+  }
+
+  async setPppoeServerDisabled(id: string, disabled: boolean): Promise<void> {
+    await this.client.execute('/interface/pppoe-server/server/set', { '.id': id, disabled: disabled ? 'yes' : 'no' });
+  }
+
+  /** End an active PPP session; the client usually dials straight back in. */
+  async removePppActive(id: string): Promise<void> {
+    await this.client.execute('/ppp/active/remove', { '.id': id });
+  }
+
   // ─── Bridge ────────────────────────────────────────────────────────────────
 
   async setBridgeVlanFiltering(bridgeName: string, enabled: boolean): Promise<void> {
@@ -4924,17 +5051,32 @@ export class DeviceCollector {
 
   // ─── MTU ──────────────────────────────────────────────────────────────────
 
+  /**
+   * Set a port's MTU. RouterOS doesn't refuse an MTU above the port's L2 MTU,
+   * or an L2 MTU above the hardware's max-l2mtu: it quietly keeps the most it
+   * can (checked on a CRS3xx, 7.25), and the save looked successful. So the L2
+   * MTU is raised first when it's too small (never lowered: a raised one can
+   * be there for VLAN tags or jumbo frames switched through), and the MTU is
+   * read back.
+   */
   async setInterfaceMtu(name: string, mtu: number): Promise<void> {
-    // Step 1: raise l2mtu so RouterOS doesn't cap the L3 mtu below the requested value.
-    // This silently fails on logical interfaces (bridge, vlan) where l2mtu is derived —
-    // that is safe because RouterOSClient now properly drains !done after !trap.
-    await this.client.execute('/interface/set', {
-      numbers: name,
-      'l2mtu': String(mtu + 8),
-    }).catch(() => {});
-
-    // Step 2: set the L3 mtu — always runs regardless of l2mtu outcome above.
+    const row = (await this.client.execute('/interface/print', { '.proplist': 'name,mtu,l2mtu,max-l2mtu' }, [`?name=${name}`]))[0];
+    const l2 = Number(row?.['l2mtu']);
+    const max = Number(row?.['max-l2mtu']);
+    if (Number.isFinite(max) && max > 0 && mtu > max) {
+      throw new Error(`${name} can't take an MTU of ${mtu}: its hardware goes up to ${max}.`);
+    }
+    if (Number.isFinite(l2) && l2 > 0 && l2 < mtu) {
+      const want = Number.isFinite(max) && max > 0 ? Math.min(mtu + 8, max) : mtu + 8;
+      // Logical interfaces (bridge, VLAN) derive their L2 MTU and refuse this; the MTU below still runs.
+      await this.client.execute('/interface/set', { numbers: name, l2mtu: String(want) }).catch(() => {});
+    }
     await this.client.execute('/interface/set', { numbers: name, mtu: String(mtu) });
+    const after = (await this.client.execute('/interface/print', { '.proplist': 'name,mtu,l2mtu' }, [`?name=${name}`]))[0];
+    if (after?.['mtu'] && after['mtu'] !== String(mtu)) {
+      throw new Error(`RouterOS kept ${name} at MTU ${after['mtu']} rather than ${mtu}` +
+        (after['l2mtu'] ? ` (its L2 MTU is ${after['l2mtu']}).` : '.'));
+    }
   }
 
   // ─── PoE ──────────────────────────────────────────────────────────────────
@@ -5456,7 +5598,9 @@ export class DeviceCollector {
     taggedVlans: number[],
     untaggedVlans: number[],
     role?: 'access' | 'trunk',
-    replaceTagged = false
+    replaceTagged = false,
+    /** A trunk that drops untagged frames instead of putting them in the PVID's VLAN. */
+    taggedOnly = false
   ): Promise<{ notRemoved: number[] }> {
     const bridgePorts = await this.client
       .execute('/interface/bridge/port/print', {}, [`?interface=${portName}`])
@@ -5470,7 +5614,7 @@ export class DeviceCollector {
       await this.client.execute('/interface/bridge/port/set', {
         '.id': bridgePortEntry['.id'],
         pvid: String(pvid),
-        ...(role ? frameTypesFor(role) : {}),
+        ...(role ? frameTypesFor(role, taggedOnly) : {}),
       });
     }
 
@@ -5515,7 +5659,9 @@ export class DeviceCollector {
       .catch(() => []);
     const plan = role === 'access'
       ? planAccessRemovals(rows as Record<string, string>[], bridge, portName, pvid)
-      : planTaggedRemovals(rows as Record<string, string>[], bridge, portName, taggedVlans);
+      // A trunk keeps one untagged VLAN, its native one, or none when it's tagged-only.
+      : planTaggedRemovals(rows as Record<string, string>[], bridge, portName, taggedVlans,
+        role === 'trunk' ? (taggedOnly ? null : pvid) : undefined);
     for (const w of plan.writes) {
       await this.client.execute('/interface/bridge/vlan/set', {
         '.id': w.id, tagged: w.tagged, untagged: w.untagged,
@@ -5681,16 +5827,18 @@ export class DeviceCollector {
   /** Every bridge with its ports, VLAN entries and addresses, read live. */
   async getBridgesDetail(): Promise<{
     bridges: Record<string, string>[]; ports: Record<string, string>[];
-    vlans: Record<string, string>[]; addresses: Record<string, string>[];
+    vlans: Record<string, string>[]; addresses: Record<string, string>[]; interfaces: Record<string, string>[];
   }> {
     const none = () => [] as Record<string, string>[];
-    const [bridges, ports, vlans, addresses] = await Promise.all([
+    const [bridges, ports, vlans, addresses, interfaces] = await Promise.all([
       this.client.execute('/interface/bridge/print', { detail: '' }),
       this.client.execute('/interface/bridge/port/print', { detail: '' }).catch(none),
       this.client.execute('/interface/bridge/vlan/print', { detail: '' }).catch(none),
       this.client.execute('/ip/address/print', { detail: '' }).catch(none),
+      // Each port's L2 MTU, the ceiling for the bridge's MTU.
+      this.client.execute('/interface/print', { '.proplist': 'name,l2mtu,max-l2mtu' }).catch(none),
     ]);
-    return { bridges, ports, vlans, addresses };
+    return { bridges, ports, vlans, addresses, interfaces };
   }
 
   async addBridge(fields: Record<string, string>): Promise<void> {
@@ -6450,6 +6598,8 @@ export class DeviceCollector {
 
   async installRouterboardUpgrade(): Promise<void> {
     await this.client.execute('/system/routerboard/upgrade');
+    // Let the bootloader write settle before asking for the reboot.
+    await new Promise((r) => setTimeout(r, 3000));
     // Through reboot(), which expects the session to die. Calling /system/reboot
     // directly reported "Connection closed" as a failed RouterBOOT upgrade
     // whenever the socket closed before RouterOS acknowledged the command, a
@@ -6470,7 +6620,12 @@ export class DeviceCollector {
       await this.client.execute('/system/reboot');
     } catch (e) {
       const msg = (e as Error).message || '';
-      if (/closed|reset|EPIPE|not connected|timed? ?out|socket/i.test(msg)) return;
+      if (/closed|reset|EPIPE|not connected|timed? ?out|socket/i.test(msg)) {
+        // Usually the reboot taking the session down. Logged, because when the
+        // device didn't in fact reboot this line is the only trace of why.
+        console.log(`[Reboot] ${this.device.name}: ${msg} (taken as the reboot dropping the session)`);
+        return;
+      }
       throw e;
     }
   }
@@ -6620,6 +6775,31 @@ export class DeviceCollector {
 
   async removeRoutingTable(id: string): Promise<void> {
     await this.client.execute('/routing/table/remove', { '.id': id });
+  }
+
+  /** Where this device keeps its routing rules: /routing/rule on RouterOS 7, /ip/route/rule on 6 (#370). */
+  private async routingRulePath(): Promise<'/routing/rule' | '/ip/route/rule'> {
+    return this.client.execute('/routing/rule/print', { '.proplist': '.id' }).then(() => '/routing/rule' as const, () => '/ip/route/rule' as const);
+  }
+
+  /** Routing rules in order, the device's tables (7 only) and its routes (#370). */
+  async getRoutingRulesData(): Promise<{ ros6: boolean; rules: Record<string, string>[]; tables: string[] | null; routes: Record<string, string>[] }> {
+    const path = await this.routingRulePath();
+    const ros6 = path === '/ip/route/rule';
+    const [rules, tables, routes] = await Promise.all([
+      this.client.execute(`${path}/print`, { detail: '' }),
+      ros6 ? Promise.resolve(null) : this.client.execute('/routing/table/print', { '.proplist': 'name' }).then((r) => r.map((t) => t['name']).filter(Boolean)).catch(() => null),
+      this.client.execute('/ip/route/print', { '.proplist': 'dst-address,gateway,immediate-gw,distance,active,disabled,routing-table,routing-mark' }).catch(() => [] as Record<string, string>[]),
+    ]);
+    return { ros6, rules, tables, routes };
+  }
+
+  async addRoutingRule(params: Record<string, string>): Promise<void> {
+    await this.client.execute(`${await this.routingRulePath()}/add`, params);
+  }
+
+  async removeRoutingRule(id: string): Promise<void> {
+    await this.client.execute(`${await this.routingRulePath()}/remove`, { '.id': id });
   }
 
   async getRouteFiltersData(): Promise<{
@@ -6931,4 +7111,19 @@ export class DeviceCollector {
   async removeTrafficFlowTarget(id: string): Promise<void> {
     await this.client.execute('/ip/traffic-flow/target/remove', { '.id': id });
   }
+}
+
+/**
+ * The arguments this device's firewall filter `add` takes, read with
+ * /console/inspect (RouterOS 7). Not every version or build knows every
+ * one: hw-offload on FastTrack is refused as "unknown parameter" on some
+ * (#369), so it is only set where the device lists it. An error, as on
+ * RouterOS 6, reads as an empty list.
+ */
+function filterAddArgs(menu: 'ip' | 'ipv6'): { command: string; params: Record<string, string> } {
+  return { command: '/console/inspect', params: { request: 'child', path: `${menu},firewall,filter,add` } };
+}
+
+function hasArg(rows: Record<string, string>[], name: string): boolean {
+  return rows.some((r) => r.name === name);
 }

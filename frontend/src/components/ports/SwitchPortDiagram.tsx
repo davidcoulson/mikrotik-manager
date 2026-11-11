@@ -12,20 +12,23 @@ import FloatingWindow from '../common/FloatingWindow';
 import { useCanWrite } from '../../hooks/useCanWrite';
 import ChangeGuardDialog, { guardOutcomeMessage, LockoutVerdictDialog, lockoutVerdictOf, type GuardResult, type LockoutVerdict } from '../ChangeGuardDialog';
 import type { SwitchPort, Vlan, TrafficPoint, PortMonitorData, PortClient } from '../../types';
-import { classifyPort, portBasis, portLabel, portSortKey } from '../../utils/portClass';
+import { classifyPort, portBasis, portSortKey } from '../../utils/portClass';
 import { parseVlanList, toggleVlan, formatVlanList } from '../../utils/vlanList';
 import { changeErrorText } from '../../utils/changeError';
 import {
-  staggerBlocks, chunkRows, resolveColumns,
+  staggerBlocks, chunkRows, resolveColumns, TILE_PX, PORTS_TILE_PX,
   DENSITY_OPTIONS, parseDensity, densityLabel, type Density, type StaggerBlock,
 } from '../../utils/faceplateLayout';
 import { lookupModelLayout, resolveEvenOnTop, arrangeSfp, stackCages, cageTiles } from '../../utils/faceplateModels';
+import PortGlyph, { glyphKind, GLYPH_WIDTH, GLYPH_SCALE } from './PortGlyph';
+import { useThemeStore } from '../../store/themeStore';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend,
 } from 'recharts';
 import { formatDistanceToNow } from 'date-fns';
 import clsx from 'clsx';
+import { portMtuError, portMtuMax } from '../../utils/mtu';
 
 /** Move-dialog targets that aren't bridge names (#258). */
 const NEW_BRIDGE = '\u0000new';
@@ -44,7 +47,8 @@ interface Props {
 interface PortEditForm {
   disabled: boolean;
   comment: string;
-  mtu: number;
+  /** As typed; sent only when it differs from the port's MTU. */
+  mtu: string;
   poe_out: 'auto-on' | 'forced-on' | 'off' | '';
   fec_mode: 'clause-74' | 'clause-91' | 'off' | '';
   tx_flow_control: 'on' | 'off' | 'auto' | '';
@@ -54,6 +58,8 @@ interface PortEditForm {
   vlan_mode: 'access' | 'trunk' | 'none';
   pvid: number;
   tagged_vlans: string; // comma-separated string
+  /** Trunk only: drop untagged frames instead of putting them in the native VLAN. */
+  tagged_only: boolean;
 }
 
 interface CreateTrunkForm {
@@ -92,11 +98,13 @@ function portErrorLine(e: PortErrorSummary): string {
 }
 
 function PortTile({
-  port, selected, hovered, isMember, watts, errors, optic,
+  port, selected, hovered, isMember, watts, errors, optic, wholeCage,
   onClick, onMouseEnter, onMouseLeave, onDoubleClick,
 }: {
   port: SwitchPort; selected: boolean; hovered: boolean; isMember?: boolean; watts?: number;
   errors?: PortErrorSummary; optic?: OpticStatus;
+  /** A QSFP cage shown as one port: drawn as the whole cage, not a lane. */
+  wholeCage?: boolean;
   onClick: (e: React.MouseEvent) => void;
   onMouseEnter: () => void; onMouseLeave: () => void; onDoubleClick: () => void;
 }) {
@@ -111,13 +119,39 @@ function PortTile({
   const border = isMember && !selected ? 'var(--warn)' : selected ? 'var(--accent)' : state === 'up' ? 'var(--port-up-border)' : state === 'down' ? 'var(--port-down-border)' : 'var(--line)';
   const textColor = selected ? '#ffffff' : state === 'up' ? 'var(--good)' : state === 'down' ? 'var(--bad)' : 'var(--ink-4)';
   const ledBg = selected ? '#ffffff' : state === 'up' ? 'var(--good)' : 'transparent';
+  const portStyle = useThemeStore((s) => s.portStyle);
+  const title = `${port.name}${port.comment || port.bridgeInfo?.config_json?.comment ? ` — ${port.comment || port.bridgeInfo?.config_json?.comment}` : ''}${port.link_rate || port.speed ? ` · ${port.link_rate || port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}${problems ? ` · ${problems}` : ''}`;
+  if (portStyle === 'ports') {
+    // Drawn ports (#412): the jack or cage, with its label under it. Selection
+    // tints the whole tile, so it stays distinct from "up", which is also the accent.
+    const kind = glyphKind(port, wholeCage);
+    return (
+      <div
+        onClick={onClick} onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave} onDoubleClick={onDoubleClick}
+        title={title}
+        style={{
+          minWidth: Math.round(GLYPH_WIDTH[kind] * GLYPH_SCALE) + 6, padding: '3px 3px 4px', borderRadius: 6, flexShrink: 0, cursor: 'pointer',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3,
+          background: selected ? 'color-mix(in srgb, var(--accent) 22%, transparent)' : undefined,
+          boxShadow: selected ? '0 0 0 1.5px var(--accent)' : isMember ? '0 0 0 1.5px var(--warn)' : undefined,
+          opacity: hovered ? 0.8 : 1, transition: 'opacity 0.1s',
+        }}
+      >
+        <PortGlyph kind={kind} state={state} tone={errTone} watts={watts} />
+        <span style={{
+          fontFamily: 'Geist Mono, monospace', fontSize: 11, fontWeight: 600, lineHeight: 1,
+          color: selected || state === 'up' ? 'var(--ink)' : 'var(--ink-4)',
+        }}>{classifyPort(port).label}</span>
+      </div>
+    );
+  }
   return (
     <div
       onClick={onClick}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
       onDoubleClick={onDoubleClick}
-      title={`${port.name}${port.comment || port.bridgeInfo?.config_json?.comment ? ` — ${port.comment || port.bridgeInfo?.config_json?.comment}` : ''}${port.link_rate || port.speed ? ` · ${port.link_rate || port.speed}` : ''}${watts && watts > 0 ? ` · ${watts.toFixed(1)}W PoE` : ''}${problems ? ` · ${problems}` : ''}`}
+      title={title}
       style={{
         width: 46, height: 46, borderRadius: 4, position: 'relative', flexShrink: 0,
         background: bg, border: errTone && !selected ? `2px solid ${errTone}` : `1px solid ${border}`,
@@ -138,7 +172,7 @@ function PortTile({
           color: selected ? '#ffffff' : errTone,
         }}>!</div>
       )}
-      <span>{portLabel(portBasis(port))}</span>
+      <span>{classifyPort(port).label}</span>
       {watts && watts > 0 ? (
         <span style={{
           position: 'absolute', bottom: 2, left: 0, right: 0, textAlign: 'center',
@@ -187,7 +221,8 @@ function groupQsfpCages(ports: SwitchPort[]): { cages: QsfpCage[]; individual: S
       (a, b) => (classifyPort(a).lane ?? 0) - (classifyPort(b).lane ?? 0)
     );
     lanes.forEach(p => laneNames.add(p.name));
-    const cageNum = key.match(/-(\d+)$/)?.[1] ?? '?';
+    // qsfp28-1 or, for QSFP+ on a CRS3xx, qsfpplus1.
+    const cageNum = key.match(/(\d+)$/)?.[1] ?? '?';
     cages.push({ key, label: `Q${cageNum}`, lanes });
   }
 
@@ -797,6 +832,7 @@ function PortClientsCard({ deviceId, portName }: { deviceId: number; portName: s
 }
 
 export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, autoOpenBridge, onBridgeOpened }: Props) {
+  const portStyle = useThemeStore((s) => s.portStyle);
   const { formatTime } = useDateTimeFormat();
   const queryClient = useQueryClient();
   const canWrite = useCanWrite();
@@ -841,7 +877,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
   const [editForm, setEditForm] = useState<PortEditForm>({
     disabled: false,
     comment: '',
-    mtu: 1500,
+    mtu: '1500',
     poe_out: '',
     fec_mode: '',
     tx_flow_control: '',
@@ -851,6 +887,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
     vlan_mode: 'none',
     pvid: 1,
     tagged_vlans: '',
+    tagged_only: false,
   });
   const [saveError, setSaveError] = useState('');
   const [saveNotice, setSaveNotice] = useState('');
@@ -955,7 +992,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
 
   const updateVlanMutation = useMutation({
     meta: { inlineError: true },
-    mutationFn: ({ name, data, confirm }: { name: string; data: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean }; confirm?: boolean }) =>
+    mutationFn: ({ name, data, confirm }: { name: string; data: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean; tagged_only?: boolean }; confirm?: boolean }) =>
       devicesApi.configurePortVlan(deviceId, name, confirm ? { ...data, confirm_lockout: true } : data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['ports', deviceId] });
@@ -1222,7 +1259,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
     setEditForm({
       disabled: port.disabled,
       comment: port.comment || '',
-      mtu: port.mtu || 1500,
+      mtu: String(port.mtu || 1500),
       poe_out: '',
       fec_mode: '',
       tx_flow_control: '',
@@ -1235,6 +1272,9 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
       // Prefill from the port's actual tagged membership so opening the dialog and
       // saving does not silently strip the trunk's VLANs.
       tagged_vlans: formatVlanList((port.bridgeInfo?.tagged_vlan_ids ?? []).map(Number).filter((n) => n > 0)),
+      // What the port does now, so opening and saving changes nothing. Trunks
+      // MTM set before 1.0.11 were all tagged-only.
+      tagged_only: port.bridgeInfo?.config_json?.['frame-types'] === 'admit-only-vlan-tagged',
     });
   };
 
@@ -1243,8 +1283,10 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
     const ifaceUpdates: Record<string, unknown> = {
       disabled: editForm.disabled,
       comment: editForm.comment,
-      mtu: editForm.mtu,
     };
+    // Only a changed MTU is sent. Sending it on every save also reset the L2
+    // MTU each time, lowering one raised for VLAN tags or jumbo frames.
+    if (editingPort && Number(editForm.mtu) !== (editingPort.mtu || 1500)) ifaceUpdates.mtu = Number(editForm.mtu);
     if (editForm.poe_out) ifaceUpdates.poe_out = editForm.poe_out;
     if (editForm.fec_mode) ifaceUpdates.fec_mode = editForm.fec_mode;
     // Each direction only when chosen. Filling the other with 'off' turned off
@@ -1260,12 +1302,12 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
 
     if (confirmLockout) ifaceUpdates.confirm_lockout = true;
 
-    let vlanData: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean } | null = null;
+    let vlanData: { pvid?: number; tagged_vlans?: number[]; untagged_vlans?: number[]; mode?: 'access' | 'trunk'; replace_tagged?: boolean; tagged_only?: boolean } | null = null;
     if (editForm.vlan_mode !== 'none') {
       // parseVlanList understands ranges. The previous split-and-parseInt read
       // "10-12" as 10 and saved the wrong VLANs without complaint. The native
       // VLAN is untagged by definition, so it is never also sent as tagged.
-      const taggedList = parseVlanList(editForm.tagged_vlans).filter((n) => n !== editForm.pvid);
+      const taggedList = parseVlanList(editForm.tagged_vlans).filter((n) => editForm.tagged_only || n !== editForm.pvid);
 
       // mode is sent explicitly so the server sets frame-types and
       // ingress-filtering to match, rather than only the PVID (#151).
@@ -1273,10 +1315,23 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
         ? { pvid: editForm.pvid, untagged_vlans: [editForm.pvid], tagged_vlans: [], mode: 'access' as const }
         // replace_tagged: the list is the port's whole tagged set, so an
         // unticked VLAN is removed rather than quietly left in place (#165).
-        : { pvid: editForm.pvid, tagged_vlans: taggedList, untagged_vlans: [], mode: 'trunk' as const, replace_tagged: true };
+        // The native VLAN goes out untagged, unless the trunk is tagged-only.
+        : {
+          pvid: editForm.pvid,
+          tagged_vlans: taggedList,
+          untagged_vlans: editForm.tagged_only ? [] : [editForm.pvid],
+          mode: 'trunk' as const,
+          replace_tagged: true,
+          tagged_only: editForm.tagged_only,
+        };
     }
     return { ifaceUpdates, vlanData };
   };
+
+  // The most this port's hardware takes: RouterOS quietly keeps a lower MTU
+  // than asked when it's more.
+  const mtuMax = editingPort ? portMtuMax(editingPort.config_json) : null;
+  const mtuError = editingPort ? portMtuError(editForm.mtu, mtuMax) : null;
 
   const handleSave = async (confirmLockout = false) => {
     if (!editingPort) return;
@@ -1316,13 +1371,19 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
   // The geometry lives in utils/faceplateLayout.ts. What used to be here was a
   // coordinate system for an absolute-positioned faceplate that no longer
   // exists -- every constant fed only the next one and none reached the render.
+  // Remembered per device in this browser; a device not set yet uses the last
+  // choice made on any device.
+  const densityKey = `faceplate.density.${deviceId}`;
   const [density, setDensity] = useState<Density>(() => {
-    try { return parseDensity(localStorage.getItem('faceplate.density')); }
+    try { return parseDensity(localStorage.getItem(densityKey) ?? localStorage.getItem('faceplate.density')); }
     catch { return 'auto'; }
   });
   const chooseDensity = (d: Density) => {
     setDensity(d);
-    try { localStorage.setItem('faceplate.density', String(d)); } catch { /* private mode */ }
+    try {
+      localStorage.setItem(densityKey, String(d));
+      localStorage.setItem('faceplate.density', String(d));
+    } catch { /* private mode */ }
   };
 
   // Measured rather than assumed, so "fit to width" actually fits.
@@ -1339,7 +1400,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
     return () => ro.disconnect();
   }, []);
 
-  const columns = resolveColumns(density, rackWidth);
+  const columns = resolveColumns(density, rackWidth, portStyle === 'ports' ? PORTS_TILE_PX : TILE_PX);
   // Odd ports on the top row, or even (2 4 6 8 over 1 3 5 7) for models wired
   // that way (#277). Remembered per model in this browser: every unit of a
   // model is the same.
@@ -1493,7 +1554,17 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
             <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
               {([['up', 'var(--accent)', ports.filter(p => !p.disabled && p.running).length], ['down', 'var(--bad)', ports.filter(p => !p.disabled && !p.running).length], ['disabled', 'var(--ink-4)', ports.filter(p => p.disabled).length], ['selected', 'var(--accent)', selectedPorts.size]] as [string,string,number][]).map(([l, c, n]) => (
                 <span key={l} className="mono text-[11px]" style={{ display: 'flex', alignItems: 'center', gap: 5, color: 'var(--ink-3)' }}>
-                  <span style={{ width: 9, height: 9, borderRadius: 2, background: c, opacity: l === 'disabled' ? 0.4 : 1, flexShrink: 0 }} />
+                  {portStyle === 'ports' ? (
+                    // Drawn ports: the swatch is a small port frame in that state's colours.
+                    <span style={{
+                      width: 10, height: 10, borderRadius: 3, flexShrink: 0,
+                      border: `1.5px ${l === 'disabled' ? 'dashed' : 'solid'} ${l === 'up' || l === 'selected' ? 'var(--accent)' : 'var(--port-frame-off)'}`,
+                      background: l === 'selected' ? 'color-mix(in srgb, var(--accent) 35%, transparent)' : 'var(--port-metal-off-lo)',
+                      boxShadow: l === 'up' ? '0 0 4px color-mix(in srgb, var(--accent) 60%, transparent)' : undefined,
+                    }} />
+                  ) : (
+                    <span style={{ width: 9, height: 9, borderRadius: 2, background: c, opacity: l === 'disabled' ? 0.4 : 1, flexShrink: 0 }} />
+                  )}
                   {l} <span className="num-tab" style={{ color: 'var(--ink-2)' }}>{n}</span>
                 </span>
               ))}
@@ -1623,10 +1694,15 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
               return (
                 <div key={cage.key}>
                   <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', letterSpacing: '.1em', marginBottom: 6 }}>{cage.label}</div>
-                  <div style={{ display: 'flex', gap: 4 }}>
+                  <div style={{
+                    display: 'flex', gap: 4,
+                    // Drawn ports: a broken-out cage's lanes sit in one cage outline (#412).
+                    ...(portStyle === 'ports' && tiles.length > 1
+                      ? { gap: 2, padding: '3px 3px 0', border: '1.5px solid var(--port-frame-off)', borderRadius: 8 } : {}),
+                  }}>
                     {tiles.map((lane) => {
                       return (
-                        <PortTile key={lane.name} port={lane} selected={selectedPorts.has(lane.name)} hovered={hoveredPort === lane.name} watts={poeWattsMap[lane.name]} errors={portErrMap[lane.name]} optic={opticMap[lane.name]} onClick={e => togglePort(lane.name, e)} onMouseEnter={() => setHoveredPort(lane.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(lane)} />
+                        <PortTile key={lane.name} port={lane} wholeCage={tiles.length === 1} selected={selectedPorts.has(lane.name)} hovered={hoveredPort === lane.name} watts={poeWattsMap[lane.name]} errors={portErrMap[lane.name]} optic={opticMap[lane.name]} onClick={e => togglePort(lane.name, e)} onMouseEnter={() => setHoveredPort(lane.name)} onMouseLeave={() => setHoveredPort(null)} onDoubleClick={() => canWrite && openEditPanel(lane)} />
                       );
                     })}
                   </div>
@@ -1904,14 +1980,16 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                     <label className="label">MTU</label>
                     <input
                       type="number"
-                      className="input"
+                      className={clsx('input', mtuError && 'border-red-400')}
                       value={editForm.mtu}
-                      onChange={(e) => setEditForm((f) => ({ ...f, mtu: parseInt(e.target.value) || 1500 }))}
+                      onChange={(e) => setEditForm((f) => ({ ...f, mtu: e.target.value }))}
                       min={576}
-                      max={9216}
+                      max={mtuMax ?? 65535}
                       placeholder="1500"
                     />
-                    <p className="text-xs text-gray-400 mt-1">Standard: 1500 · Jumbo frames: 9000</p>
+                    <p className={clsx('text-xs mt-1', mtuError ? 'text-red-600 dark:text-red-400' : 'text-gray-400')}>
+                      {mtuError ?? `Standard: 1500 · Jumbo frames: 9000${mtuMax ? ` · up to ${mtuMax} on this port` : ''}`}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -2055,7 +2133,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                       >
                         <option value="none">— No change —</option>
                         <option value="access">Access (single untagged VLAN)</option>
-                        <option value="trunk">Trunk (tagged VLANs)</option>
+                        <option value="trunk">Trunk (tagged VLANs, plus a native VLAN)</option>
                       </select>
                     </div>
 
@@ -2087,6 +2165,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                           <label className="label">Native VLAN (PVID — untagged)</label>
                           <select
                             className="input"
+                            disabled={editForm.tagged_only}
                             value={editForm.pvid}
                             onChange={(e) =>
                               setEditForm((f) => ({ ...f, pvid: parseInt(e.target.value) }))
@@ -2099,6 +2178,20 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                               </option>
                             ))}
                           </select>
+                          <p className="text-xs text-gray-400 mt-1">
+                            {editForm.tagged_only
+                              ? 'Untagged devices on this port are dropped. Untick "Tagged only" to put them in the native VLAN.'
+                              : "Untagged devices on this port (anything that doesn't use VLANs) join this VLAN."}
+                          </p>
+                          <label className="flex items-center gap-2 mt-2 text-sm cursor-pointer">
+                            <input
+                              type="checkbox"
+                              className="w-3.5 h-3.5"
+                              checked={editForm.tagged_only}
+                              onChange={(e) => setEditForm((f) => ({ ...f, tagged_only: e.target.checked }))}
+                            />
+                            Tagged only (drop untagged frames)
+                          </label>
                         </div>
                         <div>
                           <label className="label">Tagged VLANs</label>
@@ -2107,7 +2200,8 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                               tagging it too would be a misconfiguration. */}
                           <div className="flex flex-wrap gap-1.5 mb-2">
                             {[...vlans].sort((a, b) => a.vlan_id - b.vlan_id).map((v) => {
-                              const native = v.vlan_id === editForm.pvid;
+                              // A tagged-only trunk has no native VLAN, so any VLAN can be tagged.
+                              const native = !editForm.tagged_only && v.vlan_id === editForm.pvid;
                               // RouterOS-generated names ("VLAN 100") only repeat the number.
                               const label = v.name && v.name.trim() !== `VLAN ${v.vlan_id}` ? v.name : '';
                               const on = !native && parseVlanList(editForm.tagged_vlans).includes(v.vlan_id);
@@ -2173,7 +2267,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
               <div className="flex items-center justify-end gap-3 pt-2">
                 <button onClick={() => setEditingPort(null)} className="btn-secondary">Cancel</button>
                 <ReviewChangesButton
-                  deviceName={deviceName} disabled={isPending} applyLabel="Apply"
+                  deviceName={deviceName} disabled={isPending || !!mtuError} applyLabel="Apply"
                   onApply={() => { void handleSave(); }}
                   requests={() => {
                     const name = editingPort.name;
@@ -2186,7 +2280,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
                 />
                 <button
                   onClick={() => { void handleSave(); }}
-                  disabled={isPending}
+                  disabled={isPending || !!mtuError}
                   className="btn-primary flex items-center gap-2"
                 >
                   {isPending ? (

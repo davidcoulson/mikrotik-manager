@@ -3,6 +3,283 @@
 1.1 is in beta on the `dev` branch and the `:beta` images
 ([release channels](configuration.md#release-channels)). For stable, stay on 1.0 below.
 
+## 1.1.0-beta.45
+
+- **Firewall Logs looks more like Ron's mockup** in
+  [#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415): zones show as
+  coloured badges (untrust/WAN red, trust/LAN green, DMZ/guest amber, Router grey, any other zone
+  its own colour), each action has an icon, and the pager has page numbers with "Showing 1–100 of
+  N". See [Zones](firewall-events.md#zones).
+- **NAT rules can name the WAN interface**, from Ron's request in
+  [#440](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/440). The Custom pattern
+  has In. Interface and Out. Interface, so a netmap can say which uplink it uses, and 1:1 NAT has
+  an optional WAN in-interface. The rule summary names the interface.
+
+## 1.1.0-beta.44
+
+- **Firewall Logs reads in zones**, from Ron's request in
+  [#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415). On a device running
+  [zones](devices.md#zones), In and Out become **From zone** and **To zone**, with "Router" for
+  traffic to or from the router itself, and the chain is left out. A device already on zones
+  shows them within the hour, or as soon as its Zones tab is opened.
+- **Resolve names** on Firewall Logs shows client hostnames and reverse DNS in place of
+  addresses, with the address on hover (#415). Off by default. See
+  [Resolve names](firewall-events.md#resolve-names).
+
+## 1.1.0-beta.43
+
+- **nginx kept restarting after updating to beta.42** with an existing compose file
+  ([#439](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/439), reported by Ron).
+  The Let's Encrypt support needed a directory that only the new compose file provided, and on
+  the read-only container nginx stopped before starting. It now uses space every compose file
+  already has, so no compose change is needed, and if it can't, Let's Encrypt turns off and nginx
+  starts anyway. The `acme_challenge` volume is gone from the compose files; an existing one is
+  unused and can be removed with `docker volume rm`.
+
+## 1.1.0-beta.42
+
+- **Let's Encrypt certificates for the manager**, contributed by eskyuu in
+  [#420](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/420). With a public DNS name
+  and port 80 open, **Settings → Certificate** can get and renew a certificate by itself, show the
+  last Certbot attempt, and use staging or a private ACME server with its own CA. The settings can
+  also come from `.env`. Nothing changes until a domain is set. See
+  [Let's Encrypt](configuration.md#lets-encrypt-acme).
+- The nginx image is about 100 MB larger, for Certbot.
+
+## 1.1.0-beta.41
+
+- **Zone rules can name a hostname**, from Ron's request in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369): trust to untrust on
+  587 to `smtp.outlook.com`, say. The router keeps an address list of every address the name
+  resolves to, and the rule matches the list. See [Zones](devices.md#zones).
+- **Zones can limit what the manager reaches on the router** to the API, API-SSL and SSH ports,
+  the only ones it uses, instead of everything (#369).
+- **Each site can have a map zoom** (#362): 1 (the world) to 19 (a building), 12 being about
+  street level. The dashboard map opens at it when it shows only that site's devices. See
+  [Sites](sites.md).
+- **Switching to API-SSL or HTTPS explains "not enough permissions"**
+  ([#417](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/417)): which step the
+  router refused, and that the user the manager logs in as needs the `full` group or the missing
+  policies.
+- **A bridge's MTU can be set**, from the bridge's **Edit** on the **Bridges** tab: a number, or
+  `auto` for RouterOS's default. It's the MTU for the router's own traffic on the bridge; jumbo
+  frames switched between ports only need the ports' MTU raised. A bridge can't carry more than
+  the smallest L2 MTU of its ports, and RouterOS only answers "could not set mtu", so the manager
+  says which ports are too small, and which can't go higher at all and have to leave the bridge.
+  See [Bridges](devices.md#bridges).
+- **A port's MTU stops at what its hardware takes**, and the form says what that is ("up to 10218
+  on this port"). RouterOS quietly kept a lower MTU than asked when a port couldn't take it (a
+  CRS510's management port stops at 2028), and the save reported success; now the manager
+  refuses it, and says so if the device keeps a different value. The fixed 9216 limit is gone,
+  so CRS3xx and CRS5xx ports can go to 10218. See [A port's MTU](devices.md#a-ports-mtu).
+- **Saving a port no longer lowers its L2 MTU.** Every save sent the MTU, and setting it also
+  set the L2 MTU to the MTU plus 8, so a comment edit on a port raised for VLAN tags or jumbo
+  frames brought it back down. The MTU is now sent only when it changes, and the L2 MTU is only
+  ever raised.
+
+## 1.1.0-beta.40
+
+- **Zone rules can be ICMP, or any IP protocol by number**, from Ron's request in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369). A custom rule can
+  allow ICMP of one type (`8`) or type and code (`3:4`), or every type, and **Protocol #** takes a
+  protocol number such as `89` for OSPF or `47` for GRE. Both can take a source and destination
+  address. See [Zones](devices.md#zones).
+- **Zones are easier to edit.** The matrix says that a cell opens what one zone can reach in
+  another, and a zone that holds bridge ports says so on the zone itself. Rules can't see traffic
+  through a bridge port, so the warning says what to use instead.
+- **Switching to API-SSL or HTTPS works behind Cloudflare**, as in 1.0.14 below.
+
+## 1.1.0-beta.39
+
+**This update restarts Postgres, Redis and InfluxDB once**, because their settings changed. Your
+data stays as it is.
+
+- **Redis repairs a damaged data file instead of refusing to start, and the databases get 60
+  seconds to stop cleanly**, as in 1.0.13 below. See
+  [The databases during an update](configuration.md#the-databases-during-an-update).
+
+## 1.1.0-beta.38
+
+- **Zone rules can name addresses**, from Ron's request in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369). A custom rule in a
+  zone pair now takes a source and a destination as well as ports: an address, a subnet or a range,
+  with TCP, UDP or any protocol. WAN to DMZ can let one partner reach one server on 443, and LAN
+  to the router can take SSH from the admin subnet only. Setups saved before keep exactly the rules
+  they had. See [Zones](devices.md#zones).
+- **Firewall Logs: a period, and logged rules on the Firewall tab**, contributed by aziz in
+  [#437](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/437). Firewall Logs reads
+  the last hour, 24 hours, 7 days or 30 days, in Grouped and Raw, and a link can open it with
+  `?range=`. **Logged (N)** on the Firewall tab shows only the rules that log.
+- **Clients hides more network devices**
+  ([#363](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/363)): switches, routers
+  and access points the manager doesn't manage, when they announce themselves over LLDP, CDP or
+  MNDP as one. An IP phone that also reports itself as a bridge stays a client.
+- **Clients no longer kept online by stale ARP entries, mirror rollouts on 16 MB-flash devices,
+  and the CRS354's QSFP+ cages**, as in 1.0.12 below.
+- **Dependencies**: vitest 5, vite 8.3.6, react-router 7.18.5, TanStack Query 5.106.1, lucide
+  1.70, openid-client 6.8.9, otpauth 9.6.0, bullmq 6.7.1, and current Postgres, Redis and nginx
+  images.
+
+## 1.1.0-beta.37
+
+- **Trunk ports carry a native VLAN**, as in 1.0.11 below: a trunk now accepts untagged frames
+  into its native VLAN instead of dropping them, so a device that doesn't use VLANs works on a
+  trunk port. **Tagged only** in the port editor keeps the old behaviour. See
+  [Changing a port's VLAN](devices.md#changing-a-ports-vlan).
+
+## 1.1.0-beta.36
+
+- **PPP users and sessions**, from Hector's request in
+  [Discussion #85](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/85):
+  **Tunnels & PPP** now reads one router's PPPoE servers, sessions and PPP users live. Operators
+  can disconnect a session, turn a PPP user off or on, and turn a PPPoE server off or on. User
+  and server changes run under Change Guard and can be reviewed first, and everything is in the
+  audit log. Passwords aren't read. See
+  [PPP users and sessions](network-services.md#ppp-users-and-sessions).
+- **Clients leaves out your network devices**, as promised in
+  [#363](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/363): the MAC addresses
+  of managed devices (any interface or radio) and VRRP's virtual MACs no longer show as clients.
+  The filter bar says how many are hidden, with **show** to bring them back.
+- **Place a site on the map by hand**, as promised in
+  [#362](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/362): when editing a
+  site, type a latitude and longitude or press **Pick on map** and click. It wins over the
+  address, for sites the geocoder can't find or puts in the wrong place. See
+  [Sites](sites.md).
+- **A template from a device**, from Manuel's idea in
+  [Discussion #85](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/85):
+  **Templates → From a device…** reads DNS, NTP, IP services, SNMP, remote syslog and the time
+  zone off a device you've set up, and writes them as the commands that set them, in a new
+  template to check before saving. Nothing secret is taken. See
+  [A template from a device](commands.md#a-template-from-a-device).
+- **Zones hide the RouterOS rules behind them**, from Ron's request in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369). With zones on, the
+  Firewall tab reads as zones and what each can reach: the chains, jumps and returns that carry
+  them out are folded away. **Show RouterOS rules** opens them, with their counters, and the
+  browser remembers the choice. Following a log line's link to its rule opens them too.
+- **Switch to API-SSL: a failure now says why**
+  ([#417](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/417)). When the
+  manager's reply never reached the browser, for example because a reverse proxy in front of
+  MikroTik Manager gave up while a router signed its certificate, the page said only "Could not
+  enable API-SSL". It now says what happened, such as a lost reply with its HTTP status or no
+  answer in time, and that the switch may still finish, and the device list refreshes to show it.
+  Failures are also written to the backend log. Tested on RouterOS 6.49.21.
+- **Switch to API-SSL could refuse its own check.** When a device that had been on API-SSL
+  before was switched again and kept the certificate already on api-ssl, the certificate pinned
+  the first time no longer matched, so the login that decides the switch was refused. The old pin
+  is now cleared when a switch starts.
+
+## 1.1.0-beta.35
+
+- **Sessions**, the second part of Ron's
+  [#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415): a new
+  **Security → Sessions** page lists connections from NetFlow, one row each, the way a Palo Alto
+  or Check Point traffic log reads. Each row has the client and server, the addresses NAT
+  changed, application, bytes and packets each way, duration, and how it ended (closed, reset
+  by client or server, no reply, aged out). Both directions of a connection, which RouterOS
+  exports separately, become one row, through masquerade and port forwards too, and a long
+  connection stays one row as it goes on. Turn it on per router with the new **Sessions**
+  switch on **Network Services → NetFlow**; it is off by default and kept for 3 days. See
+  [Sessions](sessions.md).
+- **Menu: Firewall Logs and Sessions move under Security.** **Security** opens the security
+  page as before and now unfolds to **Firewall Logs** and **Sessions** under it. **Events** is
+  a single entry for device logs. Page addresses haven't changed, so bookmarks still work.
+- **Routers behind NAT are recognised.** When NAT sits between the routers and MikroTik Manager,
+  their flows all arrive from one address and couldn't be told apart. Now each router is
+  recognised by when it booted, which every NetFlow packet carries and polling records, so its
+  flows count under its own name and site on Traffic and NetFlow. Two routers that booted
+  together still can't be told apart.
+- **Zones on routers without FastTrack offload**, fixing Ron's failed **Turn on zones** in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369): the FastTrack rule
+  was always written with `hw-offload=yes` on RouterOS 7, and some builds don't take that
+  parameter, so the whole change was refused and Change Guard put the old firewall back.
+  MikroTik Manager now asks the router which parameters a firewall rule takes and adds
+  `hw-offload` only where it is listed. The **Forward basics** preset had the same problem and
+  the same fix.
+
+## 1.1.0-beta.34
+
+- **Torch**, from Ron's request in
+  [#416](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/416): a new card on a
+  device's **Tools** tab shows the traffic on an interface live, flow by flow, refreshed every
+  second, busiest first. Narrow it by source, destination, port and protocol. It stops when you
+  press Stop or leave the page, and by itself after 10 minutes, and a device runs at most two at
+  once ([Torch](devices.md#torch)).
+- **Firewall Logs open grouped**, the first step on Ron's
+  [#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415): one line per device,
+  rule, interfaces, protocol, source, destination and port, with a count and first and last seen,
+  the way Palo Alto and Check Point show their logs. Retries and scans no longer fill the page.
+  **Raw** shows every line as before, and a group's count opens its lines
+  ([Grouped and raw](firewall-events.md#grouped-and-raw)). Lines on the input chain no longer show
+  an output interface of "(unknown".
+- **Zones**: **Review changes** works while Change Guard is holding the device after an earlier
+  change. It only reads, but it was refused with "a protected change is still in progress"
+  ([#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369)).
+- Running and scheduling **bulk commands** is now for admins too, as in 1.0.9; operators can still
+  cancel a run. Schedules an operator saved earlier keep running.
+- Fixes from 1.0.9.
+
+## 1.1.0-beta.33
+
+- **Zones**, phase 2 of Ron's
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369): on the Firewall tab,
+  group interfaces into zones and fill in a matrix of what each zone can reach, the other zones and
+  the router itself: deny, everything, or chosen services and ports. MTM writes the whole IPv4
+  filter table from it, one chain per open pair, and reports any change made outside MTM as drift,
+  on the card and in Config Health. Applying keeps the rules that are already right and runs through
+  Change Guard ([Zones](devices.md#zones)).
+- **Change Guard**: Quick rules and **Tag all** now get a script-mode restore of just the firewall
+  tables they touch, so with script mode on a revert no longer reboots the device.
+- **Drawn ports** on the Ports tab, from Ron's mockup in
+  [#412](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/412): RJ45 jacks, SFP cages,
+  QSFP28 and QSFP-DD cages, and broken-out cages as their lanes in one cage outline, with link and
+  activity lights. Up ports take your accent colour. **Settings → General → Appearance → Faceplate
+  ports → Tiles** brings back the old squares ([Appearance](configuration.md#appearance)).
+- Broken-out QSFP lanes are labelled `1/1`, `1/2` and so on again, rather than `qsfp`.
+- The faceplate's ports-per-row choice is remembered for each device, in this browser. A device
+  you haven't set yet uses the last choice you made.
+- **AP Radio TX Retries** remembers the band you picked, in this browser
+  ([#410](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/410)).
+- Fixes from 1.0.8.
+
+## 1.1.0-beta.32
+
+- **Scheduled bulk commands**, from Ron's request in
+  [#359](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/359): **Schedule…** on
+  Bulk Commands runs a command once, daily, weekly or monthly, or on your own cron expression, on
+  chosen devices plus every device with a tag or in a site at the time it runs. Options to run only
+  inside maintenance windows and to alert when it fails or doesn't run (a new **Scheduled command
+  failed** alert). A time that passes while the manager is down is marked missed, never run late
+  ([Schedules](commands.md#schedules)).
+- **Which rule logged it**, from Ron's request in
+  [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369): a firewall or NAT rule
+  that logs gets a short tag in its log prefix, so a line on Firewall Events links to its rule, and
+  a rule links to its lines. **Tag all** on the Firewall tab tags rules made elsewhere
+  ([Which rule logged it](firewall-events.md#which-rule-logged-it)).
+
+## 1.1.0-beta.31
+
+- **Appearance**: a **System** theme that follows your computer's light or dark setting, seven
+  accent colours or your own, and **Midnight** dark surfaces, under Settings → General, from
+  [@kraken-XIV](https://github.com/kraken-XIV)'s proposal in
+  [#329](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/329)
+  ([Appearance](configuration.md#appearance)). Blue on Slate looks exactly as before.
+- **Routing rules** on a device's Routing tab, from Ron's request in
+  [#370](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/370): in order, each
+  lookup's table and routes, and flags for a rule that repeats or is covered by an earlier one, a
+  missing table, or a table with no active routes; add and remove through Change Guard
+  ([Routing rules](devices.md#routing-rules)).
+- **Traffic**: click an application to see the clients behind it, with each one's share, from
+  [@azizfayziev](https://github.com/azizfayziev)'s
+  [#366](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/366) step 1
+  ([Traffic](traffic.md#what-it-shows)).
+- **Graphs**: VRRP interfaces are left out of the busiest pick (their traffic is already counted on
+  the VLAN and bond under them), and a PPPoE client's utilisation uses its port's speed
+  ([#402](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/402)).
+- **Topology**: a link coloured by hand still turns red when it goes down or is blocked
+  ([#403](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/403)).
+- From 1.0.7: stale Change Guard restore points are cleared from devices, Postgres gets 256 MB of
+  shared memory, and `minimatch` is updated in the build tooling.
+
 ## 1.1.0-beta.30
 
 - **Device Logs and Firewall events open quickly on large log tables**, from
@@ -439,6 +716,144 @@ tested on real fleets.
 1.0 is the first stable release: a version to run in production, where updates on the 1.0.x
 line only fix things. It's the result of more than 130 beta releases since April 2026, many of them
 shaped by people running MikroTik Manager on their own fleets.
+
+## 1.0.14
+
+Released on Monday 9 November 2026.
+
+- **Switching a device to API-SSL or WebFig to HTTPS failed behind Cloudflare**
+  ([#417](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/417)). On an older
+  router, creating and signing the certificate can take a few minutes, and Cloudflare gives up on a
+  request after 100 seconds and shows its own 502, while the switch carried on unseen. Now a switch
+  that takes longer than about 25 seconds carries on in the background, the page checks back
+  every few seconds and shows the outcome when it's ready, and no other change can reach the device
+  until it's done. See [Behind a reverse proxy](configuration.md#behind-a-reverse-proxy).
+
+## 1.0.13
+
+Released on Monday 9 November 2026. Updates are safer for the databases.
+
+**This update restarts Postgres, Redis and InfluxDB once**, because their settings changed. Your
+data stays as it is.
+
+- **Redis repairs a damaged data file instead of refusing to start.** If Redis's append-only
+  file is damaged, for example because the disk lost a write in a power cut or a hard reset,
+  Redis wouldn't start, and the whole manager waited for it. This happened on a production
+  install: the damage sat unnoticed for a day, because Redis reads the file only when it starts,
+  until an update restarted it. The file is now checked before Redis starts and, if it's
+  damaged, repaired with Redis's own tool, which cuts it at the last good record. Redis holds
+  only the job queue, which refills itself, so nothing else is lost. A copy of the damaged files
+  is kept, and Redis's log says what happened. See
+  [The databases during an update](configuration.md#the-databases-during-an-update).
+- **Postgres, Redis and InfluxDB get 60 seconds to stop cleanly** when an update or a restart
+  stops them, instead of Docker's 10, so none is cut off mid-write.
+- **A Redis password with quotes or `$` in it broke Redis's health check.** The password now
+  reaches Redis and the check through the container's environment instead of being pasted into
+  a shell command.
+
+## 1.0.12
+
+Released on Monday 9 November 2026. Clients that stayed online, mirror rollouts on small
+switches, and the CRS354's QSFP+ ports.
+
+- **Clients stayed online long after they'd left**
+  ([#363](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/363)). RouterOS keeps
+  `stale` and `failed` ARP entries, MAC and all, for days on a quiet VLAN, and any that wasn't
+  `failed` counted as the client being there, so phones stayed online all weekend. Only entries
+  the router is in touch with count now (`reachable`, `delay`, `probe`, or static). A `stale` one
+  keeps a client that's already online for 15 minutes, so a quiet printer doesn't flicker, but
+  never brings one online. Thanks to aziz for tracking down the cause. See
+  [Clients](clients.md#where-the-data-comes-from).
+- **Mirror rollouts refused switches with 16 MB of flash.** A device such as a CRS309 or hAP ac²
+  runs from RAM and downloads packages into RAM, but the rollout measured them against its free
+  flash, about 3 MB, and stopped with "Not enough space". It checks free memory on those devices
+  now, keeping a margin for the device itself. Reported by Manuel in
+  [Discussion #85](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/85).
+- **The CRS354's QSFP+ ports drew as eight separate cages.** The CRS3xx names its QSFP+ lanes
+  `qsfpplus1-1` to `qsfpplus2-4`, which didn't fit the lane naming the faceplate knew, so each lane
+  was a cage of its own (Q1, Q1, Q2, Q2 and so on). They're two cages of four lanes now. Also
+  reported by Manuel.
+
+## 1.0.11
+
+Released on Sunday 8 November 2026. Trunk ports and their native VLAN.
+
+- **A trunk port dropped untagged traffic.** Setting a port to trunk wrote
+  `frame-types=admit-only-vlan-tagged`, so the native VLAN the port editor offered never
+  applied: a laptop, printer or unmanaged switch plugged into a trunk port couldn't talk at all.
+  A trunk now accepts both kinds of frame. Tagged frames go to its tagged VLANs, and untagged
+  frames join the native VLAN, which the port carries untagged. Tick **Tagged only** for a trunk
+  that should drop untagged frames, as before. Saving a trunk also takes the port out of any
+  untagged VLAN other than its native one. Trunks saved by older versions open with
+  **Tagged only** ticked and keep working as they did until you untick it and save. See
+  [Changing a port's VLAN](devices.md#changing-a-ports-vlan).
+
+## 1.0.10
+
+Released on Sunday 8 November 2026. Switching a device to API-SSL.
+
+- **Switch to API-SSL: a failure now says why**
+  ([#417](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/417)). When the
+  manager's reply never reached the browser, for example because a reverse proxy in front of
+  MikroTik Manager gave up while a router signed its certificate, the page said only "Could not
+  enable API-SSL". It now says what happened, such as a lost reply with its HTTP status or no
+  answer in time, and that the switch may still finish, and the device list refreshes to show it.
+  Failures are also written to the backend log. Tested on RouterOS 6.49.21.
+- **Switch to API-SSL could refuse its own check.** When a device that had been on API-SSL
+  before was switched again and kept the certificate already on api-ssl, the certificate pinned
+  the first time no longer matched, so the login that decides the switch was refused. The old pin
+  is now cleared when a switch starts.
+
+## 1.0.9
+
+Released on Sunday 8 November 2026. Who can open a shell or run commands, and the site switcher.
+
+- **The web terminal is for admins only**
+  ([#411](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/411)). A shell signs in
+  as the router's admin account and skips Change Guard and Review changes, so operators no longer
+  get one; a site admin still gets one on devices in their sites. For the same reason, running
+  **bulk commands** is admin-only too. Operators keep every guarded edit on the device tabs, and
+  can still cancel a bulk command run.
+- **Switching sites left you on another site's device**
+  ([#414](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/414)). Picking a site in
+  the selector while a device page was open kept showing that device, even when it belonged to
+  another site. The page now goes back to the device list when the new site doesn't include the
+  device; picking the device's own site keeps it open.
+
+## 1.0.8
+
+Released on Saturday 7 November 2026. Fixes for the device page's update check and for RouterBOOT
+upgrades.
+
+- **The update check forgot the update channel.** On a device's **Config** tab (the **Firmware** tab
+  in 1.1), the channel showed after **Check for Updates** until the page was reloaded, then went back
+  to *not checked yet*. The manager saves the channel each device reports, but the device page
+  didn't load it. It does now
+  ([#413](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/413)).
+- **A RouterBOOT upgrade could be reported as failed when only its reboot hadn't happened.** In a
+  rollout, a CRS310 took the new RouterBOOT but not the reboot after it, and stayed up. The rollout
+  waited 12 minutes and reported *device did not come back*, although the device was reachable the
+  whole time, and it showed as up to date after its next reboot. Now, if a device is still up two
+  minutes after the reboot was sent, the manager sends it again. If it still doesn't restart, the
+  rollout says so: the RouterBOOT was written, the device is running, and a reboot finishes it.
+
+## 1.0.7
+
+Released on Saturday 7 November 2026. Housekeeping: restore points left on devices, Postgres's
+shared memory, and two development-only dependency alerts.
+
+- **Old Change Guard restore points are cleared from devices.** Each guarded change saves a
+  restore point (`mtm-rp-….backup`) that only its revert scheduler reads. They were left behind
+  when a revert fired, when the manager restarted mid-change, or when the clean-up couldn't reach
+  the device, and piled up in the device's files. After each change, Change Guard now removes any
+  restore point whose revert scheduler is gone, in binary and script mode, and keeps one that's
+  still armed ([Change Guard](change-guard.md)).
+- **Postgres gets 256 MB of shared memory** (`shm_size` in both compose files). Docker's default
+  is 64 MB, and on a large events table Postgres's parallel queries and parallel `VACUUM` could
+  fail with *could not resize shared memory segment … No space left on device*. If you keep your
+  own copy of the compose file, add `shm_size: 256m` to the `postgres` service.
+- `minimatch` in the build and test tooling is updated to 11, clearing two Dependabot alerts.
+  Neither it nor `deepmerge` (an alert with no fix yet) is in the images.
 
 ## 1.0.6
 

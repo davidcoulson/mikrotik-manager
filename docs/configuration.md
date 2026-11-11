@@ -20,6 +20,9 @@ Set in `.env` at the project root. Changing any of these requires a container re
 | `PASSWORD_LOGIN` | `true` | `false` makes sign-in SSO-only. See [SSO-only sign-in](sso-oidc.md#behaviour-and-safety) |
 | `HTTP_PORT` | `80` | Host port for HTTP (redirects to HTTPS, or serves the app with `TLS_MODE=proxy`) |
 | `HTTPS_PORT` | `443` | Host port for HTTPS |
+| `ACME_DOMAIN` | *unset* | DNS name for a Let's Encrypt certificate. See [Let's Encrypt](#lets-encrypt-acme) |
+| `ACME_EMAIL` | *unset* | Contact email for Let's Encrypt expiry notices |
+| `ACME_SERVER` | Let's Encrypt | Another ACME directory URL, such as staging or a private CA |
 | `BIND_ADDRESS` | *every interface* | Host address the web UI is published on. See [Network exposure](#network-exposure). |
 | `NETFLOW_BIND_ADDRESS` | *every interface* | Host address the NetFlow collector (UDP 2055) is published on. |
 | `TLS_MODE` | `https` | `proxy` when your own reverse proxy terminates TLS. See [Behind a reverse proxy](#behind-a-reverse-proxy). |
@@ -100,6 +103,25 @@ Dates follow the browser's language too, for example `Nov 1, 14:30` in US Englis
 This only changes how times are shown. Schedules still run in the timezone set under
 **Settings → General**, the API's times are unchanged, and the browser's own date and time
 pickers keep their regional format.
+
+## Appearance
+
+**Settings → General → Appearance** sets how the manager looks to you, from
+[@kraken-XIV](https://github.com/kraken-XIV)'s proposal in #329. It's kept in this browser, so
+each person, and each browser, can have their own.
+
+- **Theme:** Light, Dark, or **System**, which follows your computer's light or dark setting and
+  changes with it. The moon and sun in the top bar switch between light and dark.
+- **Accent colour:** blue (the default), indigo, violet, emerald, teal, amber, rose, or your own
+  colour from the rainbow swatch. Buttons, links, tabs, selections and highlights take it. Where a
+  colour is too light to carry white text, the manager uses a darker shade of it, so buttons stay
+  readable. Chart series, map pins and status colours (green, amber, red) don't change.
+- **Dark surfaces:** **Slate**, as before, or **Midnight**, near-black for dark rooms and OLED
+  screens.
+- **Faceplate ports:** **Ports** (the default) draws each port on a device's Ports tab as the
+  hardware looks: RJ45 jacks, SFP cages, QSFP28 and QSFP-DD cages, and broken-out cages as their
+  lanes inside one cage outline. Up ports take the accent colour, with a green link light. **Tiles**
+  brings back the plain green and red squares.
 
 ## Sessions
 
@@ -283,13 +305,39 @@ and on such hosts the update left the databases restarting; 0.24.52 removes it.
 ## TLS
 
 A self-signed certificate is generated on first run. Replace it under
-**Settings → TLS Certificate** by uploading a certificate and private key, or regenerate the
+**Settings → Certificate** by uploading a certificate and private key, or regenerate the
 self-signed one; nginx terminates TLS, picks up the new certificate within a few seconds, and
 redirects HTTP to HTTPS.
 
 Before 0.24.37 both failed with "permission denied": the certificate volume was owned by
 root and the backend runs as a normal user. The nginx container now hands the volume to the
 backend user (uid 100, gid 101) at every start, which also fixes existing installs.
+
+### Let's Encrypt (ACME)
+
+With a public DNS name, the manager can get and renew its own certificate from Let's Encrypt
+(#420, contributed by eskyuu). Point the name at the host, make sure port 80 is reachable from the
+internet, keep `TLS_MODE=https`, and enter the name under **Settings → Certificate → Automatic HTTPS
+Certificate (ACME)**. The email is optional, but without one you get no expiry notices.
+
+- It starts within a few seconds of saving, with no restart. The certificate replaces the one
+  in use, including an uploaded one, and nginx reloads.
+- Renewal is checked every 12 hours. A failed request is retried after an hour, and the
+  certificate in use stays until a new one arrives.
+- **Last Certbot attempt** on the same card shows the result and Certbot's output, which is the
+  place to look when it fails. `docker compose logs nginx` has it too.
+- To turn it off, press **Use .env Values** with no `ACME_DOMAIN` in `.env`. The certificate it
+  got stays in place.
+- It can't work with `TLS_MODE=proxy`; there, use your proxy's own certificates.
+
+The same settings can come from `.env`: `ACME_DOMAIN`, `ACME_EMAIL` and `ACME_SERVER` (blank means
+Let's Encrypt). Settings saved in the page win over `.env`, and **Use .env Values** drops them.
+When all three are set in `.env`, they win and the page is read-only.
+
+**Staging or a private ACME server.** Set its directory URL. If its own HTTPS certificate comes
+from a private CA, paste that CA under **ACME Server CA Bundle**. The bundle replaces Certbot's
+usual trust store, so include every CA the server needs; removing it goes back to the usual one.
+Certificate checks stay on either way.
 
 ## Behind a reverse proxy
 
@@ -317,6 +365,13 @@ updates and the device terminal run over `/socket.io/`.
 Give the proxy a read timeout of at least 300 seconds (the same as the manager's own). Many
 proxies default to 60, and a protected change on a slow device can take longer: on a CRS112 a
 bridge move took about a minute and a half end to end.
+
+Some proxies can't wait that long. Cloudflare gives up after 100 seconds and shows its own 502
+page. Switching a device to API-SSL or WebFig to HTTPS can take several minutes while an older
+router signs a certificate, so from 1.0.14 these switches carry on in the background when they
+take longer than about 25 seconds, and the page fetches the outcome when it's ready. Other long
+requests, such as a protected change on a slow device or a large backup, still need the proxy
+to wait; behind Cloudflare, make those from an address that reaches the manager directly.
 
 **Keep the plain HTTP port for the proxy only.** Anyone else who can reach it talks to the
 manager unencrypted. If the proxy runs on the same host, `BIND_ADDRESS=127.0.0.1` keeps both
@@ -428,6 +483,27 @@ redirects. So when updating:
   then pull and start as above.
 
 To check that a setting arrived, ask the container: `docker compose exec nginx printenv TLS_MODE`.
+
+### The databases during an update
+
+An update that changes the Postgres, Redis or InfluxDB image restarts that container, and the
+release notes say so when it does. Each gets 60 seconds to shut down cleanly before Docker stops
+it (Docker's own default is 10), so an update never cuts one off mid-write.
+
+Redis holds only the manager's job queue, which refills itself. If its append-only file is
+damaged (for example, the disk lost a write in a power cut or a hard reset), Redis refuses to
+start, and the rest of the stack waits for it. So before Redis starts, the file is checked, and
+if it's damaged it's repaired with Redis's own `redis-check-aof --fix`, which cuts it at the last
+good record. At most, jobs queued after that point are lost, and they're queued again. Redis's
+log says when this happens:
+
+```
+[mtm] Redis's append-only file was damaged. It was repaired by cutting it at the last good record; ...
+```
+
+A copy of the damaged files is kept in the Redis volume as `appendonlydir.damaged-<time>`, the
+newest two. Once all is well you can remove them:
+`docker compose exec redis sh -c 'rm -rf /data/appendonlydir.damaged-*'`.
 
 ### Release channels
 

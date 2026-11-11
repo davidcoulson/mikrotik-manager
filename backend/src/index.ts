@@ -38,6 +38,7 @@ import { convertConfigTemplates } from './services/convertConfigTemplates';
 import { netflowCollector } from './services/netflow/NetflowCollector';
 import { verifyToken, highestRole, type AuthPayload } from './middleware/auth';
 import { roleOnDevice } from './utils/siteAccess';
+import { attachTorch, TORCH_ROLES } from './services/torch';
 import { validateSession } from './utils/sessionState';
 import { verifyDeviceIdentity } from './services/identityPins';
 import { RouterOSClient } from './services/mikrotik/RouterOSClient';
@@ -56,6 +57,7 @@ import maintenanceWindowsRoutes from './routes/maintenanceWindows';
 import devicesRoutes, { setPollerService as setDevicesPoller } from './routes/devices';
 import clientsRoutes, { setPollerService as setClientsPoller } from './routes/clients';
 import eventsRoutes from './routes/events';
+import sessionsRoutes from './routes/sessions';
 import proxyRoutes from './routes/proxy';
 import backupsRoutes from './routes/backups';
 import guestWifiRoutes from './routes/guestWifi';
@@ -64,6 +66,7 @@ import firmwareMirrorRoutes from './routes/firmwareMirror';
 import { startMirrorScheduler } from './services/firmwareMirror';
 import automationRoutes from './routes/automation';
 import { reportService } from './services/ReportService';
+import { commandScheduler } from './services/CommandScheduler';
 import { firmwareOrchestrator } from './services/FirmwareOrchestrator';
 import { commandRunner } from './services/CommandRunner';
 import operationsRoutes from './routes/operations';
@@ -215,12 +218,21 @@ io.on('connection', (socket) => {
   });
 });
 
+// ─── Torch namespace (#416) ────────────────────────────────────────────────────
+const torchNs = attachTorch(io, {
+  socketSession,
+  roleOnDevice,
+  clientIp: (socket) => clientIpBehindProxy(socket.handshake.headers['x-forwarded-for'], socket.handshake.address),
+});
+
 // ─── SSH Terminal namespace ────────────────────────────────────────────────────
 const terminalNs = io.of('/terminal');
 
 // Roles allowed to open an interactive device shell. The stored SSH account is
-// the router admin, so console access mirrors requireWrite: viewers are rejected.
-const TERMINAL_ROLES = new Set(['admin', 'operator']);
+// the router's admin and a shell bypasses Change Guard, previews and the audit
+// of each change, so only admins get one (#411); operators keep the guarded
+// edits and bulk commands.
+const TERMINAL_ROLES = new Set(['admin']);
 
 // Per-user rate limit on shell starts (in-memory; sliding window).
 const TERMINAL_START_LIMIT = 5;
@@ -281,6 +293,7 @@ setInterval(() => {
   };
   for (const s of io.sockets.sockets.values()) void check(s);
   for (const s of terminalNs.sockets.values()) void check(s, TERMINAL_ROLES);
+  for (const s of torchNs.sockets.values()) void check(s, TORCH_ROLES);
 }, SOCKET_RECHECK_MS).unref();
 
 terminalNs.on('connection', (socket) => {
@@ -468,6 +481,7 @@ app.use('/api/devices', devicesRoutes);
 app.use('/api/adoption', adoptionRoutes);
 app.use('/api/clients', clientsRoutes);
 app.use('/api/events', eventsRoutes);
+app.use('/api/sessions', sessionsRoutes);
 app.use('/api/proxy', proxyRoutes);
 app.use('/api/backups', backupsRoutes);
 app.use('/api/operations', operationsRoutes);
@@ -654,6 +668,8 @@ async function start(): Promise<void> {
 
   // Scheduled report mailer (hourly check)
   reportService.startScheduler();
+  // Scheduled bulk commands (#359), after interrupted runs are reconciled above.
+  commandScheduler.start();
 
   // Start HTTP server. No host given, Node listens on :: (IPv4 and IPv6) where
   // the kernel has IPv6 and falls back to 0.0.0.0 where it doesn't (#231).

@@ -7,6 +7,8 @@ export interface Site {
   address: string | null;
   location_lat: number | null;
   location_lng: number | null;
+  /** The zoom its map opens at, 1 (world) to 19 (building); null fits the map (#362). */
+  map_zoom?: number | null;
   notes: string | null;
   is_default: boolean;
   device_count: number;
@@ -76,3 +78,13 @@ export const useSiteStore = create<SiteState>()(
     }
   )
 );
+
+/**
+ * When the user last picked a site or group in the selector (#414). Switching
+ * remounts every page (main.tsx), so a page can't compare the scope it was
+ * opened under; a device page checks this instead and, right after a switch,
+ * leaves a device the new scope doesn't include.
+ */
+export const scopeSwitch = { at: 0 };
+/** How long after a switch a remounted page treats itself as switched. */
+export const SCOPE_SWITCH_WINDOW_MS = 5_000;

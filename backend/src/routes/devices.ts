@@ -11,7 +11,9 @@ import { validateOverrides } from '../utils/pollOverrides';
 import { devicePins, pendingIdentityChanges, trustNewIdentity, IDENTITY_KINDS } from '../services/identityPins';
 import { enableApiSsl, type ApiSslDevice } from '../services/apiSsl';
 import { enableWwwSsl } from '../services/wwwSsl';
-import { deviceWriteLock, deviceIdFromPath } from '../services/changeGuard/deviceLock';
+import { deviceWriteLock, deviceIdFromPath, detachHeldLock } from '../services/changeGuard/deviceLock';
+import { answerWithTask, answerTaskStatus } from '../services/deviceTasks';
+import { permissionProblem } from '../utils/devicePermission';
 import { randomUUID } from 'crypto';
 import { Client as SshClient } from 'ssh2';
 import { query, queryOne } from '../config/database';
@@ -34,6 +36,13 @@ import { readApiConnections } from '../services/changeGuard/targetedReads';
 import { planPreset, topAnchor, bfDefaults, QUICK_PRESETS, type QuickOptions, type QuickPreset, type IfaceRef } from '../utils/firewallPresets';
 import { managerAddressFromActive } from '../utils/logNoise';
 import { messagesFrom, SMS_ID } from '../utils/lteSms';
+import { readRules, analyseRules, routesByTable, parseRuleInput } from '../utils/routingRules';
+import { tagOf, withTag, tagsIn, tagParams, planTags } from '../utils/ruleTags';
+import {
+  parseZoneInput, compileZones, planApply, planMembers, zoneEligibility, zoneDrift, unzoned, pairKey, zoneHosts, planHostLists, interfaceZones,
+  ROUTER, BUILTIN_LISTS, FORWARD_SERVICES, ROUTER_SERVICES, type ZoneConfig, type CompiledRule,
+} from '../utils/zoneFirewall';
+import { previewContext } from '../utils/previewContext';
 import { analyzeChange, type PlannedChange } from '../services/changeGuard/analyzeChange';
 import { runConfigHealth } from '../services/changeGuard/configHealth';
 import { fixFor, noFixReason } from '../utils/configHealthFixes';
@@ -83,7 +92,7 @@ import { ipv6RoutesView } from '../utils/ipv6Routes';
 import { switchVlanEntry, switchPortVlan, validPortName } from '../utils/switchVlanEdit';
 import { ipAddressEdit } from '../utils/ipAddressEdit';
 import { parseBgpConnection } from '../utils/bgpConnection';
-import { parseBridgeCreate, parseBridgeUpdate } from '../utils/bridgeEdit';
+import { parseBridgeCreate, parseBridgeUpdate, bridgeMtuProblem } from '../utils/bridgeEdit';
 import { bridgesView } from '../utils/bridgesView';
 import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
 
@@ -108,13 +117,16 @@ router.use(deviceWriteLock(deviceIdFromPath));
 // (#302): its security checks, services and the rest. Dropped after any
 // successful write, so the Security page doesn't show a fixed finding for the
 // rest of the cache's 15 minutes.
+const dropLiveCache = (id: number): void => {
+  void query(`DELETE FROM device_live_cache WHERE device_id = $1`, [id]).catch(() => {});
+};
 router.use((req, res, next) => {
   if (req.method === 'GET') { next(); return; }
   const m = /^\/(\d+)(?:\/|$)/.exec(req.path);
   const id = m ? Number(m[1]) : null;
   if (id != null) {
     res.on('finish', () => {
-      if (res.statusCode < 400) void query(`DELETE FROM device_live_cache WHERE device_id = $1`, [id]).catch(() => {});
+      if (res.statusCode < 400) dropLiveCache(id);
     });
   }
   next();
@@ -507,7 +519,7 @@ router.get('/bulk-add/jobs/:jobId', requireWrite, async (req, res) => {
 router.get('/:id', async (req, res) => {
   const device = await queryOne(
     `SELECT ${DEVICE_BASE_COLUMNS},
-            ssh_port, ssh_username, latest_ros_version,
+            ssh_port, ssh_username, latest_ros_version, reported_update_channel,
             firmware_update_available, routerboard_upgrade_available, upgrade_firmware_version,
             location_address,
             location_lat::float8 AS location_lat,
@@ -971,6 +983,19 @@ router.get('/:id/optics/:port/history', async (req, res) => {
 router.put('/:id/interfaces/:name', requireWrite, async (req, res) => {
   const name = req.params.name;
   const { disabled, comment, mtu, poe_out, fec_mode, tx_flow_control, rx_flow_control, auto_negotiation, speed } = req.body;
+  // An MTU the port can't take used to be dropped without a word (outside
+  // 576–9216), or clamped by RouterOS to the hardware's max-l2mtu (2028 on a
+  // CRS510's management port) while the save reported success.
+  if (mtu !== undefined) {
+    const row = await queryOne<{ config_json: Record<string, string> | null }>(
+      `SELECT config_json FROM interfaces WHERE device_id = $1 AND name = $2`, [req.params.id, name]);
+    const max = Number(row?.config_json?.['max-l2mtu']) || 65535;
+    if (!Number.isInteger(mtu) || mtu < 576 || mtu > max) {
+      return res.status(400).json({ error: max < 65535
+        ? `MTU on ${name}: 576 to ${max}. ${max} is the most its hardware takes.`
+        : `MTU on ${name}: a whole number from 576 to 65535.` });
+    }
+  }
 
   const changes: PlannedChange[] = [];
   if (typeof disabled === 'boolean') changes.push({ kind: 'interface.disable', name, disabled });
@@ -988,7 +1013,7 @@ router.put('/:id/interfaces/:name', requireWrite, async (req, res) => {
     if (comment !== undefined) {
       await collector.setInterfaceComment(req.params.name, comment);
     }
-    if (typeof mtu === 'number' && mtu >= 576 && mtu <= 9216) {
+    if (typeof mtu === 'number') {
       await collector.setInterfaceMtu(req.params.name, mtu);
     }
     if (poe_out && ['auto-on', 'forced-on', 'off'].includes(poe_out)) {
@@ -1031,7 +1056,7 @@ router.put('/:id/interfaces/:name', requireWrite, async (req, res) => {
 // Guarded: changing a port's PVID or its tagged/untagged membership is one of the
 // most common ways to strand the management VLAN on a switch.
 router.put('/:id/ports/:name/vlan', requireWrite, async (req, res) => {
-  const { pvid, tagged_vlans = [], untagged_vlans = [], mode, replace_tagged } = req.body;
+  const { pvid, tagged_vlans = [], untagged_vlans = [], mode, replace_tagged, tagged_only } = req.body;
   if (pvid !== undefined && (typeof pvid !== 'number' || pvid < 1 || pvid > 4094)) {
     return res.status(400).json({ error: 'pvid must be 1-4094' });
   }
@@ -1043,6 +1068,9 @@ router.put('/:id/ports/:name/vlan', requireWrite, async (req, res) => {
   // VLANs left out are removed. Only meaningful for a trunk (#165). An access
   // port always leaves every VLAN but its PVID's.
   const replaceTagged = role === 'trunk' && replace_tagged === true;
+  // A trunk admits untagged frames into its native VLAN (the PVID) unless this
+  // says otherwise. Before 1.0.11 every trunk was tagged-only.
+  const taggedOnly = role === 'trunk' && tagged_only === true;
 
   await withGuardedChange(
     req.params.id,
@@ -1050,7 +1078,7 @@ router.put('/:id/ports/:name/vlan', requireWrite, async (req, res) => {
     res,
     {
       kind: 'port.vlan',
-      summary: `VLAN config on port ${req.params.name} (pvid ${pvid ?? 1}${role ? `, ${role}` : ''})`,
+      summary: `VLAN config on port ${req.params.name} (pvid ${pvid ?? 1}${role ? `, ${role}${taggedOnly ? ', tagged only' : ''}` : ''})`,
       change: {
         kind: 'port.vlan',
         port: req.params.name,
@@ -1061,6 +1089,7 @@ router.put('/:id/ports/:name/vlan', requireWrite, async (req, res) => {
         // a far bigger change than a PVID edit, and the summary should say so.
         mode: role,
         replaceTagged,
+        taggedOnly,
       },
     },
     async (c) => {
@@ -1070,7 +1099,8 @@ router.put('/:id/ports/:name/vlan', requireWrite, async (req, res) => {
         tagged_vlans as number[],
         untagged_vlans as number[],
         role,
-        replaceTagged
+        replaceTagged,
+        taggedOnly
       );
       return {
         message: notRemoved.length
@@ -1293,10 +1323,282 @@ function bodyToRosParams(body: Record<string, unknown>, keepEmpty = false): Reco
 // disabled=no, a move or a delete used to skip the check (outside review P2-8).
 // `force` is the older name for confirm_lockout and is still accepted.
 
+/**
+ * Rule tags (#369): a filter or NAT rule that logs gets a tag in its log
+ * prefix, unique across the device's filter and NAT rules, so its log lines
+ * lead back to it. An edited rule keeps the tag it had.
+ */
+async function withRuleTag(c: DeviceCollector, params: Record<string, string>, family: FirewallFamily,
+  edit?: { table: 'filter' | 'nat'; id: string }): Promise<Record<string, string>> {
+  if (!(params.log === 'yes' || params.log === 'true') || tagOf(params['log-prefix'])) return params;
+  const [filter, nat] = await Promise.all([
+    c.getFirewallRules(family).catch(() => [] as Record<string, string>[]),
+    c.getNatRules(family).catch(() => [] as Record<string, string>[]),
+  ]);
+  const current = edit ? (edit.table === 'filter' ? filter : nat).find((r) => r['.id'] === edit.id) : undefined;
+  const had = tagOf(current?.['log-prefix']);
+  // Only log-prefix sent leaves the device's prefix as it is: tag that.
+  const prefix = 'log-prefix' in params ? params['log-prefix'] : current?.['log-prefix'];
+  if (had) return { ...params, 'log-prefix': withTag(prefix, had) };
+  return tagParams({ ...params, 'log-prefix': prefix ?? '' }, tagsIn(filter, nat));
+}
+
+// ─── Zone-based firewall (#369 phase 2) ──────────────────────────────────────
+// A zone is an interface list; the matrix (deny, allow, or some services from
+// each zone to each other zone and to the router) is kept here and compiled
+// into the whole IPv4 filter table. See utils/zoneFirewall.ts.
+
+interface ZoneRow { config: ZoneConfig; desired: CompiledRule[]; enabled: boolean; applied_at: string | null; applied_by: string | null }
+const zoneRow = (id: string) => queryOne<ZoneRow>(
+  `SELECT config, desired, enabled, applied_at, applied_by FROM firewall_zone_configs WHERE device_id = $1`, [id]);
+const isYes = (v: string | undefined) => v === 'true' || v === 'yes';
+
+/** Refuse a hand edit to the IPv4 filter table while zones manage it. */
+async function zoneManaged(req: Request, res: Response, family: FirewallFamily): Promise<boolean> {
+  if (family !== 'ip') return false;
+  const row = await zoneRow(String(req.params.id));
+  if (!row?.enabled) return false;
+  res.status(409).json({
+    error: 'Zones manage this firewall, so its rules change from the Zones card. Turn zones off to edit rules by hand.',
+    zone_managed: true,
+  });
+  return true;
+}
+
+type ZoneLiveContext = Awaited<ReturnType<DeviceCollector['getZoneContext']>>;
+const zoneLists = (live: ZoneLiveContext) => live.lists
+  .filter((l) => l.name && !isYes(l.builtin) && !BUILTIN_LISTS.includes(l.name))
+  .map((l) => l.name);
+
+/** Errors, warnings and the compiled rules for a zone request, against what the device has now. */
+function zonePlan(body: unknown, live: ZoneLiveContext, managerIp: string | null, enabled: boolean) {
+  const { input, errors } = parseZoneInput(body, { lists: zoneLists(live), interfaces: live.interfaces.map((i) => i.name).filter(Boolean) });
+  const elig = zoneEligibility(live.filter);
+  if (!enabled && !elig.ok) {
+    errors.eligibility = `This device has ${elig.foreign} filter rule${elig.foreign === 1 ? '' : 's'} that ${elig.foreign === 1 ? "isn't" : "aren't"} MikroTik's defaults. `
+      + 'Zones replace the whole filter table, so they can only start from an empty table or the defaults.';
+  }
+  if (!input || errors.eligibility) return { input: null, errors, warnings: [] as string[] };
+  const warnings: string[] = [];
+  const loose = unzoned(live.addresses, input.members);
+  if (loose.length) {
+    warnings.push(`${loose.join(', ')} ${loose.length === 1 ? 'has an address but is' : 'have addresses but are'} in no zone, so nothing reaches the router or another zone through ${loose.length === 1 ? 'it' : 'them'}.`);
+  }
+  const ports = new Set(live.interfaces.filter((i) => isYes(i.slave)).map((i) => i.name));
+  for (const z of input.config.zones) {
+    const inZone = (input.members[z] ?? []).filter((i) => ports.has(i));
+    if (inZone.length) {
+      const many = inZone.length > 1;
+      warnings.push(`${z} has bridge ports (${inZone.slice(0, 3).join(', ')}${inZone.length > 3 ? ', …' : ''}), so its rules won't match `
+        + `traffic through ${many ? 'them' : 'it'}: traffic between bridge ports is switched past the firewall, and routed traffic shows up on the bridge. `
+        + `Put the bridge or a VLAN interface in ${z} instead, or take ${many ? 'the ports' : 'the port'} out of the bridge to route ${many ? 'them' : 'it'} on ${many ? 'their' : 'its'} own.`);
+    }
+  }
+  const empty = input.config.zones.filter((z) => !(input.members[z] ?? []).length && !live.members.some((m) => m.list === z && isYes(m.dynamic)));
+  if (empty.length) warnings.push(`${empty.join(', ')} ${empty.length === 1 ? 'has' : 'have'} no interfaces yet.`);
+  if (!managerIp) warnings.push("MTM couldn't see its own address on this device, so there's no rule that always lets it in. Change Guard still checks the change before it sticks.");
+  const hosts = zoneHosts(input.config);
+  if (hosts.length) {
+    warnings.push(`The router looks up ${hosts.join(', ')} with its own DNS (IP > DNS) and keeps ${hosts.length === 1 ? 'an address list' : 'address lists'} `
+      + `of what ${hosts.length === 1 ? 'it resolves' : 'they resolve'} to. If it can't resolve a name, rules using it match nothing.`);
+  }
+  if (!input.config.zones.some((z) => input.config.policies[pairKey(z, ROUTER)])) {
+    warnings.push('No zone can reach the router. Only the manager and replies to the router\'s own connections get in.');
+  }
+  const desired = compileZones(input.config, { services: live.services, rosMajor: live.rosMajor, fasttrackHwOffload: live.fasttrackHwOffload, managerIp });
+  return { input, errors, warnings, desired };
+}
+
+// GET /api/devices/:id/firewall/zones — the zone setup, what the device has
+// to build it from, and whether the device still matches the last apply.
+router.get('/:id/firewall/zones', async (req, res) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const row = await zoneRow(req.params.id);
+  const c = new DeviceCollector(deviceRow);
+  try {
+    await c.connect();
+    const live = await c.getZoneContext();
+    const managerIp = await managerAddressOf(c, deviceRow);
+    const elig = zoneEligibility(live.filter);
+    // Firewall Logs' zone columns (#415) follow what the device has now.
+    if (row?.enabled && row.config?.zones) {
+      await query(`UPDATE firewall_zone_configs SET interface_zones = $2 WHERE device_id = $1`,
+        [req.params.id, JSON.stringify(interfaceZones(row.config.zones, live.members))]);
+    }
+    return res.json({
+      enabled: !!row?.enabled,
+      config: row?.config ?? null,
+      applied_at: row?.applied_at ?? null,
+      applied_by: row?.applied_by ?? null,
+      eligible: elig.ok,
+      foreign_rules: elig.foreign,
+      lists: zoneLists(live).map((name) => ({
+        name,
+        members: live.members.filter((m) => m.list === name).map((m) => ({ interface: m.interface, dynamic: isYes(m.dynamic) })),
+      })),
+      interfaces: live.interfaces.filter((i) => i.name).map((i) => ({
+        name: i.name, type: i.type ?? '', running: isYes(i.running), disabled: isYes(i.disabled), bridge_port: isYes(i.slave),
+        addresses: live.addresses.filter((a) => (a['actual-interface'] || a.interface) === i.name && !isYes(a.disabled)).map((a) => a.address),
+      })),
+      manager_ip: managerIp,
+      drift: row?.enabled ? zoneDrift(live.filter, row.desired) : null,
+      services: { forward: Object.entries(FORWARD_SERVICES).map(([key, s]) => ({ key, label: s.label })), router: Object.entries(ROUTER_SERVICES).map(([key, s]) => ({ key, label: s.label })) },
+    });
+  } finally {
+    c.disconnect();
+  }
+});
+
+// POST /api/devices/:id/firewall/zones/plan { config, members } — what an
+// apply would do: errors, warnings, the rules and the counts. Changes nothing.
+router.post('/:id/firewall/zones/plan', requireWrite, async (req, res) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const row = await zoneRow(req.params.id);
+  const c = new DeviceCollector(deviceRow);
+  try {
+    await c.connect();
+    const live = await c.getZoneContext();
+    const managerIp = await managerAddressOf(c, deviceRow);
+    const p = zonePlan(req.body, live, managerIp, !!row?.enabled);
+    if (!p.input || !p.desired) return res.json({ errors: p.errors, warnings: p.warnings, rules: [], changes: null });
+    const rules = planApply(live.filter, p.desired);
+    const members = planMembers(zoneLists(live), live.members, p.input.members);
+    const hostLists = planHostLists(live.hostEntries, zoneHosts(p.input.config));
+    return res.json({
+      errors: p.errors, warnings: p.warnings,
+      rules: p.desired.map((r) => ({ ...r.params, hidden: r.hidden, description: r.description })),
+      changes: {
+        add: rules.add.length, remove: rules.remove.length, keep: rules.keep,
+        host_lists_added: hostLists.add.map((e) => e.list), host_lists_removed: hostLists.remove.map((e) => e.list),
+        lists: members.createLists, members_added: members.addMembers, members_removed: members.removeMembers.map(({ list, interface: i }) => ({ list, interface: i })),
+      },
+    });
+  } finally {
+    c.disconnect();
+  }
+});
+
+// PUT /api/devices/:id/firewall/zones { config, members, confirm_lockout? }
+// Applies the zones in one guarded change: lists and members, then the filter
+// table made to match (rules already right stay, with their counters).
+router.put('/:id/firewall/zones', requireWrite, async (req, res) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const row = await zoneRow(req.params.id);
+  const reader = new DeviceCollector(deviceRow);
+  let live: ZoneLiveContext;
+  let managerIp: string | null;
+  try {
+    await reader.connect();
+    live = await reader.getZoneContext();
+    managerIp = await managerAddressOf(reader, deviceRow);
+  } finally {
+    reader.disconnect();
+  }
+  const p = zonePlan(req.body, live, managerIp, !!row?.enabled);
+  if (!p.input || !p.desired) return res.status(400).json({ error: Object.values(p.errors)[0], errors: p.errors });
+  const { config } = p.input;
+  const desired = p.desired;
+  const rules = planApply(live.filter, desired);
+  const members = planMembers(zoneLists(live), live.members, p.input.members);
+  // Hostnames in rules (#369): their address lists go in before the rules
+  // that match them, and lists no rule uses any more go after.
+  const hostLists = planHostLists(live.hostEntries, zoneHosts(config));
+  const changes: PlannedChange[] = [
+    ...members.createLists.map((name): PlannedChange => ({ kind: 'interface-list.add', name })),
+    ...members.addMembers.map((m): PlannedChange => ({ kind: 'interface-list.member.add', list: m.list, interface: m.interface })),
+    ...hostLists.add.map((fields): PlannedChange => ({ kind: 'address-list.add', fields })),
+    ...rules.add.map((a): PlannedChange => ({ kind: 'firewall.add', fields: a.params, ...(a.placeBefore ? { placeBefore: a.placeBefore } : {}) })),
+    ...rules.remove.map((r): PlannedChange => ({ kind: 'firewall.remove', ruleId: r.id })),
+    ...members.removeMembers.map((m): PlannedChange => ({ kind: 'interface-list.member.remove', memberId: m.id })),
+    ...hostLists.remove.map((e): PlannedChange => ({ kind: 'address-list.remove', entryId: e.id })),
+  ];
+  const n = (k: number, w: string) => `${k} ${w}${k === 1 ? '' : 's'}`;
+  const summary = `Zones: ${n(config.zones.length, 'zone')}; ${n(rules.add.length, 'rule')} added, ${rules.remove.length} removed`;
+  await withGuardedChange(req.params.id, req, res, { kind: 'firewall.zones', summary, change: { kind: 'batch', changes } }, async (c) => {
+    let wrote = false;
+    try {
+      for (const name of members.createLists) { await c.addInterfaceList(name); wrote = true; }
+      for (const m of members.addMembers) { await c.addInterfaceListMember(m.list, m.interface); wrote = true; }
+      for (const e of hostLists.add) { await c.addAddressListEntry(e); wrote = true; }
+      // New rules go in disabled, then are turned on with the drops last, so
+      // no step in between drops more than before: a final drop added ahead
+      // of the accepts in its zone's chain cut the manager's new connections.
+      const preview = !!previewContext();
+      for (const a of rules.add) {
+        const params = { ...a.params, ...(preview ? {} : { disabled: 'yes' }), ...(a.placeBefore ? { 'place-before': a.placeBefore } : {}) };
+        await c.addFirewallRule(params);
+        wrote = true;
+      }
+      if (!preview && rules.add.length) {
+        const before = new Set(live.filter.map((r) => r['.id']));
+        const added = (await c.getFirewallRules()).filter((r) => !before.has(r['.id']) && isYes(r.disabled) && !isYes(r.dynamic));
+        const drop = (r: Record<string, string>) => ['drop', 'reject', 'tarpit'].includes(r.action);
+        for (const r of [...added.filter((r) => !drop(r)), ...added.filter(drop)]) await c.updateFirewallRule(r['.id'], { disabled: 'no' });
+      }
+      for (const r of rules.remove) { await c.deleteFirewallRule(r.id); wrote = true; }
+      for (const m of members.removeMembers) { await c.removeInterfaceListMember(m.id); wrote = true; }
+      for (const e of hostLists.remove) { await c.removeAddressListEntry(e.id); wrote = true; }
+    } catch (err) {
+      throw stepFailure(err, wrote);
+    }
+    if (!previewContext()) {
+      await query(
+        `INSERT INTO firewall_zone_configs (device_id, config, desired, enabled, applied_at, applied_by, updated_at, interface_zones)
+         VALUES ($1, $2, $3, TRUE, NOW(), $4, NOW(), $5)
+         ON CONFLICT (device_id) DO UPDATE SET config = $2, desired = $3, enabled = TRUE, applied_at = NOW(), applied_by = $4, updated_at = NOW(),
+           interface_zones = $5`,
+        [req.params.id, JSON.stringify(config), JSON.stringify(desired), req.user?.username ?? null,
+          // The members as this apply leaves them: its static ones, plus the dynamic ones it doesn't touch.
+          JSON.stringify(interfaceZones(config.zones, [
+            ...live.members.filter((m) => isYes(m.dynamic)),
+            ...Object.entries(p.input.members).flatMap(([list, ifaces]) => ifaces.map((i) => ({ list, interface: i }))),
+          ]))]);
+    }
+    const nothing = !rules.add.length && !rules.remove.length && !changes.length;
+    return {
+      message: nothing ? 'The firewall already matches the zones.' : `Applied: ${n(rules.add.length, 'rule')} added, ${rules.remove.length} removed, ${rules.keep} kept.`,
+      added: rules.add.length, removed: rules.remove.length, kept: rules.keep,
+    };
+  });
+});
+
+// DELETE /api/devices/:id/firewall/zones — stop managing the firewall with
+// zones. The rules stay on the device as ordinary rules; nothing is written.
+router.delete('/:id/firewall/zones', requireWrite, async (req, res) => {
+  const r = await query(`UPDATE firewall_zone_configs SET enabled = FALSE, updated_at = NOW() WHERE device_id = $1 AND enabled RETURNING device_id`, [req.params.id]);
+  if (!r.length) return res.status(404).json({ error: 'Zones are not on for this device.' });
+  return res.json({ message: 'Zones are off. The rules stay on the device and can be edited by hand.' });
+});
+
+// POST /api/devices/:id/firewall/tag-logging[?family=ipv6] — tag every logging
+// rule that has no tag yet, filter and NAT (#369). Only log prefixes change.
+router.post('/:id/firewall/tag-logging', requireWrite, async (req, res) => {
+  const family = familyOf(req, res);
+  if (!family) return;
+  if (await zoneManaged(req, res, family)) return;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'firewall.tag-logging', summary: `Tag the ${family === 'ipv6' ? 'IPv6 ' : ''}firewall rules that log` },
+    async (c) => {
+      const [filter, nat] = await Promise.all([c.getFirewallRules(family), c.getNatRules(family).catch(() => [] as Record<string, string>[])]);
+      const taken = tagsIn(filter, nat);
+      const forFilter = planTags(filter, taken);
+      for (const t of forFilter) taken.add(tagOf(t.to)!);
+      const forNat = planTags(nat, taken);
+      for (const t of forFilter) await c.updateFirewallRule(t.id, { 'log-prefix': t.to }, family);
+      for (const t of forNat) await c.updateNatRule(t.id, { 'log-prefix': t.to }, family);
+      const n = forFilter.length + forNat.length;
+      return { tagged: n, message: n ? `Tagged ${n} rule${n === 1 ? '' : 's'}` : 'Every rule that logs already has a tag' };
+    });
+});
+
 // POST /api/devices/:id/firewall[?family=ipv6]
 router.post('/:id/firewall', requireWrite, async (req, res) => {
   const family = familyOf(req, res);
   if (!family) return;
+  if (await zoneManaged(req, res, family)) return;
   const { chain, action } = req.body;
   if (!chain || !action) return res.status(400).json({ error: 'chain and action are required' });
   const params = bodyToRosParams(req.body);
@@ -1304,13 +1606,14 @@ router.post('/:id/firewall', requireWrite, async (req, res) => {
     ? await ipv6WriteMeta(req.params.id, 'firewall.add', `Add ${chain} ${action} IPv6 firewall rule`)
     : { kind: 'firewall.add', summary: `Add ${chain} ${action} firewall rule`, change: { kind: 'firewall.add', fields: params } as PlannedChange };
   await withGuardedChange(req.params.id, req, res, meta,
-    async (c) => { await c.addFirewallRule(params, family); return { message: 'Rule added' }; });
+    async (c) => { await c.addFirewallRule(await withRuleTag(c, params, family), family); return { message: 'Rule added' }; });
 });
 
 // PUT /api/devices/:id/firewall/:ruleId[?family=ipv6]
 router.put('/:id/firewall/:ruleId', requireWrite, async (req, res) => {
   const family = familyOf(req, res);
   if (!family) return;
+  if (await zoneManaged(req, res, family)) return;
   const params = bodyToRosParams(req.body, true);
   const ruleId = req.params.ruleId;
   const summary = (Object.keys(params).length === 1 && 'disabled' in params
@@ -1320,13 +1623,14 @@ router.put('/:id/firewall/:ruleId', requireWrite, async (req, res) => {
     ? await ipv6WriteMeta(req.params.id, 'firewall.set', summary)
     : { kind: 'firewall.set', summary, change: { kind: 'firewall.set', ruleId, fields: params } as PlannedChange };
   await withGuardedChange(req.params.id, req, res, meta,
-    async (c) => { await c.updateFirewallRule(ruleId, params, family); return { message: 'Rule updated' }; });
+    async (c) => { await c.updateFirewallRule(ruleId, await withRuleTag(c, params, family, { table: 'filter', id: ruleId }), family); return { message: 'Rule updated' }; });
 });
 
 // POST /api/devices/:id/firewall/move[?family=ipv6]  { id, destination? }
 router.post('/:id/firewall/move', requireWrite, async (req, res) => {
   const family = familyOf(req, res);
   if (!family) return;
+  if (await zoneManaged(req, res, family)) return;
   const { id, destination } = req.body;
   if (!id) return res.status(400).json({ error: 'id is required' });
   const ruleId = String(id);
@@ -1364,21 +1668,22 @@ function quickOptions(src: Record<string, unknown>): { preset: QuickPreset | nul
   };
 }
 
+/** The manager's own address as the device sees it, or null. */
+async function managerAddressOf(collector: DeviceCollector, device: DeviceRow): Promise<string | null> {
+  const deviceIp = collector.apiRemoteAddress() || device.ip_address;
+  const conns = await readApiConnections(collector.batchReader(), deviceIp, device.api_port).catch(() => []);
+  const managerIp = managerIpFromConntrack({ mgmtConnections: conns, managerLocalPort: collector.apiLocalPort() ?? null } as unknown as DeviceSnapshot, device.api_port);
+  if (managerIp) return managerIp;
+  // Conntrack is off on most switches: the manager's API session in
+  // /user/active says the same, when it's the only address for that login.
+  const active = await collector.commandRunner().execute('/user/active/print', { '.proplist': 'name,address,via' }).catch(() => null);
+  return active ? managerAddressFromActive(active, device.api_username) : null;
+}
+
 /** Read what a preset plans against, including the manager's own address as the device sees it. */
 async function quickPlanFor(collector: DeviceCollector, device: DeviceRow, family: FirewallFamily, preset: QuickPreset, options: QuickOptions) {
   const live = await collector.getQuickRuleContext(family);
-  let managerIp: string | null = null;
-  if (preset === 'management-access' || preset === 'brute-force') {
-    const deviceIp = collector.apiRemoteAddress() || device.ip_address;
-    const conns = await readApiConnections(collector.batchReader(), deviceIp, device.api_port).catch(() => []);
-    managerIp = managerIpFromConntrack({ mgmtConnections: conns, managerLocalPort: collector.apiLocalPort() ?? null } as unknown as DeviceSnapshot, device.api_port);
-    // Conntrack is off on most switches: the manager's API session in
-    // /user/active says the same, when it's the only address for that login.
-    if (!managerIp) {
-      const active = await collector.commandRunner().execute('/user/active/print', { '.proplist': 'name,address,via' }).catch(() => null);
-      managerIp = active ? managerAddressFromActive(active, device.api_username) : null;
-    }
-  }
+  const managerIp = preset === 'management-access' || preset === 'brute-force' ? await managerAddressOf(collector, device) : null;
   const plan = planPreset(preset, options, { family, ...live, managerIp });
   return { live, managerIp, plan };
 }
@@ -1421,6 +1726,8 @@ router.post('/:id/firewall/quick', requireWrite, async (req, res) => {
   if (!family) return;
   const { preset, options } = quickOptions((req.body ?? {}) as Record<string, unknown>);
   if (!preset) return res.status(400).json({ error: 'Choose a preset.', errors: { preset: 'Choose a preset.' } });
+  // Masquerade is NAT only; the rest add filter rules, which zones own.
+  if (preset !== 'masquerade' && await zoneManaged(req, res, family)) return;
   const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
   if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
   let plan: Awaited<ReturnType<typeof quickPlanFor>>;
@@ -1496,6 +1803,7 @@ router.post('/:id/firewall/reset-counters', requireWrite, async (req, res) => {
 router.delete('/:id/firewall/:ruleId', requireWrite, async (req, res) => {
   const family = familyOf(req, res);
   if (!family) return;
+  if (await zoneManaged(req, res, family)) return;
   const ruleId = req.params.ruleId;
   const meta = family === 'ipv6'
     ? await ipv6WriteMeta(req.params.id, 'firewall.remove', 'Delete IPv6 firewall rule')
@@ -1558,7 +1866,7 @@ router.post('/:id/nat', requireWrite, async (req, res) => {
     ? await ipv6WriteMeta(req.params.id, 'nat.add', `Add ${chain} ${action} IPv6 NAT rule`)
     : { kind: 'nat.add', summary: `Add ${chain} ${action} NAT rule` };
   await withGuardedChange(req.params.id, req, res, meta,
-    async (c) => { await c.addNatRule(params, family); return { message: 'NAT rule added' }; });
+    async (c) => { await c.addNatRule(await withRuleTag(c, params, family), family); return { message: 'NAT rule added' }; });
 });
 
 // PUT /api/devices/:id/nat/:ruleId[?family=ipv6]
@@ -1568,7 +1876,7 @@ router.put('/:id/nat/:ruleId', requireWrite, async (req, res) => {
   const params = natBodyToRosParams(req.body, true);
   const meta = family === 'ipv6' ? await ipv6WriteMeta(req.params.id, 'nat.set', 'Edit IPv6 NAT rule') : { kind: 'nat.set', summary: 'Edit NAT rule' };
   await withGuardedChange(req.params.id, req, res, meta,
-    async (c) => { await c.updateNatRule(req.params.ruleId, params, family); return { message: 'NAT rule updated' }; });
+    async (c) => { await c.updateNatRule(req.params.ruleId, await withRuleTag(c, params, family, { table: 'nat', id: req.params.ruleId }), family); return { message: 'NAT rule updated' }; });
 });
 
 // DELETE /api/devices/:id/nat/:ruleId[?family=ipv6]
@@ -2366,39 +2674,59 @@ router.post('/:id/plain-api/off', requireWrite, async (req, res) => {
 
 // POST /api/devices/:id/api-ssl — turn on API-SSL on the device and move the
 // manager's connection to it once a login over it works (outside review P1-4).
+// Signing a certificate can take minutes, longer than a proxy in front of the
+// manager will wait, so a switch still going after a short wait is answered
+// 202 and followed with GET .../api-ssl/status (#417).
 router.post('/:id/api-ssl', requireWrite, async (req, res) => {
   const device = await queryOne<ApiSslDevice>(
     `SELECT id, name, ip_address, api_port, api_tls, api_username, api_password_encrypted, jump_host_id FROM devices WHERE id = $1`, [req.params.id]);
   if (!device) return res.status(404).json({ error: 'Device not found' });
-  try {
-    const result = await enableApiSsl(device);
-    return res.json(result);
-  } catch (err) {
-    // Connection failures get the usual safe wording; anything the device
-    // itself said, or a step that explains itself, is shown as it is.
-    const msg = (err as Error).message ?? String(err);
-    const connectionProblem = !!(err as NodeJS.ErrnoException).code
-      || /timeout|connection|invalid user name or password/i.test(msg);
-    return res.status(502).json({
-      error: `Could not enable API-SSL: ${connectionProblem ? safeConnectionError('api-ssl', err) : msg}`,
-    });
-  }
+  await answerWithTask(res, `api-ssl:${device.id}`, () => enableApiSsl(device), {
+    failure: (err) => {
+      // Connection failures get the usual safe wording; anything the device
+      // itself said, or a step that explains itself, is shown as it is.
+      const msg = (err as Error).message ?? String(err);
+      const connectionProblem = !!(err as NodeJS.ErrnoException).code
+        || /timeout|connection|invalid user name or password/i.test(msg);
+      // In the log too, for when the reply never reaches the browser (#417).
+      if (!connectionProblem) console.warn(`[api-ssl] ${device.name}: ${msg}${(err as { during?: string }).during ? ` (${(err as { during?: string }).during})` : ''}`);
+      const denied = permissionProblem(err, device.api_username);
+      return { httpStatus: 502, error: `Could not enable API-SSL: ${denied ?? (connectionProblem ? safeConnectionError('api-ssl', err) : msg)}` };
+    },
+    // Read by a page loaded before this change, which expects a result.
+    stillRunning: { switched: false, steps: [], message: `Still working on ${device.name.trim()} (signing a certificate can take a few minutes). Reload the page shortly to see the outcome.` },
+    detach: () => detachHeldLock(device.id),
+    onSettled: () => dropLiveCache(device.id),
+  });
+});
+
+router.get('/:id/api-ssl/status', (req, res) => {
+  answerTaskStatus(res, `api-ssl:${parseInt(req.params.id, 10)}`, 'a switch to API-SSL');
 });
 
 // POST /api/devices/:id/www-ssl — WebFig over HTTPS (#234): certificate, www-ssl
 // on, and plain www off only once HTTPS answers.
 router.post('/:id/www-ssl', requireWrite, async (req, res) => {
-  try {
-    return res.json(await enableWwwSsl(parseInt(req.params.id, 10)));
-  } catch (err) {
-    const msg = (err as Error).message ?? String(err);
-    if (msg === 'Device not found') return res.status(404).json({ error: msg });
-    const connectionProblem = !!(err as NodeJS.ErrnoException).code
-      || /timeout|connection|invalid user name or password/i.test(msg);
-    return res.status(502).json({
-      error: `Could not switch WebFig to HTTPS: ${connectionProblem ? safeConnectionError('api', err) : msg}`,
-    });
-  }
+  const id = parseInt(req.params.id, 10);
+  const apiUser = (await queryOne<{ api_username: string }>(`SELECT api_username FROM devices WHERE id = $1`, [id]))?.api_username;
+  // Same as API-SSL above: it may sign a certificate, so it may answer 202 (#417).
+  await answerWithTask(res, `www-ssl:${id}`, () => enableWwwSsl(id), {
+    failure: (err) => {
+      const msg = (err as Error).message ?? String(err);
+      if (msg === 'Device not found') return { httpStatus: 404, error: msg };
+      const connectionProblem = !!(err as NodeJS.ErrnoException).code
+        || /timeout|connection|invalid user name or password/i.test(msg);
+      const denied = permissionProblem(err, apiUser);
+      return { httpStatus: 502, error: `Could not switch WebFig to HTTPS: ${denied ?? (connectionProblem ? safeConnectionError('api', err) : msg)}` };
+    },
+    stillRunning: { switched: false, steps: [], message: 'Still working on the device (signing a certificate can take a few minutes). Reload the page shortly to see the outcome.' },
+    detach: () => detachHeldLock(id),
+    onSettled: () => dropLiveCache(id),
+  });
+});
+
+router.get('/:id/www-ssl/status', (req, res) => {
+  answerTaskStatus(res, `www-ssl:${parseInt(req.params.id, 10)}`, 'a switch to HTTPS');
 });
 
 // POST /api/devices/:id/romon — apply the device's RoMON setting (#311): its
@@ -3285,6 +3613,41 @@ router.delete('/:id/routing/tables/:itemId', requireWrite, async (req, res) => {
     async (collector) => { await collector.removeRoutingTable(decodeURIComponent(req.params.itemId)); return { success: true }; });
 });
 
+// ─── Routing Rules (#370) ─────────────────────────────────────────────────────
+router.get('/:id/routing/rules', async (req, res) => {
+  const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  const collector = new DeviceCollector(deviceRow);
+  try {
+    await collector.connect();
+    const data = await collector.getRoutingRulesData();
+    const byTable = routesByTable(data.routes);
+    const rules = analyseRules(readRules(data.rules), data.tables, byTable);
+    // Each table a rule looks up, with its routes, for showing next to the rule.
+    const used = new Set(rules.map((r) => r.table).filter((t): t is string => !!t));
+    const tables = [...used].map((t) => byTable.get(t) ?? { table: t, routes: [] });
+    return res.json({ ros6: data.ros6, rules, tables, table_names: data.tables });
+  } finally { collector.disconnect(); }
+});
+
+router.post('/:id/routing/rules', requireWrite, async (req, res) => {
+  const parsed = parseRuleInput(req.body ?? {});
+  if ('errors' in parsed) return res.status(400).json({ error: Object.values(parsed.errors)[0], errors: parsed.errors });
+  const r = parsed.rule;
+  const what = [r['src-address'] && `from ${r['src-address']}`, r['dst-address'] && `to ${r['dst-address']}`,
+    r['routing-mark'] && `mark ${r['routing-mark']}`, r.interface && `in ${r.interface}`].filter(Boolean).join(' ') || 'all traffic';
+  await withGuardedChange(req.params.id, req, res,
+    { kind: 'routing.rules.post', summary: `Add routing rule: ${what} → ${r.action}${r.table ? ` ${r.table}` : ''}` },
+    async (collector) => { await collector.addRoutingRule({ ...r } as Record<string, string>); return { success: true }; });
+});
+
+router.delete('/:id/routing/rules/:itemId', requireWrite, async (req, res) => {
+  const itemId = decodeURIComponent(req.params.itemId);
+  if (!/^\*[0-9A-F]{1,8}$/i.test(itemId)) return res.status(400).json({ error: 'Unknown rule' });
+  await withGuardedChange(req.params.id, req, res, { kind: 'routing.rules.delete', summary: 'Remove routing rule' },
+    async (collector) => { await collector.removeRoutingRule(itemId); return { success: true }; });
+});
+
 // ─── Route Filters ────────────────────────────────────────────────────────────
 router.get('/:id/routing/filters', async (req, res) => {
   const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
@@ -3703,9 +4066,9 @@ router.post('/:id/bridges', requireWrite, async (req, res) => {
     async (c) => { await c.collectInterfaces(); });
 });
 
-// PUT /api/devices/:id/bridges/:bridgeName { name?, protocol_mode?, priority?, comment?, disabled? }
-// Renaming or changing spanning tree on the bridge management runs through
-// can't be simulated, so it requires auto-revert; disabling it is predicted
+// PUT /api/devices/:id/bridges/:bridgeName { name?, protocol_mode?, priority?, comment?, disabled?, mtu? }
+// Renaming, changing spanning tree or the MTU on the bridge management runs
+// through can't be simulated, so it requires auto-revert; disabling it is predicted
 // as a lockout. VLAN filtering has its own route with its own analysis.
 router.put('/:id/bridges/:bridgeName', requireWrite, async (req, res) => {
   const name = req.params.bridgeName;
@@ -3713,12 +4076,32 @@ router.put('/:id/bridges/:bridgeName', requireWrite, async (req, res) => {
   const parsed = parseBridgeUpdate(req.body ?? {});
   if ('error' in parsed) return res.status(400).json({ error: parsed.error });
   const f = parsed.fields;
+  // An MTU the ports can't carry is refused by RouterOS with no reason given,
+  // so it's checked here first against each port's L2 MTU.
+  if (f.mtu && f.mtu !== 'auto') {
+    const deviceRow = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+    if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+    const reader = new DeviceCollector(deviceRow);
+    let bridge: ReturnType<typeof bridgesView>[number] | undefined;
+    try {
+      await reader.connect();
+      bridge = bridgesView(await reader.getBridgesDetail()).find((b) => b.name === name);
+    } catch (err) {
+      return res.status(502).json({ error: `Couldn't read the device's bridges: ${(err as Error).message}` });
+    } finally {
+      reader.disconnect();
+    }
+    if (!bridge) return res.status(404).json({ error: `There is no bridge called ${name} on this device.` });
+    const problem = bridgeMtuProblem(f.mtu, bridge.ports);
+    if (problem) return res.status(400).json({ error: problem });
+  }
   const changes: PlannedChange[] = [];
   if (f.name && f.name !== name) changes.push({ kind: 'path-object.change', name, what: `Renaming the bridge to ${f.name}` });
+  if (f.mtu) changes.push({ kind: 'path-object.change', name, what: 'Changing the MTU' });
   if (f['protocol-mode'] || f.priority) changes.push({ kind: 'path-object.change', name, what: 'Changing spanning tree' });
   if (f.disabled) changes.push({ kind: 'interface.disable', name, disabled: f.disabled === 'yes' });
   const what = [f.name && f.name !== name ? `rename to '${f.name}'` : '', f['protocol-mode'] ? `protocol ${f['protocol-mode']}` : '',
-    f.priority ? `priority ${f.priority}` : '', f.disabled ? (f.disabled === 'yes' ? 'disable' : 'enable') : '',
+    f.priority ? `priority ${f.priority}` : '', f.mtu ? `MTU ${f.mtu}` : '', f.disabled ? (f.disabled === 'yes' ? 'disable' : 'enable') : '',
     f.comment !== undefined ? 'comment' : ''].filter(Boolean).join(', ');
   await withGuardedChange(req.params.id, req, res,
     {

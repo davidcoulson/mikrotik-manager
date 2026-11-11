@@ -1,6 +1,6 @@
 {
   "name": "mikrotik-manager-backend",
-  "version": "1.1.0-beta.30",
+  "version": "1.1.0-beta.45",
   "description": "Mikrotik Network Management Platform - Backend API",
   "main": "dist/index.js",
   "scripts": {
@@ -18,9 +18,10 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@peculiar/x509": "2.2.0",
     "bcryptjs": "^3.0.3",
-    "bullmq": "^6.5.3",
+    "bullmq": "^6.7.1",
     "compression": "^1.8.2",
     "cors": "^2.8.5",
+    "cron-parser": "^5.10.4",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
     "helmet": "^8.3.0",
@@ -28,8 +29,8 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.12.1",
     "nodemailer": "^10.3.1",
-    "openid-client": "^6.8.8",
-    "otpauth": "^9.5.2",
+    "openid-client": "^6.8.9",
+    "otpauth": "^9.6.0",
     "pg": "^8.23.1",
     "qrcode": "^1.5.4",
     "reflect-metadata": "0.2.2",
@@ -60,5 +61,8 @@
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.71.2"
+  },
+  "overrides": {
+    "minimatch@>=7.0.0 <11.0.1": "^11.0.5"
   }
 }

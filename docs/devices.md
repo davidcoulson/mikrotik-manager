@@ -393,7 +393,7 @@ history, uptime figures and reports keep every outage. **Snooze** instead hides 
 | **VLANs** | The bridge VLAN table, copying VLANs between switches, and VLAN interfaces (`/interface vlan`) with their parent and addresses, which you can add, edit and remove |
 | **Radios** | Wireless interfaces, SSIDs, channels, connected clients |
 | **Firewall** | Filter and NAT rules and address lists, for IPv4 and IPv6 (the **IPv4** / **IPv6** switch at the top), with reordering and counters, and [Quick rules](#quick-firewall-rules). IPv6 NAT needs RouterOS 7 |
-| **Routing** | IPv4 routes, IPv6 routes (read-only), OSPF, BGP, routing tables and filters |
+| **Routing** | IPv4 routes, IPv6 routes (read-only), routing rules, OSPF, BGP, routing tables and filters |
 | **Queues** | Traffic shaping |
 | **Connections** | The live connection tracking table: the total, and the first 200, 500 or 2,000 connections, filtered by protocol on the router. A busy router isn't asked for its whole table, and refreshing is on request unless you turn on auto-refresh (#300). Every column sorts, ports included (before 0.71.0, RouterOS 7.24's ports were missing) |
 | **Graphs** | History for this device, one range for every chart (1h to 30d), with a hover cursor shared across them. See [Device graphs](#device-graphs) |
@@ -459,7 +459,7 @@ without connection tracking has no Connections section, a single-core device no 
 | **Memory** | Memory used, with the peak band where it differs |
 | **Connections** | Active connections (with the peak, and the share of the table's maximum), connections by protocol and NAT translations (src-nat, dst-nat), and new connections per second where the router counts them (below). Only where connection tracking is running |
 | **Firewall drops** | Packets per second dropped by drop and reject rules, per chain (input, forward, and raw), and the rules that dropped the most in the range |
-| **Interfaces** | The four busiest ports and bonds in the range (or the ones you pick, up to eight), in and out on one chart each, their utilisation of the link speed, and packets per second. The same traffic isn't picked twice: a bond is picked rather than its members, and a PPPoE client rather than the port under it. A bond's speed is its running members' together; a port whose speed isn't known is named under the utilisation chart. The picker lists ports in number order (ether1, ether2 … ether48, then SFP and QSFP ports, bonds and VLANs) |
+| **Interfaces** | The four busiest ports and bonds in the range (or the ones you pick, up to eight), in and out on one chart each, their utilisation of the link speed, and packets per second. The same traffic isn't picked twice: a bond is picked rather than its members, a PPPoE client rather than the port under it, and VLAN and VRRP interfaces are left out (their traffic is counted on the port or bond they ride on). A bond's speed is its running members' together and a PPPoE client's is its port's; an interface whose speed isn't known is named under the utilisation chart. The picker lists ports in number order (ether1, ether2 … ether48, then SFP and QSFP ports, bonds and VLANs) |
 | **Temperature** | Each temperature sensor the device reports |
 
 A series that started inside the range, such as one new in this release or a device added
@@ -546,6 +546,109 @@ across the fleet, as of each device's last slow poll.
 The Security tab's **No input-chain firewall rule** finding (IPv4 or IPv6) has an **Add input rules**
 button that opens Quick rules on Input basics.
 
+## Zones
+
+**Zones** on the Firewall tab (IPv4) builds the whole filter table from a matrix, the way
+zone-based firewalls work (#369). A zone is an interface list (`LAN`, `WAN`, `DMZ`…). For each pair
+of zones, and from each zone to the router itself, you choose **Deny**, **Allow everything**, or
+**Only these services**:
+
+| To | Services to pick from |
+|---|---|
+| Another zone | Ping, Web (80, 443), DNS, SSH, Remote Desktop, File sharing (SMB), NTP |
+| The router | Ping, WinBox, SSH, WebFig, API, DNS, DHCP, NTP, SNMP. WinBox, SSH, WebFig and the API use the ports set in **IP > Services** |
+
+Any pair can also have up to 10 rules of your own, under **+ Custom rule**: TCP or UDP ports
+(`8080`, `5000-5010,6000`), a source address, a destination address, or any of them together. An
+address can be one address, a subnet (`10.0.0.0/24`) or a range (`10.0.0.10-10.0.0.20`). With an
+address the ports are optional, and the protocol can be **Any**. So WAN to DMZ can let one partner's
+address reach one server on 443 and nothing else, and LAN to the router can take SSH from the admin
+subnet only.
+
+A custom rule can also be **ICMP**, with an optional type (`8` for echo request) or type and code
+(`3:4`); left empty it allows every ICMP type. Or it can be any other IP protocol by number under
+**Protocol #**: `89` for OSPF, `47` for GRE, `112` for VRRP. RouterOS shows a protocol it has a name
+for by that name, so the rule appears on the device as `protocol=ospf`. Neither takes ports, and
+both can take addresses.
+
+A source or destination can also be a **hostname**, such as `smtp.office365.com`. The router looks
+it up with its own DNS (**IP > DNS**) and keeps an address list of every address it resolves to,
+updated as the name's records change, so a service behind several changing addresses stays
+matched. The manager keeps one list per name, called `mtm-zone-<name>`, holding a single entry
+commented `mtm zone host`, and removes it once no rule uses the name. If the router can't
+resolve a name, rules using it match nothing.
+
+Traffic between interfaces of the same zone is allowed unless you turn it off for that zone.
+
+### Turning zones on
+
+Zones replace the whole IPv4 filter table, so they can be turned on only when the table is empty or
+holds just MikroTik's default rules (comments starting `defconf`). Click **Set up zones**: the form
+starts from the device's interface lists. When it has `LAN` and `WAN`, the cells start like the
+defaults: LAN reaches everything, WAN only gets ping to the router.
+
+Add interfaces to a zone, or a new zone (which creates an interface list on the device). Put routed
+interfaces in zones: a bridge, a VLAN interface, the WAN port. The firewall sees routed traffic on
+the bridge, not on its ports, so a zone made of bridge ports gets a warning. So does an interface
+with an address that's in no zone, since nothing reaches the router or another zone through it.
+
+As you change the matrix, the form shows what applying will do: the lists and members it changes,
+and how many rules it adds, removes and keeps. **Show the rules** lists them all.
+
+### The rules
+
+Every rule is commented `mtm zone: …`. In order:
+
+- **Input** (traffic to the router): accept established, related and untracked; drop invalid;
+  accept to the loopback (for CAPsMAN); accept the manager's own address, when MTM can see it on
+  the device; a jump per zone that can reach the router, to `<zone>-to-router`; then drop the rest.
+- **Forward** (traffic between zones): FastTrack established and related (optional, with hardware
+  offload on RouterOS 7); accept established, related and untracked; drop invalid; an accept per
+  zone for same-zone traffic; a jump per open pair, to `<from>-to-<to>`; then drop the rest.
+- **One chain per open pair**, holding its accepts and ending in a return.
+
+The manager's rule lets its address reach everything on the router by default. To narrow it,
+set **The manager can reach** to **only the API, API-SSL and SSH ports**. Those are all the
+manager connects to: the API for everything it reads and changes, and SSH for the terminal,
+SSH-only devices and keys. It doesn't ping devices or poll them over SNMP. The ports are the ones
+set in **IP > Services**, so an SSH server moved to 2222 is the port allowed. The choice only
+appears when MTM can see its own address on the device.
+
+The two final drops log by default with the prefixes `zone drop in` and `zone drop fwd`, tagged so
+[Firewall Events](firewall-events.md#which-rule-logged-it) links each line to its rule. Untick **Log
+what's dropped** to leave them quiet. The returns and the final drops aren't shown in the matrix.
+
+Replies always get back: a connection allowed one way is tracked, and the stateful accepts let its
+replies through. Port forwards (dstnat) are matched after the address is changed, so allow the
+service from the outside zone to the zone the server is in.
+
+### Applying
+
+**Apply** runs as one [Change Guard](change-guard.md) change. The whole new table is checked
+against the manager's own connection first, including the jumps into each zone's chain and any
+interface moved between lists, so a matrix that would cut the manager off is caught before anything
+is written. **Review changes** shows the commands.
+
+Rules that are already right stay as they are, with their counters; the rest are added in place or
+removed. New rules go in disabled and are turned on with the drops last, so no step along the way
+drops anything the old table let through.
+
+### While zones are on
+
+Zones own the IPv4 filter table. The RouterOS rules that carry them out (one chain per zone,
+with its jumps and returns) are folded away on the Firewall tab, so the tab reads as zones and
+what each can reach. **Show RouterOS rules** opens them, with their counters, and the browser
+remembers the choice; following a log line's rule link opens them too. They can't be edited,
+moved or deleted there, and Quick rules other than masquerade are refused. NAT, address lists and
+IPv6 are unchanged.
+
+If the table is changed outside MTM (in WinBox, say), the Zones card says what differs, and
+[Config Health](change-guard.md#config-health) reports **Firewall differs from its zones**.
+**Apply** puts the rules back.
+
+**Turn zones off** stops managing the table. Nothing on the device changes: the rules stay as
+ordinary rules you can edit. Turning zones on again starts from the same matrix.
+
 ## Ports and the faceplate
 
 The faceplate mirrors the physical front panel — copper staggered odd above even as the
@@ -571,7 +674,8 @@ port's comment here sets the interface comment. The column is hidden when no por
 comment.
 
 Use **ports per row** in the faceplate header if the default does not suit your hardware;
-the setting is remembered. Next to it, **top row** says which ports are on top: `1 3 5` (most
+it's remembered for each device in your browser, and a device you haven't set yet uses the last
+choice you made. Next to it, **top row** says which ports are on top: `1 3 5` (most
 models) or `2 4 6`, for models whose front panel has the even ports on top (#277). It appears
 when the Ethernet ports sit in two rows, and is remembered per model in your browser. A choice you make there overrides the model's built-in Ethernet layout.
 
@@ -580,6 +684,21 @@ many receive and transmit errors, drops and transmit-queue drops the port had in
 a small chart of them when there were any, or "0 errors · 0 drops in this range" when there were
 none (#402). They're kept apart from the throughput so a few
 aren't flattened by gigabit traffic. Drops are counted from 1.1.0-beta.26 on.
+
+### A port's MTU
+
+A port's edit form takes its MTU, from 576 up to what the port's hardware takes. RouterOS calls
+that `max-l2mtu`, and the field shows it ("up to 10218 on this port"). It varies by port: most
+SFP+ and QSFP28 ports on CRS3xx and CRS5xx switches take 10218, while a CRS510's management port
+(ether1) stops at 2028. RouterOS doesn't refuse a higher MTU; it keeps the most it can without
+saying so. So the manager refuses one the port can't take, and reports it if the device keeps a
+different value than asked.
+
+The port's L2 MTU is raised with the MTU when it's too small, and is never lowered, so a port
+raised for VLAN tags or jumbo frames keeps it. The MTU is only sent when you change it.
+
+Jumbo frames switched between ports only need those ports' MTU raised. The bridge's own MTU
+(see [Bridges](#bridges)) is only for the router's own traffic on the bridge.
 
 ### Power-cycling a PoE port
 
@@ -594,10 +713,21 @@ powered may be carrying the manager's connection.
 Selecting a port and setting it to **access** or **trunk** writes three things: the PVID, the
 bridge VLAN membership, and frame admission (`frame-types` and `ingress-filtering`).
 
-For a trunk, tick the tagged VLANs. The native VLAN (PVID) is greyed out because it is carried
-untagged. The text box below the checkboxes holds the same list, for copying between switches,
-and accepts ranges such as `10,20,100-110`. A VLAN typed there that the switch does not have
-yet is created on the bridge when you save.
+For a trunk, pick the native VLAN and tick the tagged VLANs. A trunk accepts both kinds of
+frame: tagged frames for its tagged VLANs, and untagged frames, which join the native VLAN
+(the PVID). So a device that doesn't use VLANs, such as a laptop or an unmanaged switch, works
+on a trunk port and lands in the native VLAN. The native VLAN is greyed out in the tagged list
+because it is carried untagged. The text box below the checkboxes holds the same list, for
+copying between switches, and accepts ranges such as `10,20,100-110`. A VLAN typed there that
+the switch does not have yet is created on the bridge when you save.
+
+Tick **Tagged only** for a trunk that should drop untagged frames instead (`frame-types=admit-only-vlan-tagged`).
+It then has no native VLAN. Before 1.0.11 every trunk was set this way, so a trunk saved by an
+older version opens with **Tagged only** ticked. Untick it and save to let untagged devices use
+the native VLAN.
+
+Saving a trunk also takes the port out of any untagged VLAN other than its native one, so a
+former access port stops sending its old VLAN untagged.
 
 Unticking a VLAN removes the port from it. One exception: if the switch holds several VLANs
 in one bridge VLAN entry (for example `vlan-ids=100-110`) and the port keeps some of them,
@@ -607,7 +737,7 @@ entry on the VLANs tab to remove them.
 An access port carries one VLAN, its PVID, untagged. Setting a port to access takes it out of
 every other VLAN it was in, tagged or untagged, so a former trunk stops sending its VLANs. The
 editor opens a port in the mode its frame admission says: a port that only admits untagged
-frames shows as access, one that only admits tagged frames as trunk.
+frames shows as access, one that only admits tagged frames as a tagged-only trunk.
 
 !!! warning "This is a guarded change"
     Moving the port that carries management traffic is the most common way to lock a MikroTik
@@ -722,13 +852,24 @@ has a small chip icon; hover a port for its PVID and spanning tree role.
 - **New bridge** creates an empty one, with RSTP unless you choose otherwise. Add ports to it
   on the **Ports** tab (see [Moving ports between bridges](#moving-ports-between-bridges)).
 - **Edit** renames it, changes its spanning tree mode or priority (0 to 61440 in steps of
-  4096; the lowest wins the root election), changes its comment, or turns it off. Renaming
-  keeps its ports, VLANs and addresses.
+  4096; the lowest wins the root election), changes its comment or MTU, or turns it off.
+  Renaming keeps its ports, VLANs and addresses.
+- **MTU** is `auto` by default: RouterOS uses the lowest MTU of the bridge's ports. Set a
+  number, or `auto` to go back. The bridge's MTU is for the router's own traffic on the bridge:
+  its address, routing in and out, and VLAN interfaces on it. Jumbo frames switched between
+  ports don't use it; they only need those ports' MTU raised (see
+  [A port's MTU](#a-ports-mtu)).
+
+  A bridge's MTU can't be more than the smallest L2 MTU of its ports, and the field says what
+  that is. Asked for more, the manager names the ports that are too small, because RouterOS's
+  own answer is only "could not set mtu". Raise those ports' MTU on the **Ports** tab first. A
+  port whose hardware can't go that high, such as a CRS510's 2028-byte management port, has to
+  leave the bridge instead.
 - **turn on / turn off** next to VLAN filtering works as it does from the faceplate.
 - The bin deletes a bridge with no ports, addresses or VLAN entries.
 
 Everything runs through [Change Guard](change-guard.md). Renaming the bridge the manager
-connects through, or changing its spanning tree, can't be simulated, so it runs with
+connects through, or changing its spanning tree or MTU, can't be simulated, so it runs with
 auto-revert required; turning that bridge off is predicted as a lockout and asks first.
 
 ## Routing between VLANs in hardware
@@ -764,6 +905,24 @@ destination, gateway, table, distance, whether it's active and how it was learne
 connected, OSPF, BGP and so on), and blackhole or unreachable routes. It's read-only for now.
 Devices with IPv6 turned off, or without the ipv6 package, say so rather than showing an empty table.
 
+### Routing rules
+
+**Rules** lists the device's policy routing rules (`/routing/rule`, or `/ip/route/rule` on
+RouterOS 6) in the order RouterOS tries them, from Ron's request in #370. Each shows what it
+matches (source, destination, routing mark, in interface) and what it does; for a lookup, click
+the action to see that table's routes under the rule. The first rule that matches decides, so
+the tab flags:
+
+- a rule that's the **same as an earlier one**, or that an earlier rule **already covers** (for
+  example `192.168.52.0/24` after `192.168.0.0/16`): it never applies;
+- a lookup in a **table that doesn't exist** (RouterOS 7);
+- a lookup in a **table with no active routes**; with *Look up only in table* that traffic is
+  unreachable.
+
+A rule with `min-prefix` can pass traffic on to the next rule, so it's never counted as covering
+the ones after it. Rules can be added (at the end) and removed through
+[Change Guard](change-guard.md), with **Review changes** first if you like.
+
 ## Tools
 
 All of these run **on the device**, not from the manager, so they see the network from where
@@ -777,6 +936,19 @@ the device sits.
 | Wake-on-LAN | Magic packet sent from the device |
 | Packet capture | 5–60s sniff, downloaded as `.pcap`. Requires SSH |
 | Bandwidth test | Between two managed devices; the target's test server is enabled and disabled for you |
+| Torch | Live traffic on one interface, flow by flow, refreshed every second (below) |
+
+### Torch
+
+**Torch** shows who is talking on an interface right now: protocol, source and destination
+with ports, and each flow's TX and RX rate, busiest first, refreshed every second. Narrow it
+by source, destination (IPv4 or IPv6, a single address or a prefix), port and protocol before
+starting. It is RouterOS's own `/tool torch`, read over the API.
+
+Torch costs the router CPU while it runs, so it is bounded: it stops when you press **Stop**
+or leave the page, and by itself after 10 minutes. A device runs at most two at once. Traffic
+that a switch chip forwards in hardware never reaches the CPU, so on a CRS switch Torch shows
+only what the CPU handles. Operators and admins can use it, and each start is in the audit log.
 
 ### Web Admin
 
@@ -790,7 +962,9 @@ the manager, it falls back to `http://` on the device's address.
 
 ### Terminal
 
-The terminal opens an SSH shell on the device, for operators and admins in the device's site.
+The terminal opens an SSH shell on the device, for admins in the device's site. Operators
+don't get one: a shell skips Change Guard and Review changes, so they make their changes
+through the tabs and bulk commands instead.
 The audit log records each session's start, who opened it, from which address, and when it
 was refused (for example by the rate limit). **What is typed in the shell is not recorded.**
 If you need a record of commands, turn on logging on the device itself (`/system logging`), or

@@ -1005,6 +1005,55 @@ CREATE TABLE IF NOT EXISTS command_run_devices (
 );
 CREATE INDEX IF NOT EXISTS idx_command_run_devices ON command_run_devices(run_id, wave);
 
+-- Scheduled bulk commands (#359). Targets are worked out at each run: devices
+-- named, plus every device with one of the tags or in one of the sites.
+CREATE TABLE IF NOT EXISTS command_schedules (
+  id                 SERIAL PRIMARY KEY,
+  name               VARCHAR(120) NOT NULL,
+  command            TEXT NOT NULL,
+  device_ids         INTEGER[] NOT NULL DEFAULT '{}',
+  tag_ids            INTEGER[] NOT NULL DEFAULT '{}',
+  site_ids           INTEGER[] NOT NULL DEFAULT '{}',
+  wave_size          INTEGER NOT NULL DEFAULT 1,
+  halt_on_failure    BOOLEAN NOT NULL DEFAULT TRUE,
+  use_change_guard   BOOLEAN NOT NULL DEFAULT TRUE,
+  maintenance_only   BOOLEAN NOT NULL DEFAULT FALSE,
+  alert_on_failure   BOOLEAN NOT NULL DEFAULT TRUE,
+  -- once | simple | cron; simple keeps the choices (for editing) and its cron.
+  kind               VARCHAR(8) NOT NULL,
+  run_at             TIMESTAMPTZ,
+  cron               VARCHAR(100),
+  simple             JSONB,
+  enabled            BOOLEAN NOT NULL DEFAULT TRUE,
+  next_run_at        TIMESTAMPTZ,
+  last_run_id        INTEGER REFERENCES command_runs(id) ON DELETE SET NULL,
+  last_status        VARCHAR(16),
+  created_by         VARCHAR(50),
+  created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_command_schedules_due ON command_schedules(next_run_at) WHERE enabled;
+-- A run a schedule made, and why one didn't happen (status 'missed').
+ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS schedule_id INTEGER REFERENCES command_schedules(id) ON DELETE SET NULL;
+ALTER TABLE command_runs ADD COLUMN IF NOT EXISTS note TEXT;
+
+-- Zone-based firewall (#369 phase 2): the matrix, which RouterOS has no
+-- notion of, and the rules it compiled to at the last apply (for drift).
+CREATE TABLE IF NOT EXISTS firewall_zone_configs (
+  device_id    INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  config       JSONB NOT NULL,
+  desired      JSONB NOT NULL,
+  enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+  applied_at   TIMESTAMPTZ,
+  applied_by   VARCHAR(50),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Interface -> zone, as last read from the device (#415): Firewall Logs shows
+-- zones instead of interfaces. Refreshed on apply, on opening the Zones tab
+-- and by the hourly config-health read.
+ALTER TABLE firewall_zone_configs ADD COLUMN IF NOT EXISTS interface_zones JSONB;
+
 CREATE TABLE IF NOT EXISTS device_ssh_keys (
   device_id        INTEGER PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
   key_type         VARCHAR(24) NOT NULL DEFAULT 'ed25519',
@@ -1986,6 +2035,44 @@ CREATE TABLE IF NOT EXISTS proxy_certs (
   renewed_at      TIMESTAMPTZ,
   PRIMARY KEY (device_id, sni)
 );
+
+-- Session log from NetFlow (#415 step 2): one row per connection, both
+-- directions paired, client to server. Off until turned on per device.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS netflow_sessions BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS netflow_sessions (
+  id              BIGSERIAL PRIMARY KEY,
+  device_id       INTEGER REFERENCES devices(id) ON DELETE CASCADE,
+  -- The source address, when the exporting router couldn't be identified.
+  exporter        VARCHAR(64),
+  protocol        SMALLINT NOT NULL,
+  client_addr     VARCHAR(45) NOT NULL,
+  client_port     INTEGER NOT NULL,
+  server_addr     VARCHAR(45) NOT NULL,
+  server_port     INTEGER NOT NULL,
+  client_nat_addr VARCHAR(45),
+  client_nat_port INTEGER,
+  server_nat_addr VARCHAR(45),
+  server_nat_port INTEGER,
+  client_mac      VARCHAR(17),
+  app             VARCHAR(32),
+  started_at      TIMESTAMPTZ NOT NULL,
+  ended_at        TIMESTAMPTZ NOT NULL,
+  bytes_out       BIGINT NOT NULL DEFAULT 0,
+  bytes_in        BIGINT NOT NULL DEFAULT 0,
+  packets_out     BIGINT NOT NULL DEFAULT 0,
+  packets_in      BIGINT NOT NULL DEFAULT 0,
+  flags_out       SMALLINT,
+  flags_in        SMALLINT,
+  end_reason      VARCHAR(16) NOT NULL,
+  updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_netflow_sessions_ended ON netflow_sessions(ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_netflow_sessions_device ON netflow_sessions(device_id, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_netflow_sessions_client ON netflow_sessions(client_addr, ended_at DESC);
+CREATE INDEX IF NOT EXISTS idx_netflow_sessions_server ON netflow_sessions(server_addr, ended_at DESC);
+-- The zoom a site's map opens at (#362): 1 (world) to 19 (a building). NULL
+-- fits the map to what's on it, as before.
+ALTER TABLE sites ADD COLUMN IF NOT EXISTS map_zoom SMALLINT;
 `;
 
 const DEFAULT_SETTINGS = [
@@ -2034,6 +2121,10 @@ const DEFAULT_SETTINGS = [
   { key: 'netflow_accept_unknown', value: false },
   { key: 'netflow_retention_days', value: 30 },
   { key: 'netflow_daily_retention_days', value: 365 },
+  // Session log (#415 step 2): sessions from routers that can't be identified
+  // are kept only when this is on, and sessions are kept this many days.
+  { key: 'netflow_sessions_unidentified', value: false },
+  { key: 'retention_sessions_days', value: 3 },
   { key: 'change_guard_enabled', value: true },
   { key: 'change_guard_mode', value: 'binary' },
   { key: 'change_guard_timeout_sec', value: 120 },

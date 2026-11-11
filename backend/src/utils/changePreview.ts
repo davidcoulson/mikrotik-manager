@@ -35,6 +35,8 @@ const READ_VERBS = new Set(['print', 'getall', 'get', 'monitor', 'monitor-traffi
 export function isReadCommand(command: string, params: Record<string, string> = {}): boolean {
   const verb = command.split('/').filter(Boolean).pop() ?? '';
   if (READ_VERBS.has(verb)) return true;
+  // What a menu's commands take, for features some builds lack (#369).
+  if (command === '/console/inspect') return true;
   // /export prints the configuration; with file= it writes one.
   if (verb === 'export') return !('file' in params);
   return false;
@@ -190,7 +192,7 @@ const PREVIEWABLE: [string, RegExp][] = [
   ['PUT', /^\/api\/devices\/\d+\/services\/[^/]+$/],
   ['PUT', /^\/api\/devices\/\d+\/(system-config|clock|l3hw)$/],
   ['POST|PUT|DELETE', /^\/api\/devices\/\d+\/ip-addresses(\/[^/]+)?$/],
-  ['POST|PUT|DELETE', /^\/api\/devices\/\d+\/routing(\/(ospf\/instance|ospf\/area|bgp\/connection|tables|filters\/rule))?(\/[^/]+)?$/],
+  ['POST|PUT|DELETE', /^\/api\/devices\/\d+\/routing(\/(ospf\/instance|ospf\/area|bgp\/connection|tables|rules|filters\/rule))?(\/[^/]+)?$/],
   ['POST|PUT|DELETE', /^\/api\/devices\/\d+\/(vlans|bonds)(\/[^/]+)?$/],
   ['PUT', /^\/api\/devices\/\d+\/bridge\/[^/]+\/vlan-filtering$/],
   ['POST|PUT', /^\/api\/devices\/\d+\/bridges(\/[^/]+)?$/],
@@ -207,6 +209,8 @@ const PREVIEWABLE: [string, RegExp][] = [
   ['POST|DELETE', /^\/api\/network-services\/netinstall\/cache$/],
   ['PUT', /^\/api\/network-services\/netinstall\/settings$/],
   ['POST', /^\/api\/network-services\/netinstall\/(package|devices\/install|devices\/clear)$/],
+  // PPP users and PPPoE servers (Discussion #85); disconnecting isn't config
+  ['PUT', /^\/api\/tunnels\/ppp\/(user|server)$/],
   // Reverse proxy (#358)
   ['POST|PUT|DELETE', /^\/api\/reverse-proxy\/rule(\/[^/]+)?$/],
   ['PUT', /^\/api\/reverse-proxy\/service$/],

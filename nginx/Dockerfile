@@ -17,10 +17,11 @@ ENV VITE_BUILD_SHA=$BUILD_SHA VITE_BUILD_DATE=$BUILD_DATE
 RUN npm run build
 
 # Stage 2: Serve with nginx
-FROM nginx:alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
+FROM nginx:alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
 
-# Install openssl for self-signed certificate generation
-RUN apk add --no-cache openssl
+# Certbot obtains and renews ACME certificates; su-exec runs it as the owner of
+# the shared certificate volume. openssl generates the local fallback cert.
+RUN apk add --no-cache certbot openssl su-exec
 
 # Copy built frontend
 COPY --from=frontend-builder /frontend/dist /usr/share/nginx/html

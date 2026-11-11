@@ -66,9 +66,20 @@ Choosing **All sites** also makes every other page fleet-wide, which is the hone
 of "all sites" — useful for a fleet-wide search, less so for a dashboard that averages
 several unrelated networks.
 
-Pins require an address, which is geocoded via Nominatim when you save it. If
-**Settings → Maps enabled** is off, no geocoding or tile request is made and the map is
-hidden; addresses are still stored and shown as text.
+A pin comes from the site's address, which is geocoded via Nominatim when you save it. When
+the address can't be found, or the pin lands in the wrong place, edit the site and set **Map
+position** yourself: type a latitude and longitude (`51.5072, -0.1276`, as most map sites copy
+them), or press **Pick on map** and click where the site is. A position set this way wins
+over the address, and **remove pin** takes the site off the map.
+
+**Map zoom** sets how close the site's map opens, from 1 (the whole world) to 19 (a single
+building); 12 is about street level. Blank fits the map to what's on it, as before. It's used
+when the dashboard shows only that site's devices, by the sites map when it's the only site
+with a pin, and by **Pick on map**. While picking, **Use the map's zoom** takes the zoom you've
+zoomed the picker to.
+
+If **Settings → Maps enabled** is off, no geocoding or tile request is made and the map is
+hidden; addresses and typed positions are still stored.
 
 ## Site address and device locations
 
@@ -113,12 +124,11 @@ What a site-limited account gets:
   tokens, encryption or other fleet settings, and admin-only fleet-wide credential presets are
   as closed to them as to an operator. They do manage their own sites' credential presets
   under **Operations → Credentials**.
-- **Bulk work within its sites.** Bulk commands and firmware rollouts are available only if
-  every device in them is in the account's sites. "Apply to all" actions (SNMP, LLDP, Backup
+- **Bulk work within its sites.** Bulk commands (site admins only) and firmware rollouts are
+  available only if every device in them is in the account's sites. "Apply to all" actions (SNMP, LLDP, Backup
   all) skip sites where it's only a viewer.
 - **Terminals and live updates** follow the same rules: a shell opens only on a device in a
-  site where the account is an operator or admin, and live-update events for other sites
-  never reach it.
+  site where the account is an admin, and live-update events for other sites never reach it.
 
 Not available to site-limited accounts, because each covers the whole fleet:
 

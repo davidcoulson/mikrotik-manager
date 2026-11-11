@@ -14,7 +14,7 @@ import TimeFormatSetting from '../components/settings/TimeFormatSetting';
 import type { CertInfo, AlertRule, AlertChannel } from '../services/api';
 import PollerHealthCard from '../components/system/PollerHealthCard';
 import { useAuthStore } from '../store/authStore';
-import { useThemeStore } from '../store/themeStore';
+import AppearanceCard from '../components/settings/AppearanceCard';
 import type { User, UserRole } from '../types';
 import {
   parseBackupCron, scheduleToCron, describeBackupSchedule, WEEKDAY_NAMES, ordinal,
@@ -31,6 +31,8 @@ import EncryptionKeyCard from '../components/settings/EncryptionKeyCard';
 import OidcSettings from '../components/settings/OidcSettings';
 import AiConnectionsSettings from '../components/settings/AiConnectionsSettings';
 import PlatformBackupSettings from '../components/settings/PlatformBackupSettings';
+import AcmeCaBundleCard from '../components/settings/AcmeCaBundleCard';
+import AcmeAttemptStatus from '../components/settings/AcmeAttemptStatus';
 import { useIsSiteScoped } from '../hooks/useCanWrite';
 import SiteAccessDialog, { type UserSiteRole, type UserGroupRole } from '../components/settings/SiteAccessDialog';
 
@@ -66,7 +68,6 @@ export default function SettingsPage() {
   const { formatDateTime, formatTime, timeFormat } = useDateTimeFormat();
   const queryClient = useQueryClient();
   const { user } = useAuthStore();
-  const { theme, setTheme } = useThemeStore();
   const isAdmin = user?.role === 'admin';
   const canWrite = user?.role !== 'viewer';
   // Timezone for scheduled work. The browser's zone is offered as a shortcut
@@ -264,6 +265,33 @@ export default function SettingsPage() {
     queryFn: () => certApi.get().then((r) => r.data as CertInfo),
     enabled: activeTab === 'certificate',
   });
+  const { data: acmeSettings, isLoading: acmeLoading, error: acmeLoadError } = useQuery({
+    queryKey: ['cert-acme'],
+    queryFn: () => certApi.getAcme().then((r) => r.data),
+    enabled: activeTab === 'certificate' && isAdmin,
+  });
+  const [acmeForm, setAcmeForm] = useState({ domain: '', email: '', server: '' });
+  const [acmeError, setAcmeError] = useState('');
+  const [acmeSuccess, setAcmeSuccess] = useState('');
+  useEffect(() => {
+    if (acmeSettings) {
+      setAcmeForm({ domain: acmeSettings.domain, email: acmeSettings.email, server: acmeSettings.server });
+    }
+  }, [acmeSettings]);
+  const acmeMutation = useMutation({
+    mutationFn: (settings: { domain: string; email: string; server: string } | null) =>
+      settings ? certApi.updateAcme(settings) : certApi.resetAcme(),
+    onSuccess: (_data, settings) => {
+      queryClient.invalidateQueries({ queryKey: ['cert-acme'] });
+      setAcmeError('');
+      setAcmeSuccess(settings ? 'ACME settings saved.' : 'Now using the ACME values from the deployment environment.');
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setAcmeError(msg || 'Failed to save ACME settings');
+      setAcmeSuccess('');
+    },
+  });
 
   const [certUpload, setCertUpload] = useState({ certificate: '', private_key: '' });
   const [certError, setCertError] = useState('');
@@ -439,6 +467,7 @@ export default function SettingsPage() {
     tunnel_down: 'Tunnel down: an IPsec peer, EoIP, GRE or IPIP tunnel, or PPPoE client that was up has been down this long (threshold, minutes)',
     mlag_degraded: 'MLAG degraded: a critical MLAG problem — not connected, both peers primary, peer link down, a bond cabled to two devices, or a heartbeat storm',
     platform_backup_failed: 'Platform backup failed: a backup of MikroTik Manager itself failed or didn’t reach a destination',
+    scheduled_command_failed: 'Scheduled command failed: a scheduled bulk command failed on a device, halted, or didn’t run (each schedule can turn this off)',
     device_cert_renewal_failed: 'Device certificate renewal failed: the manager couldn’t renew a certificate its CA issued to a device',
   };
 
@@ -569,31 +598,7 @@ export default function SettingsPage() {
         <div className="max-w-6xl xl:columns-2 xl:gap-4 [&>*]:mb-4 [&>*]:break-inside-avoid">
           <TimeFormatSetting />
           {isAdmin && <EncryptionKeyCard />}
-          <div className="card p-5">
-            <h3 className="font-semibold text-gray-900 dark:text-white mb-4">Appearance</h3>
-            <div className="flex items-center justify-between">
-              <div>
-                <label className="text-sm font-medium text-gray-700 dark:text-slate-300">Theme</label>
-                <p className="text-xs text-gray-400 dark:text-slate-500">Choose your preferred color scheme</p>
-              </div>
-              <div className="flex gap-2">
-                {(['light', 'dark'] as const).map((t) => (
-                  <button
-                    key={t}
-                    onClick={() => setTheme(t)}
-                    className={clsx(
-                      'px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors capitalize',
-                      theme === t
-                        ? 'bg-blue-600 text-white border-blue-600'
-                        : 'border-gray-300 dark:border-slate-600 text-gray-600 dark:text-slate-400'
-                    )}
-                  >
-                    {t}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
+          <AppearanceCard />
 
           <div className="card p-5">
             <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Polling Intervals</h3>
@@ -898,6 +903,7 @@ export default function SettingsPage() {
                 { key: 'retention_availability_days', label: 'Outage history retention', desc: 'Auto-delete ended outages older than this many days (uptime reports look back up to 90)' },
                 { key: 'netflow_retention_days', label: 'Traffic detail retention', desc: 'Auto-delete per-client NetFlow time-series data older than this many days' },
                 { key: 'netflow_daily_retention_days', label: 'Traffic daily rollup retention', desc: 'Auto-delete per-client daily traffic totals older than this many days' },
+                { key: 'retention_sessions_days', label: 'Session log retention', desc: 'Auto-delete NetFlow sessions that ended more than this many days ago' },
               ].map(({ key, label, desc }) => (
                 <div key={key} className="flex items-center justify-between gap-4">
                   <div>
@@ -1565,6 +1571,97 @@ export default function SettingsPage() {
               </div>
             )}
           </div>
+
+          {isAdmin && (
+            <div className="card p-5 space-y-4">
+              <div>
+                <h3 className="font-semibold text-gray-900 dark:text-white mb-1 flex items-center gap-2">
+                  <Globe className="w-4 h-4 text-blue-500" />
+                  Automatic HTTPS Certificate (ACME)
+                </h3>
+                <p className="text-xs text-gray-500 dark:text-slate-400">
+                  Request and renew a certificate for this web interface using HTTP-01. The domain must point to this host, port 80 must be reachable from the internet, and TLS_MODE must be https. Changes take effect without restarting the containers.
+                </p>
+              </div>
+              {acmeLoading ? (
+                <p className="text-sm text-gray-400">Loading ACME settings...</p>
+              ) : acmeLoadError ? (
+                <p className="text-sm text-red-600 dark:text-red-400">
+                  Failed to load ACME settings: {acmeLoadError instanceof Error ? acmeLoadError.message : 'Unknown error'}
+                </p>
+              ) : (
+                <form onSubmit={(e) => {
+                  e.preventDefault();
+                  if (acmeSettings?.readOnly) return;
+                  if (!acmeForm.domain.trim()) {
+                    setAcmeError('A domain is required.');
+                    return;
+                  }
+                  setAcmeError('');
+                  setAcmeSuccess('');
+                  acmeMutation.mutate(acmeForm);
+                }}>
+                  <p className="text-xs text-gray-500 dark:text-slate-400">
+                    {acmeSettings?.readOnly
+                      ? 'All ACME environment variables are set. These settings are read-only; change .env and restart the containers to modify them.'
+                      : acmeSettings?.source === 'web'
+                      ? 'Web settings override the ACME values in .env.'
+                      : 'Using ACME values from .env until you save web settings.'}
+                  </p>
+                  <fieldset disabled={acmeSettings?.readOnly || acmeMutation.isPending} className="grid gap-3 sm:grid-cols-2 mt-3 min-w-0">
+                    <div>
+                      <label className="label" htmlFor="acme-domain">Domain (required)</label>
+                      <input id="acme-domain" required className="input w-full" value={acmeForm.domain} onChange={(e) => setAcmeForm((s) => ({ ...s, domain: e.target.value }))} placeholder="manager.example.com" />
+                    </div>
+                    <div>
+                      <label className="label" htmlFor="acme-email">Contact email (optional)</label>
+                      <input id="acme-email" className="input w-full" type="email" value={acmeForm.email} onChange={(e) => setAcmeForm((s) => ({ ...s, email: e.target.value }))} placeholder="admin@example.com" />
+                      <p className="mt-1 text-xs text-gray-400">Without an email, you may not receive certificate expiry or account notices.</p>
+                    </div>
+                    <div className="sm:col-span-2">
+                      <label className="label" htmlFor="acme-server">ACME directory URL</label>
+                      <input id="acme-server" className="input w-full" type="url" value={acmeForm.server} onChange={(e) => setAcmeForm((s) => ({ ...s, server: e.target.value }))} placeholder="https://acme-v02.api.letsencrypt.org/directory" />
+                      <p className="mt-1 text-xs text-gray-400">Defaults to Let&apos;s Encrypt production.</p>
+                    </div>
+                  </fieldset>
+                  {acmeError && (
+                    <div className="flex items-center gap-2 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                      <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                      <p className="text-sm text-red-600 dark:text-red-400">{acmeError}</p>
+                    </div>
+                  )}
+                  {acmeSuccess && (
+                    <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                      <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0" />
+                      <p className="text-sm text-green-600 dark:text-green-400">{acmeSuccess}</p>
+                    </div>
+                  )}
+                  {!acmeSettings?.readOnly && <div className="flex flex-wrap gap-2 mt-4">
+                    <button
+                      type="submit"
+                      className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                      disabled={acmeMutation.isPending}
+                    >
+                      {acmeMutation.isPending ? 'Saving...' : 'Save ACME Settings'}
+                    </button>
+                    {acmeSettings?.source === 'web' && (
+                      <button
+                        type="button"
+                        className="btn-secondary disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled={acmeMutation.isPending}
+                        onClick={() => { setAcmeError(''); setAcmeSuccess(''); acmeMutation.mutate(null); }}
+                      >
+                        Use .env Values
+                      </button>
+                    )}
+                  </div>}
+                </form>
+              )}
+              {acmeSettings?.domain.trim() && <AcmeAttemptStatus />}
+            </div>
+          )}
+
+          {isAdmin && <AcmeCaBundleCard />}
 
           {/* Regenerate self-signed */}
           <div className="card p-5">

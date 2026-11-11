@@ -50,6 +50,8 @@ export interface PortVlanConfig {
   mode?: 'access' | 'trunk';
   /** Trunk only: tagged_vlans is the complete set, so unlisted VLANs are removed. */
   replace_tagged?: boolean;
+  /** Trunk only: drop untagged frames rather than put them in the PVID's VLAN. */
+  tagged_only?: boolean;
 }
 
 export type DeviceStatus = 'online' | 'offline' | 'unknown';
@@ -92,6 +94,8 @@ export interface Device {
   firmware_version?: string;
   ros_version?: string;
   latest_ros_version?: string;
+  /** The channel the device reported at its last update check (#413). */
+  reported_update_channel?: string | null;
   firmware_update_available?: boolean;
   routerboard_upgrade_available?: boolean;
   upgrade_firmware_version?: string;

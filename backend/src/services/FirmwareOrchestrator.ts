@@ -17,7 +17,7 @@ import { interruptedOutcome, INTERRUPTED_RUN_ERROR } from '../utils/interrupted'
 import { describeUpdateStatus, type UpdateStatus } from '../utils/updateStatus';
 import { upgradeDecision, verifyUpgrade, scheduleDecision } from '../utils/firmwarePlan';
 import { mirrorForDevice, newestCompleteVersion, type MirrorRow } from './firmwareMirror';
-import { matchLocalUpdate, packageFileName } from '../utils/firmwareMirror';
+import { matchLocalUpdate, packageFileName, packageRoom } from '../utils/firmwareMirror';
 import { runSshCommand, looksLikeFailure, type SshExecDevice } from './sshExec';
 import { withSafeApply, type GuardDevice } from './changeGuard/ChangeGuard';
 import { fillSecrets, maskSecrets } from './commandSecrets';
@@ -50,6 +50,10 @@ const REBOOT_POLL_MS = 15_000;       // probe cadence while waiting
 const ROUTERBOOT_SETTLE_MS = 10_000;
 const ROUTERBOOT_CONNECT_ATTEMPTS = 3;
 const REBOOT_TIMEOUT_MS = 12 * 60_000; // give slow flash writes room
+// A device that's still up, with its uptime still climbing, this long after the
+// RouterBOOT reboot was sent never took the reboot. It's asked once more: the
+// new RouterBOOT is already written, so a second reboot only applies it.
+const ROUTERBOOT_RESEND_AFTER_MS = 2 * 60_000;
 
 /**
  * Operator overrides, read per rollout so a change needs no restart.
@@ -747,9 +751,27 @@ export class FirmwareOrchestrator {
       return { pkg: p, name, size: Number(expected.find((e) => e.filename === name)?.size_bytes || 0) };
     });
     const needBytes = want.reduce((n, w) => n + w.size, 0);
-    const free = Number(res['free-hdd-space'] || 0);
-    if (free && needBytes > free) {
-      return { kind: 'fail', error: `Not enough space for ${target}: the packages need ${Math.round(needBytes / 1048576)} MB and the device has ${Math.round(free / 1048576)} MB free. Nothing was downloaded.` };
+    // A 16 MB-flash device keeps downloads in RAM: its root is RAM, with the
+    // flash mounted as `flash` (Manuel, Discussion #85).
+    const ramRoot = await Promise.resolve()
+      .then(() => collector.getFiles())
+      .then((files) => files.some((f) => f['name'] === 'flash' && (f['type'] === 'disk' || f['type'] === 'directory')))
+      .catch(() => false);
+    const room = packageRoom({
+      needBytes,
+      freeHdd: Number(res['free-hdd-space'] || 0),
+      freeMemory: Number(res['free-memory'] || 0),
+      totalMemory: Number(res['total-memory'] || 0),
+      ramRoot,
+    });
+    if (!room.ok) {
+      const mb = (n: number) => Math.round(n / 1048576);
+      return {
+        kind: 'fail',
+        error: room.where === 'memory'
+          ? `Not enough memory for ${target}: this device downloads packages into RAM, and the packages need ${mb(needBytes)} MB plus ${mb(room.needBytes - needBytes)} MB to keep running on, against ${mb(room.freeBytes)} MB free. Nothing was downloaded.`
+          : `Not enough space for ${target}: the packages need ${mb(needBytes)} MB and the device has ${mb(room.freeBytes)} MB free. Nothing was downloaded.`,
+      };
     }
     const uptimeBefore = await collector.getUptimeSeconds();
 
@@ -871,6 +893,13 @@ export class FirmwareOrchestrator {
     // counts once uptime proves it restarted; otherwise the old bootloader
     // version would be read and reported as a failed upgrade.
     const deadline = Date.now() + this.rebootMs;
+    const sentAt = Date.now();
+    // Whether the last probe found the device up and not restarted, and
+    // whether the reboot has been sent a second time (MiniRack, rollout 35:
+    // the device took the RouterBOOT write but not the reboot, and was
+    // reported as "did not come back" while it sat there reachable).
+    let upNotRestarted = false;
+    let resent = false;
     while (Date.now() < deadline) {
       if (this.cancelRequested) return { ok: false, error: 'cancelled while rebooting' };
       await sleep(REBOOT_POLL_MS);
@@ -879,9 +908,16 @@ export class FirmwareOrchestrator {
         await probe.connect();
         const uptimeNow = await probe.getUptimeSeconds().catch(() => null);
         if (uptimeBefore != null && uptimeNow != null && uptimeNow >= uptimeBefore) {
+          upNotRestarted = true;
+          if (!resent && Date.now() - sentAt >= ROUTERBOOT_RESEND_AFTER_MS) {
+            resent = true;
+            console.log(`[Firmware] ${device.name}: still up ${Math.round((Date.now() - sentAt) / 1000)}s after the RouterBOOT reboot; sending the reboot again`);
+            await probe.reboot().catch(() => undefined);
+          }
           probe.disconnect();
           continue;   // not restarted yet
         }
+        upNotRestarted = false;
         const after = await probe.checkRouterboardUpgrade();
         probe.disconnect();
         // Checked against the target, and an unreadable version is not a pass.
@@ -903,6 +939,13 @@ export class FirmwareOrchestrator {
       } catch {
         probe.disconnect();
       }
+    }
+    if (upNotRestarted) {
+      return {
+        ok: false,
+        error: `RouterBOOT ${target || 'upgrade'} was written, but the device didn't restart when asked${resent ? ' (twice)' : ''}. ` +
+          'It is still running and reachable: reboot it to finish, and the new RouterBOOT takes effect then.',
+      };
     }
     return { ok: false, error: `device did not come back within ${Math.round(this.rebootMs / 60000)} minutes after the RouterBOOT upgrade` };
   }

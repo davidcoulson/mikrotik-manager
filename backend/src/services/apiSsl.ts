@@ -24,6 +24,7 @@ import { usesApiTls } from '../utils/apiTls';
 import { API_SSL_PORT } from './mikrotik/apiConnect';
 import { forgetIdentity } from './identityPins';
 import { configuredServices, allowedFrom, allowedFromKey } from '../utils/ipServices';
+import { during } from '../utils/devicePermission';
 import { routeOf } from './jumpHosts';
 
 export const MTM_CERT_NAME = 'mtm-api-ssl';
@@ -75,11 +76,11 @@ export async function ensureCertificate(client: CommandRunner, device: { name: s
     return MTM_CERT_NAME;
   }
   if (existing?.['.id']) {
-    await client.execute('/certificate/remove', { '.id': existing['.id'] });
+    await during('removing the old certificate', () => client.execute('/certificate/remove', { '.id': existing['.id'] }));
     steps.push(`Removed an unusable "${MTM_CERT_NAME}" certificate`);
   }
   const identity = (await client.execute('/system/identity/print').catch(() => []))[0]?.['name'] || device.name;
-  await client.execute('/certificate/add', {
+  await during('creating the certificate', () => client.execute('/certificate/add', {
     name: MTM_CERT_NAME,
     'common-name': identity.slice(0, 64),
     'key-size': '2048',
@@ -87,7 +88,7 @@ export async function ensureCertificate(client: CommandRunner, device: { name: s
     // key-cert-sign is needed for a certificate to sign itself; without it
     // RouterOS refuses with "CA not found".
     'key-usage': 'digital-signature,key-encipherment,key-cert-sign,tls-server',
-  });
+  }));
   steps.push(`Created a self-signed certificate "${MTM_CERT_NAME}" (valid 10 years)`);
 
   // Signing generates the key, which takes a while on small devices. The
@@ -95,7 +96,7 @@ export async function ensureCertificate(client: CommandRunner, device: { name: s
   const added = await certByName(client, MTM_CERT_NAME);
   if (!added?.['.id']) throw new Error('The certificate was created but could not be found to sign it.');
   // By .id: the API's /certificate/sign refuses `numbers`.
-  await client.execute('/certificate/sign', { '.id': added['.id'] }, [], { timeoutMs: SIGN_TIMEOUT_MS });
+  await during('signing the certificate', () => client.execute('/certificate/sign', { '.id': added['.id'] }, [], { timeoutMs: SIGN_TIMEOUT_MS }));
   const deadline = Date.now() + SIGN_WAIT_MS;
   while (Date.now() < deadline) {
     if (usable(await certByName(client, MTM_CERT_NAME))) {
@@ -128,6 +129,11 @@ export async function enableApiSsl(device: ApiSslDevice): Promise<ApiSslResult> 
     return { switched: false, steps: [], message: `${device.name} is already managed over API-SSL.` };
   }
   const steps: string[] = [];
+  // The device is on the plain API, so any API-SSL certificate pinned from an
+  // earlier time on 8729 is stale, even when the certificate is kept below:
+  // left in place it refused the login that decides the switch (#417). The
+  // login below pins what the device presents now.
+  await forgetIdentity(device.id, 'api-tls');
   const client = new RouterOSClient(
     device.ip_address, device.api_port, device.api_username, decrypt(device.api_password_encrypted), 15_000, 30_000, false,
     routeOf(device));
@@ -135,7 +141,7 @@ export async function enableApiSsl(device: ApiSslDevice): Promise<ApiSslResult> 
     await client.connect();
     // Configured rows only: a live api-ssl session is printed as another
     // "api-ssl" row (#192).
-    const services = configuredServices(await client.execute('/ip/service/print', { detail: '' }));
+    const services = configuredServices(await during('reading the services', () => client.execute('/ip/service/print', { detail: '' })));
     const svc = services.find((r) => r['name'] === 'api-ssl');
     if (!svc?.['.id']) throw new Error('This device has no api-ssl service.');
     const plainApi = services.find((r) => r['name'] === 'api');
@@ -151,12 +157,7 @@ export async function enableApiSsl(device: ApiSslDevice): Promise<ApiSslResult> 
     }
 
     const changes: Record<string, string> = {};
-    if (svc['certificate'] !== certName) {
-      changes['certificate'] = certName;
-      // The manager is replacing the certificate itself, so the old pin is
-      // expected to stop matching; the login below pins the new one.
-      await forgetIdentity(device.id, 'api-tls');
-    }
+    if (svc['certificate'] !== certName) changes['certificate'] = certName;
     if (isTrue(svc['disabled'])) changes['disabled'] = 'no';
     if (svc['port'] !== String(API_SSL_PORT)) changes['port'] = String(API_SSL_PORT);
     // api-ssl takes over api's job, so it gets api's allowed addresses too
@@ -168,7 +169,7 @@ export async function enableApiSsl(device: ApiSslDevice): Promise<ApiSslResult> 
       changes[allowedFromKey(svc)] = apiList.join(',');
     }
     if (Object.keys(changes).length > 0) {
-      await client.execute('/ip/service/set', { '.id': svc['.id'], ...changes });
+      await during('changing the api-ssl service', () => client.execute('/ip/service/set', { '.id': svc['.id'], ...changes }));
       if (changes['disabled']) steps.push('Enabled the api-ssl service');
       if (changes['certificate']) steps.push(`Assigned "${certName}" to the api-ssl service`);
       if (changes['port']) steps.push(`Moved api-ssl to port ${API_SSL_PORT} (it was on ${svc['port']})`);
@@ -185,6 +186,7 @@ export async function enableApiSsl(device: ApiSslDevice): Promise<ApiSslResult> 
   // The deciding step: a real login over TLS, on a new connection.
   const failure = await tryApiSsl(device);
   if (failure) {
+    console.warn(`[api-ssl] ${device.name}: enabled, but the login over ${API_SSL_PORT} failed: ${failure}`);
     return {
       switched: false,
       steps,

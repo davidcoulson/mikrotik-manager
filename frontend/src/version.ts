@@ -1,4 +1,4 @@
-export const APP_VERSION = 'v1.1.0-beta.30';
+export const APP_VERSION = 'v1.1.0-beta.45';
 
 /**
  * Commit and date of a non-release build ("a1b2c3d · 2026-10-15"), or '' for a

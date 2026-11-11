@@ -354,6 +354,39 @@ export const identityApi = {
     api.post<{ message: string }>(`/devices/${deviceId}/identity/${kind}/trust`),
 };
 
+/**
+ * A device operation that may outlast a proxy's patience (#417): the manager
+ * answers within about 25s, either with the outcome or 202 "still running",
+ * and in the second case its outcome is fetched from `${path}/status` every
+ * few seconds. Resolves and rejects like a plain axios call, so callers read
+ * `res.data` and `err.response.data.error` as before.
+ */
+export async function runDeviceTask<T>(path: string): Promise<{ data: T }> {
+  const first = await api.post<T>(path, undefined, { timeout: 120_000 });
+  if (first.status !== 202) return first;
+  const deadline = Date.now() + 10 * 60_000;
+  let misses = 0;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 3_000));
+    let view: { status: string; result?: T; http_status?: number; error?: string };
+    try {
+      view = (await api.get(`${path}/status`, { timeout: 20_000 })).data;
+      misses = 0;
+    } catch (err) {
+      // The manager's own answer (such as "no record of it") ends the wait;
+      // a blip on the way there doesn't, unless it keeps happening.
+      if ((err as AxiosError).response?.data || ++misses >= 5) throw err;
+      continue;
+    }
+    if (view.status === 'done') return { data: view.result as T };
+    if (view.status === 'failed') {
+      throw Object.assign(new Error(view.error || 'Request failed'),
+        { response: { status: view.http_status ?? 502, data: { error: view.error } } });
+    }
+  }
+  throw Object.assign(new Error('timeout'), { code: 'ECONNABORTED' });
+}
+
 export interface ApiSslResult {
   switched: boolean;
   steps: string[];
@@ -680,7 +713,25 @@ export interface CommandRunSummary {
   id: number; name: string; command: string; status: string;
   wave_size: number; halt_on_failure: boolean; use_change_guard: boolean;
   total: number; succeeded: number; failed: number; created_at: string;
+  /** The schedule that made it (#359), and why a scheduled run didn't happen. */
+  schedule_id?: number | null; note?: string | null;
 }
+
+/** A scheduled bulk command (#359). */
+export interface CommandSchedule {
+  id: number; name: string; command: string;
+  device_ids: number[]; tag_ids: number[]; site_ids: number[];
+  wave_size: number; halt_on_failure: boolean; use_change_guard: boolean;
+  maintenance_only: boolean; alert_on_failure: boolean;
+  kind: 'once' | 'simple' | 'cron';
+  run_at: string | null; cron: string | null;
+  simple: { freq: 'daily' | 'weekly' | 'monthly'; time: string; weekday?: number; monthday?: number } | null;
+  enabled: boolean; next_run_at: string | null;
+  last_run_id: number | null; last_status: string | null; last_run_at?: string | null;
+  created_by: string | null;
+  description: string; target_count: number;
+}
+export type CommandScheduleInput = Omit<CommandSchedule, 'id' | 'enabled' | 'next_run_at' | 'last_run_id' | 'last_status' | 'last_run_at' | 'created_by' | 'description' | 'target_count'>;
 
 export interface CommandRunDevice {
   id: number; device_id: number; device_name: string; ip_address: string;
@@ -717,6 +768,11 @@ export const commandTemplatesApi = {
   update: (id: number, data: Partial<Pick<CommandTemplate, 'name' | 'command' | 'description'>>) =>
     api.put<CommandTemplate>(`/command-templates/${id}`, data),
   delete: (id: number) => api.delete(`/command-templates/${id}`),
+  /** What a template can be captured from, and a draft read off a device (Discussion #85). */
+  captureSections: () => api.get<{ key: string; label: string }[]>('/command-templates/capture/sections'),
+  capture: (deviceId: number, sections: string[]) =>
+    api.get<{ name: string; description: string; command: string; skipped: string[] }>('/command-templates/capture',
+      { params: { deviceId, sections: sections.join(',') } }),
 };
 
 export const commandsApi = {
@@ -736,6 +792,12 @@ export const commandsApi = {
    */
   exportCsv: (id: number) =>
     api.get(`/commands/runs/${id}/export`, { responseType: 'blob' }),
+  listSchedules: () => api.get<{ time_zone: string; schedules: CommandSchedule[] }>('/commands/schedules'),
+  createSchedule: (body: CommandScheduleInput) => api.post<CommandSchedule>('/commands/schedules', body),
+  updateSchedule: (id: number, body: CommandScheduleInput) => api.put<CommandSchedule>(`/commands/schedules/${id}`, body),
+  setScheduleEnabled: (id: number, enabled: boolean) => api.post(`/commands/schedules/${id}/enabled`, { enabled }),
+  runScheduleNow: (id: number) => api.post<{ id: number }>(`/commands/schedules/${id}/run-now`),
+  deleteSchedule: (id: number) => api.delete(`/commands/schedules/${id}`),
 };
 
 /** Overridable settings (#261): the overrides set here, and what's in force with where it comes from. */
@@ -948,7 +1010,7 @@ export const devicesApi = {
   addBridge: (id: number, data: { name: string; protocol_mode?: string; priority?: string; vlan_filtering?: boolean; comment?: string }) =>
     api.post(`/devices/${id}/bridges`, data, GUARDED),
   updateBridge: (id: number, bridgeName: string,
-    data: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean }, confirmLockout = false) =>
+    data: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean; mtu?: string }, confirmLockout = false) =>
     api.put(`/devices/${id}/bridges/${encodeURIComponent(bridgeName)}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
   setBridgeVlanFiltering: (id: number, bridgeName: string, enabled: boolean, confirmLockout = false) =>
     api.put(`/devices/${id}/bridge/${encodeURIComponent(bridgeName)}/vlan-filtering`,
@@ -965,6 +1027,9 @@ export const devicesApi = {
     api.post(`/devices/${id}/firewall/move`, { id: ruleId, destination, ...(confirmLockout ? { confirm_lockout: true } : {}) }, famParams(family)),
   /** Count "outages this week" from now on (#85); history is kept. */
   resetOutages: (id: number) => api.post<{ message: string; outages_reset_at: string }>(`/devices/${id}/outages/reset`),
+  /** Tag every rule that logs without a tag, filter and NAT (#369). */
+  tagLoggingRules: (id: number, family?: FirewallFamily, confirm = false) =>
+    api.post<{ tagged: number; message: string }>(`/devices/${id}/firewall/tag-logging`, confirm ? { confirm_lockout: true } : {}, famParams(family)),
   resetFirewallCounters: (id: number, family?: FirewallFamily) =>
     api.post<Record<string, string>[]>(`/devices/${id}/firewall/reset-counters`, undefined, famParams(family)),
   moveNatRule: (id: number, ruleId: string, destination?: string, family?: FirewallFamily) =>
@@ -1036,8 +1101,7 @@ export const devicesApi = {
   unsuppressSecurityCheck: (id: number) =>
     api.delete(`/devices/security/suppressions/${id}`),
   /** Enable API-SSL on the device and move the manager's connection to it. Signing a certificate can take a minute. */
-  enableApiSsl: (id: number) =>
-    api.post<ApiSslResult>(`/devices/${id}/api-ssl`, undefined, { timeout: 240_000 }),
+  enableApiSsl: (id: number) => runDeviceTask<ApiSslResult>(`/devices/${id}/api-ssl`),
   /**
    * Turn off plain API once the manager is on API-SSL (#201). Refused while
    * anything else is connected to plain API (409 with in_use_by), and run
@@ -1048,8 +1112,7 @@ export const devicesApi = {
   /** WebFig over HTTPS (#234); plain www goes off only once HTTPS answers. Same result shape. */
   /** Apply the device's RoMON setting: its site's, group's or the fleet default (#311). */
   applyRomon: (id: number) => api.post<{ message: string }>(`/devices/${id}/romon`),
-  enableWwwSsl: (id: number) =>
-    api.post<ApiSslResult & { url?: string }>(`/devices/${id}/www-ssl`, undefined, { timeout: 240_000 }),
+  enableWwwSsl: (id: number) => runDeviceTask<ApiSslResult & { url?: string }>(`/devices/${id}/www-ssl`),
   getSecurityPosture: (id: number) =>
     api.get<{ score: number; checks: SecurityCheck[] }>(`/devices/${id}/security-posture`),
   // Config Health — cached findings load instantly; the scan re-reads the device.
@@ -1258,8 +1321,10 @@ export const clientsApi = {
     offset?: number;
     sort?: string;
     dir?: 'asc' | 'desc';
+    /** 'show' includes managed devices' own MACs and VRRP MACs (#363). */
+    infra?: 'show';
   }) =>
-    api.get<{ clients: Client[]; total: number; vlans?: number[] }>('/clients', { params }),
+    api.get<{ clients: Client[]; total: number; vlans?: number[]; network_device_macs?: number }>('/clients', { params }),
   get: (mac: string) => api.get<ClientDetail>(`/clients/${encodeURIComponent(mac)}`),
   getRoaming: (mac: string, range = '24h') =>
     api.get<RoamingHistory>(`/clients/${encodeURIComponent(mac)}/roaming`, { params: { range } }),
@@ -1339,6 +1404,44 @@ export interface FirewallEvent {
   dstPort?: number;
 
   length?: number;
+
+  /** The device runs zones (#415): the line reads from zone to zone. */
+  zoned?: boolean;
+  /** "Router" for the router's own traffic; missing for an interface in no zone. */
+  fromZone?: string;
+  toZone?: string;
+  /** With names=1: the client's hostname or reverse DNS. */
+  srcName?: string;
+  dstName?: string;
+}
+
+/** Firewall log lines folded by rule, source, destination and port (#415). */
+export interface FirewallGroup extends Omit<FirewallEvent, 'id' | 'eventTime' | 'severity' | 'topic' | 'srcPort'> {
+  count: number;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+/** Policy routing rules (#370), in the device's order, with what's wrong with them. */
+export interface RoutingRule {
+  id: string; position: number;
+  src: string | null; dst: string | null; routingMark: string | null; iface: string | null;
+  action: string; table: string | null; minPrefix: string | null;
+  disabled: boolean; invalid: boolean; dynamic: boolean; comment: string | null;
+  flags: { level: 'warn' | 'info'; text: string }[];
+}
+export interface RoutingRulesData {
+  ros6: boolean;
+  rules: RoutingRule[];
+  /** Each table a rule looks up, with its routes. */
+  tables: { table: string; routes: { dst: string; gateway: string | null; distance: string | null; active: boolean }[] }[];
+  /** The device's routing tables (RouterOS 7), for the add form. */
+  table_names: string[] | null;
+}
+export interface RoutingRuleInput {
+  'src-address'?: string; 'dst-address'?: string; 'routing-mark'?: string; interface?: string;
+  action: string; table?: string; comment?: string;
+  confirm_lockout?: boolean;
 }
 
 export const eventsApi = {
@@ -1369,11 +1472,24 @@ export const eventsApi = {
     protocol?: string;
     limit?: number;
     offset?: number;
+    names?: 1;
   }) =>
     api.get<{
       events: FirewallEvent[];
       total: number;
     }>('/events/firewall', { params }),
+  /** The same filters, folded into groups (#415). */
+  firewallGrouped: (params?: {
+    deviceId?: number;
+    search?: string;
+    since?: string;
+    action?: FirewallEvent['action'];
+    protocol?: string;
+    limit?: number;
+    offset?: number;
+    names?: 1;
+  }) =>
+    api.get<{ groups: FirewallGroup[]; total: number; scanLimit: number }>('/events/firewall', { params: { ...params, view: 'grouped' } }),
   clearFirewall: (deviceId?: number) =>
     api.delete<{ message: string; deleted: number }>('/events/firewall', {
       params: deviceId ? { deviceId } : {},
@@ -1894,6 +2010,70 @@ export const routersApi = {
   }>('/routers/snmp', config),
 };
 
+/** Policy routing rules on a device (#370). */
+export const routingRulesApi = {
+  list: (id: number) =>
+    api.get<RoutingRulesData>(`/devices/${id}/routing/rules`),
+  add: (id: number, data: RoutingRuleInput) =>
+    api.post(`/devices/${id}/routing/rules`, data),
+  remove: (id: number, itemId: string, confirmLockout = false) =>
+    api.delete(`/devices/${id}/routing/rules/${encodeURIComponent(itemId)}`,
+      confirmLockout ? { params: { confirm_lockout: 'true' } } : undefined),
+};
+
+// ─── Zone-based firewall (#369) ───────────────────────────────────────────────
+export type ZoneAction = 'deny' | 'allow' | 'services';
+/** A rule of your own: protocol and ports, and optionally a source and destination address (#369). */
+/** `icmp` is a type or type:code for ICMP; `number` an IP protocol number for "other" (#369). */
+export interface ZoneCustomService {
+  protocol: 'tcp' | 'udp' | 'any' | 'icmp' | 'other'; ports: string; icmp?: string; number?: string; src?: string; dst?: string;
+}
+export interface ZonePolicy { action: ZoneAction; services: string[]; custom: ZoneCustomService[] }
+export interface ZoneConfig {
+  zones: string[];
+  intra: Record<string, boolean>;
+  /** `${from}>${to}`, where `to` is a zone or '@router'. */
+  policies: Record<string, ZonePolicy>;
+  fasttrack: boolean;
+  logDrops: boolean;
+  /** The manager reaches only its API, API-SSL and SSH ports on the router; missing means everything (#369). */
+  managerAccess?: 'management';
+}
+export interface ZoneRequest { config: ZoneConfig; members: Record<string, string[]> }
+export interface ZonesData {
+  enabled: boolean;
+  config: ZoneConfig | null;
+  applied_at: string | null;
+  applied_by: string | null;
+  eligible: boolean;
+  foreign_rules: number;
+  lists: { name: string; members: { interface: string; dynamic: boolean }[] }[];
+  interfaces: { name: string; type: string; running: boolean; disabled: boolean; bridge_port: boolean; addresses: string[] }[];
+  manager_ip: string | null;
+  drift: { missing: string[]; extra: string[] } | null;
+  services: { forward: { key: string; label: string }[]; router: { key: string; label: string }[] };
+}
+export interface ZonePlan {
+  errors: Record<string, string>;
+  warnings: string[];
+  rules: (Record<string, string> & { hidden: boolean; description: string })[];
+  changes: {
+    add: number; remove: number; keep: number; lists: string[];
+    members_added: { list: string; interface: string }[]; members_removed: { list: string; interface: string }[];
+    /** Address lists kept for hostnames in rules (#369). */
+    host_lists_added?: string[]; host_lists_removed?: string[];
+  } | null;
+}
+
+export const zonesApi = {
+  get: (id: number) => api.get<ZonesData>(`/devices/${id}/firewall/zones`),
+  plan: (id: number, body: ZoneRequest) => api.post<ZonePlan>(`/devices/${id}/firewall/zones/plan`, body),
+  apply: (id: number, body: ZoneRequest, confirmLockout = false) =>
+    api.put<{ message: string; added: number; removed: number; kept: number }>(`/devices/${id}/firewall/zones`,
+      { ...body, ...(confirmLockout ? { confirm_lockout: true } : {}) }),
+  turnOff: (id: number) => api.delete<{ message: string }>(`/devices/${id}/firewall/zones`),
+};
+
 // ─── Routing Protocols (per-device) ───────────────────────────────────────────
 Object.assign(devicesApi, {
   getOspf: (id: number) => api.get<Record<string, unknown>>(`/devices/${id}/routing/ospf`),
@@ -2049,11 +2229,34 @@ export interface CertInfo {
   san?: string | null;
 }
 
+export interface AcmeSettings {
+  domain: string;
+  email: string;
+  server: string;
+  source: 'web' | 'environment';
+  readOnly: boolean;
+}
+
+export interface AcmeAttempt {
+  time: string;
+  action: 'issue' | 'renew';
+  exitCode: number;
+  domain: string;
+  output: string;
+}
+
 export const certApi = {
   get: () => api.get<CertInfo>('/cert'),
   regenerate: () => api.post<CertInfo & { message: string }>('/cert/regenerate'),
   upload: (certificate: string, private_key: string) =>
     api.post<CertInfo & { message: string }>('/cert/upload', { certificate, private_key }),
+  getAcme: () => api.get<AcmeSettings>('/cert/acme'),
+  getAcmeStatus: () => api.get<{ lastAttempt: AcmeAttempt | null }>('/cert/acme/status'),
+  updateAcme: (data: Pick<AcmeSettings, 'domain' | 'email' | 'server'>) => api.put('/cert/acme', data),
+  resetAcme: () => api.delete('/cert/acme'),
+  getAcmeCaBundle: () => api.get<{ installed: boolean; readOnly: boolean }>('/cert/acme/ca-bundle'),
+  uploadAcmeCaBundle: (certificate: string) => api.put('/cert/acme/ca-bundle', { certificate }),
+  deleteAcmeCaBundle: () => api.delete('/cert/acme/ca-bundle'),
 };
 
 // ─── Wireless ─────────────────────────────────────────────────────────────────
@@ -2378,6 +2581,8 @@ export interface NetflowDeviceState {
   target_matches_collector: boolean;
   flows_received: number;
   last_flow_at: string | null;
+  /** Session log on for this device (#415). */
+  sessions?: boolean;
   error?: string;
 }
 
@@ -2395,6 +2600,12 @@ export interface TrafficTopClient {
   ip_address: string | null;
 }
 export interface TrafficApp { app: string; bytes: number; packets?: number }
+export interface TrafficAppClients {
+  app: string;
+  total_bytes: number;
+  client_count: number;
+  clients: (TrafficTopClient & { share: number })[];
+}
 export interface TrafficCollectorStats {
   listening: boolean;
   port: number;
@@ -2410,7 +2621,60 @@ export interface TrafficCollectorStats {
   rejectedSources?: { address: string; reason: 'unknown_exporter' | 'public_address'; packets: number; lastSeen: string }[];
   /** True when `exporters` is limited to the selected site; the counters stay collector-wide (#236). */
   site_filtered?: boolean;
+  /** Session log (#415): open in memory, written since start, dropped for being over a bound. */
+  sessions?: { open: number; written: number; dropped: number };
 }
+
+// ─── Session log (#415) ──────────────────────────────────────────────────────
+
+export type SessionEndReason = 'fin' | 'reset-client' | 'reset-server' | 'no-reply' | 'aged-out';
+
+export interface NetflowSession {
+  id: number;
+  device_id: number | null;
+  device_name: string | null;
+  exporter: string | null;
+  protocol: number;
+  client_addr: string;
+  client_port: number;
+  server_addr: string;
+  server_port: number;
+  client_nat_addr: string | null;
+  client_nat_port: number | null;
+  server_nat_addr: string | null;
+  server_nat_port: number | null;
+  client_mac: string | null;
+  client_name: string | null;
+  app: string | null;
+  started_at: string;
+  ended_at: string;
+  bytes_out: number;
+  bytes_in: number;
+  packets_out: number;
+  packets_in: number;
+  flags_out: number | null;
+  flags_in: number | null;
+  end_reason: SessionEndReason;
+}
+
+export interface SessionFilters {
+  deviceId?: number;
+  since?: string;
+  address?: string;
+  port?: string;
+  protocol?: string;
+  reason?: string;
+  app?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const sessionsApi = {
+  list: (params: SessionFilters) =>
+    api.get<{ sessions: NetflowSession[]; total: number; totalCapped: boolean }>('/sessions', { params }),
+  setDevice: (deviceId: number, enabled: boolean) =>
+    api.put<{ id: number; sessions: boolean }>(`/sessions/devices/${deviceId}`, { enabled }),
+};
 
 export const trafficApi = {
   status: () => api.get<TrafficCollectorStats>('/traffic/status'),
@@ -2420,6 +2684,9 @@ export const trafficApi = {
     api.get<TrafficTopClient[]>('/traffic/top-clients', { params: { range, limit } }),
   apps: (range = '24h', mac?: string) =>
     api.get<TrafficApp[]>('/traffic/apps', { params: { range, mac } }),
+  /** Who generates one application's traffic (#366). */
+  appClients: (app: string, range = '24h') =>
+    api.get<TrafficAppClients>(`/traffic/apps/${encodeURIComponent(app)}/clients`, { params: { range } }),
   client: (mac: string, range = '24h') =>
     api.get<{ series: ClientTrafficPoint[]; apps: TrafficApp[] }>(
       `/traffic/client/${encodeURIComponent(mac)}`, { params: { range } }
@@ -2486,6 +2753,8 @@ export interface SitePayload {
   notes?: string;
   location_lat?: number | null;
   location_lng?: number | null;
+  /** The zoom its map opens at, 1 to 19; null to fit the map (#362). */
+  map_zoom?: number | null;
   /** The group it belongs to; null for none (#306). */
   group_id?: number | null;
   /** Pre-fills new devices in the site; null for direct. */
@@ -2842,7 +3111,9 @@ export const platformBackupApi = {
 export interface BridgeView {
   id: string; name: string; protocolMode: string; priority: string | null; vlanFiltering: boolean;
   running: boolean; disabled: boolean; dynamic: boolean; comment: string | null; mtu: string | null; macAddress: string | null;
-  ports: { name: string; hw: boolean; pvid: string | null; disabled: boolean; inactive: boolean; dynamic: boolean; role: string | null }[];
+  /** The MTU as set: "auto" or a number. `mtu` is what it is in effect. */
+  mtuSetting?: string;
+  ports: { name: string; hw: boolean; pvid: string | null; disabled: boolean; inactive: boolean; dynamic: boolean; role: string | null; l2mtu?: number | null; maxL2mtu?: number | null }[];
   vlans: string[];
   dynamicVlans?: string[];
   addresses: string[];
@@ -2895,8 +3166,28 @@ export interface TunnelRowView {
   last_change_at: string;
   updated_at: string;
 }
+/** One router's PPP users, PPPoE servers and sessions, read live (Discussion #85). */
+export interface PppUser {
+  id: string; name: string; service: string; profile: string | null; remote_address: string | null;
+  disabled: boolean; comment: string | null; last_logged_out: string | null; last_caller_id: string | null;
+  last_disconnect_reason: string | null; sessions: number;
+}
+export interface PppServer { id: string; service_name: string; interface: string | null; disabled: boolean }
+export interface PppSession { id: string; name: string; service: string; caller_id: string | null; address: string | null; uptime: string | null }
+export interface PppState { users: PppUser[]; servers: PppServer[]; sessions: PppSession[] }
+
 export const tunnelsApi = {
   list: () => api.get<TunnelRowView[]>('/tunnels'),
+  ppp: (deviceId: number) => api.get<PppState>('/tunnels/ppp', { params: { deviceId } }),
+  setUser: (deviceId: number, id: string, disabled: boolean, confirmLockout = false) =>
+    api.put<{ message: string }>('/tunnels/ppp/user', { id, disabled, ...(confirmLockout ? { confirm_lockout: true } : {}) },
+      { params: { deviceId }, ...GUARDED }),
+  setServer: (deviceId: number, id: string, disabled: boolean, confirmLockout = false) =>
+    api.put<{ message: string }>('/tunnels/ppp/server', { id, disabled, ...(confirmLockout ? { confirm_lockout: true } : {}) },
+      { params: { deviceId }, ...GUARDED }),
+  disconnect: (deviceId: number, id: string, name: string, confirmManaged = false) =>
+    api.post<{ message: string }>('/tunnels/ppp/disconnect', { id, name, ...(confirmManaged ? { confirm_managed: true } : {}) },
+      { params: { deviceId } }),
 };
 
 /** Netinstall from RouterOS devices (#310). */

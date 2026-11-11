@@ -48,7 +48,7 @@ applied; the rest are protected by auto-revert alone.
 | Addressing | IP address add, remove | Yes |
 | VLAN interfaces | add, edit, enable/disable, remove | Yes; an MTU change is flagged when the interface carries management |
 | Routing | static route add, remove | Yes |
-| Routing | OSPF, BGP, routing tables, route filters | No |
+| Routing | routing rules, OSPF, BGP, routing tables, route filters | No |
 | Bonding | create, edit, delete | Flagged when a member or the bond carries management |
 | Services | management service enable/disable | Yes |
 | NAT | add, edit, move, delete | No |
@@ -363,7 +363,7 @@ The review is available on:
 - **VLANs:** add and edit.
 - **Ports:** the port editor (link settings and VLAN role).
 - **IP addresses and routes.**
-- **Routing:** OSPF instances and areas, BGP connections, route filters, routing tables.
+- **Routing:** routing rules, OSPF instances and areas, BGP connections, route filters, routing tables.
 - **Firewall:** filter and NAT rules, and address lists.
 - **Bandwidth queues.**
 - **DHCP:** servers, pools and static leases.
@@ -421,6 +421,7 @@ device-mode can only be changed at the device. Their advice is unchanged.
 | Routing between VLANs on the CPU of a switch chip that can do it in hardware | Inter-VLAN traffic runs at a fraction of the ports' speed; see [Routing between VLANs in hardware](devices.md#routing-between-vlans-in-hardware) |
 | MTU above L2MTU | Large frames dropped without error |
 | Duplicate address on two interfaces | Only one can answer; which is not stated by the config |
+| Firewall differs from its [zones](devices.md#zones) | A rule was added, changed or removed outside MTM, so the table no longer does what the matrix says |
 | Ingress port would reject the frames management arrives in | `admit-only-vlan-tagged` on a port carrying untagged management drops it at ingress, while every VLAN row still lists the port |
 | Spanning tree off on a bridge with several active ports | Nothing stops a loop; the second cable someone plugs in becomes a broadcast storm |
 | Bridge running classic STP rather than RSTP | Convergence takes tens of seconds where RSTP takes under one |

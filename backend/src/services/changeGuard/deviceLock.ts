@@ -25,6 +25,8 @@ const WRITE_LOCK_TTL_SEC = 600;
 const REDIS_TIMEOUT_MS = 2_000;
 
 const held = new AsyncLocalStorage<Map<number, string>>();
+/** Locks handed to work that carries on after its request has been answered. */
+const detached = new Set<string>();
 
 /** The token this request holds for `deviceId`, if it holds that device's lock. */
 export function heldLockToken(deviceId: number): string | undefined {
@@ -87,7 +89,7 @@ export function deviceWriteLock(getDeviceId: (req: Request) => number | null) {
 
     let released = false;
     const release = (): void => {
-      if (released) return;
+      if (released || detached.has(token)) return;
       released = true;
       withTimeout(redis.eval(RELEASE_IF_OWNER, 1, key, token)).catch(() => {});
     };
@@ -101,6 +103,25 @@ export function deviceWriteLock(getDeviceId: (req: Request) => number | null) {
 }
 
 /**
+ * Keep this request's lock on `deviceId` after the request is answered, for
+ * work that carries on in the background (#417). The returned function
+ * releases it and must be called when that work ends; the lock's TTL is the
+ * backstop. A request that holds no lock (Redis was unavailable) gets a no-op.
+ */
+export function detachHeldLock(deviceId: number): () => void {
+  const token = heldLockToken(deviceId);
+  if (!token) return () => {};
+  detached.add(token);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    detached.delete(token);
+    withTimeout(redis.eval(RELEASE_IF_OWNER, 1, deviceLockKey(deviceId), token)).catch(() => {});
+  };
+}
+
+/**
  * Device write routes that don't need the lock: they change only the manager's
  * own records, or only read from the device.
  */
@@ -109,6 +130,7 @@ const UNLOCKED_DEVICE_ROUTES: RegExp[] = [
   /^\/\d+\/(location|monitoring)\/?$/,
   /^\/\d+\/(preflight|sync|test|ap-scan|check-update|check-routerboard)\/?$/,
   /^\/\d+\/(config-health\/scan|change-guard\/(check|probe)|ssh-key\/verify)\/?$/,
+  /^\/\d+\/firewall\/zones\/plan\/?$/, // what applying zones would do: reads only
   /^\/\d+\/identity\//, // trusting a changed certificate or host key: manager records only
   /^\/\d+\/tools\//,
   /^\/\d+\/spectral-scan\//,
