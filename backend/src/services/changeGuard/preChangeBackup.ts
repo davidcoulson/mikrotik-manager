@@ -45,10 +45,16 @@ export async function backupBeforeChange(deviceId: number, kind: string, summary
 
     // Loaded lazily: BackupService itself imports ChangeGuard.
     const { BackupService } = await import('../BackupService');
+    const svc = new BackupService();
     let timer: NodeJS.Timeout | undefined;
+    let expired = false;
     await Promise.race([
-      new BackupService().createBackup(device, `Before change: ${summary}`, 'pre-change'),
-      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('timed out')), BUDGET_MS); }),
+      (async () => {
+        const { text, containsSecrets } = await svc.exportConfig(device, { includeSecrets: await svc.includeSecretsSetting(device.id) });
+        // Past the budget the change is already running; a late export would be a misleading restore point.
+        if (!expired) await svc.createBackupFromContent(device, text, `Before change: ${summary}`, 'pre-change', containsSecrets);
+      })(),
+      new Promise((_, rej) => { timer = setTimeout(() => { expired = true; rej(new Error('timed out')); }, BUDGET_MS); }),
     ]).finally(() => clearTimeout(timer));
   } catch (e) {
     console.warn(`[ChangeGuard] Pre-change backup skipped for device ${deviceId}: ${(e as Error).message}`);
