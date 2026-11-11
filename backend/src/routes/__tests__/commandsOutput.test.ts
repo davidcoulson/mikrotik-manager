@@ -2,6 +2,7 @@ jest.mock('../../config/database');
 jest.mock('../../config/redis', () => ({ redis: {} }));
 jest.mock('../../services/CommandRunner', () => ({ commandRunner: { start: jest.fn(), cancel: jest.fn() } }));
 jest.mock('../../middleware/auth', () => ({
+  ...jest.requireActual('../../middleware/auth'),
   requireAuth: (_q: unknown, _s: unknown, next: () => void) => next(),
   requireWrite: (_q: unknown, _s: unknown, next: () => void) => next(),
   isSiteScoped: (u?: { siteRoles?: unknown }) => !!u?.siteRoles,
