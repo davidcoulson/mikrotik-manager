@@ -178,10 +178,10 @@ function WebhooksSection() {
           <input className="input font-mono text-sm" value={form.secret} onChange={e => setForm(f => ({ ...f, secret: e.target.value }))} placeholder="Signing secret (optional, recommended)" />
           <div className="flex flex-wrap gap-1.5">
             {events.map(e => (
-              <button key={e} onClick={() => toggleEvent(e)}
-                className={clsx('text-xs px-2 py-1 rounded-md border transition-colors',
-                  form.events.has(e) ? 'bg-violet-100 dark:bg-violet-900/30 border-violet-300 dark:border-violet-700 text-violet-700 dark:text-violet-300' : 'border-gray-200 dark:border-slate-600 text-gray-500 dark:text-slate-400 hover:bg-gray-50 dark:hover:bg-slate-700')}>
-                {EVENT_LABEL[e] || e}
+              <button key={e} onClick={() => toggleEvent(e)} aria-pressed={form.events.has(e)}
+                className={clsx('text-xs px-2 py-1 rounded-md border transition-colors inline-flex items-center gap-1',
+                  form.events.has(e) ? 'bg-violet-600 border-violet-600 text-white font-medium' : 'border-gray-200 dark:border-slate-600 text-gray-500 dark:text-slate-400 hover:bg-gray-50 dark:hover:bg-slate-700')}>
+                {form.events.has(e) && <Check className="w-3 h-3" />}{EVENT_LABEL[e] || e}
               </button>
             ))}
           </div>
