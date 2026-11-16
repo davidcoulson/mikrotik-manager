@@ -41,7 +41,7 @@ const EMPTY_FORM: FormState = {
   ssh_port: '22',
   notes: '',
   clear_ssh_password: false,
-  allow_operator_use: true,
+  allow_operator_use: false,
   site_id: '',
 };
 

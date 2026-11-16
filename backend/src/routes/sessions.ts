@@ -152,7 +152,7 @@ router.get('/', async (req, res) => {
 
 // PUT /api/sessions/devices/:id — { enabled } turns the session log on or off for a device
 const deviceFromPath = (req: Request): number | null => {
-  const m = /^\/devices\/(\d+)\/?$/.exec(req.path);
+  const m = /^\/devices\/(\d+)\/?$/i.exec(req.path);
   return m ? Number(m[1]) : null;
 };
 router.put('/devices/:id', deviceSiteAccess(deviceFromPath), requireWrite, async (req, res) => {

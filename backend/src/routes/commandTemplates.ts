@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { query, queryOne } from '../config/database';
-import { requireAuth, requireWrite, fleetOnly } from '../middleware/auth';
+import { requireAuth, requireWrite, requireAdmin, fleetOnly } from '../middleware/auth';
 import { strictId } from '../utils/siteAccess';
 import { DeviceCollector, type DeviceRow } from '../services/mikrotik/DeviceCollector';
 import { captureCommands, CAPTURE_SECTIONS, CAPTURE_LABELS, type CaptureSection } from '../utils/templateCapture';
@@ -84,7 +84,7 @@ router.get('/capture', requireWrite, fleetOnly, async (req, res) => {
   });
 });
 
-router.post('/', requireWrite, fleetOnly, async (req, res) => {
+router.post('/', requireAdmin, async (req, res) => {
   const v = validate(req.body ?? {}, false);
   if (v.error) return res.status(400).json({ error: v.error });
   try {
@@ -100,7 +100,7 @@ router.post('/', requireWrite, fleetOnly, async (req, res) => {
   }
 });
 
-router.put('/:id', requireWrite, fleetOnly, async (req, res) => {
+router.put('/:id', requireAdmin, async (req, res) => {
   const v = validate(req.body ?? {}, true);
   if (v.error) return res.status(400).json({ error: v.error });
   const sets: string[] = [];
@@ -121,7 +121,7 @@ router.put('/:id', requireWrite, fleetOnly, async (req, res) => {
   }
 });
 
-router.delete('/:id', requireWrite, fleetOnly, async (req, res) => {
+router.delete('/:id', requireAdmin, async (req, res) => {
   const rows = await query(`DELETE FROM command_templates WHERE id = $1 RETURNING id`, [req.params.id]);
   if (!rows.length) return res.status(404).json({ error: 'Template not found' });
   return res.json({ ok: true });

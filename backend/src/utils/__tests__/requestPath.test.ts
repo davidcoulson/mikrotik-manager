@@ -12,6 +12,11 @@ describe('decodedPath', () => {
     expect(decodedPath(req('/%31%32/system-config'))).toBe('/12/system-config');
     expect(decodedPath(req('/12/ports/ether1'))).toBe('/12/ports/ether1');
   });
+  it('reads the spellings Express also routes the same: other case, trailing slash', () => {
+    expect(decodedPath(req('/ROLLOUTS/42/Start'))).toBe('/rollouts/42/start');
+    expect(decodedPath(req('/channel/'))).toBe('/channel');
+    expect(decodedPath(req('/'))).toBe('/');
+  });
   it('returns null for a path that cannot be decoded', () => {
     expect(decodedPath(req('/%E0%A4%A/x'))).toBeNull();
   });

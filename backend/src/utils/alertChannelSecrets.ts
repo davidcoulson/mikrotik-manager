@@ -32,7 +32,7 @@ export function maskConfig(type: string, config: Record<string, unknown>): Recor
  * server they run, keep the masked token, press Test, and receive the token.
  */
 const DESTINATION_KEYS: Record<string, string[]> = {
-  email:  ['smtp_host', 'smtp_port'],
+  email:  ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_tls_verify'],
   ntfy:   ['server_url'],
   gotify: ['server_url'],
 };
@@ -41,17 +41,32 @@ const DESTINATION_KEYS: Record<string, string[]> = {
  * When updating, a sensitive field sent back as the mask placeholder keeps its
  * saved value, unless the destination changed (see DESTINATION_KEYS).
  */
+/**
+ * A secret typed into a channel is plain text. One that already looks sealed was
+ * copied from somewhere else (another setting's ciphertext), and sending it
+ * would have the manager decrypt it for the sender.
+ */
+export function sealedSecretInput(type: string, incoming: Record<string, unknown>, existing: Record<string, unknown> = {}): boolean {
+  return (SENSITIVE_KEYS[type] ?? []).some((k) => {
+    const v = incoming[k];
+    return typeof v === 'string' && isSealed(v) && v !== existing[k];
+  });
+}
+
 export function mergeConfig(
   type: string,
   existing: Record<string, unknown>,
   incoming: Record<string, unknown>
 ): { merged: Record<string, unknown> } | { error: string } {
+  if (sealedSecretInput(type, incoming, existing)) return { error: 'Enter the password or token as plain text.' };
   const merged = { ...existing, ...incoming };
   const destinationChanged = (DESTINATION_KEYS[type] ?? []).some(
     (k) => k in incoming && String(incoming[k] ?? '') !== String(existing[k] ?? '')
   );
   for (const key of SENSITIVE_KEYS[type] ?? []) {
-    if (incoming[key] === '••••••••') {
+    // A secret left out of the request is kept just like a masked one, so it needs the same check.
+    const kept = !(key in incoming) || incoming[key] === '••••••••';
+    if (kept) {
       if (destinationChanged && existing[key]) {
         return { error: 'The server changed, so re-enter the password or token. A saved secret is only sent to the server it was saved for.' };
       }

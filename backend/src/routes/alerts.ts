@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { query } from '../config/database';
 import { requireAuth, requireWrite, fleetOnly } from '../middleware/auth';
 import { alertService } from '../services/AlertService';
-import { maskConfig, mergeConfig, sealConfig } from '../utils/alertChannelSecrets';
+import { maskConfig, mergeConfig, sealConfig, sealedSecretInput } from '../utils/alertChannelSecrets';
 
 const router = Router();
 
@@ -143,6 +143,8 @@ router.post('/channels', requireWrite, async (req, res) => {
   if (!validTypes.includes(type)) {
     return res.status(400).json({ error: `type must be one of: ${validTypes.join(', ')}` });
   }
+
+  if (sealedSecretInput(type, config)) return res.status(400).json({ error: 'Enter the password or token as plain text.' });
 
   const rows = await query(
     `INSERT INTO alert_channels (name, type, enabled, config)

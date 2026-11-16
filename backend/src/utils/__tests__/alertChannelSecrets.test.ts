@@ -22,6 +22,18 @@ describe('alert channel secrets', () => {
     expect('error' in e).toBe(true);
   });
 
+  it('refuses a new server when the secret field is left out altogether', () => {
+    const r = mergeConfig('ntfy', { server_url: 'https://ntfy.sh', token: 'old' }, { server_url: 'https://evil.example' });
+    expect('error' in r).toBe(true);
+    const e = mergeConfig('email', { smtp_host: 'mail.lan', smtp_pass: 'pw', smtp_tls_verify: true }, { smtp_tls_verify: false });
+    expect('error' in e).toBe(true);
+  });
+
+  it('refuses a token that is already someone else\'s ciphertext', () => {
+    const r = mergeConfig('gotify', { server_url: 'http://g.lan', app_token: 'enc:C:x' }, { app_token: 'enc:C:other' });
+    expect('error' in r).toBe(true);
+  });
+
   it('accepts a new server when the token is typed again', () => {
     const r = mergeConfig('ntfy', { server_url: 'https://ntfy.sh', token: 'old' }, { server_url: 'https://ntfy.lan', token: 'new' });
     expect(r).toEqual({ merged: { server_url: 'https://ntfy.lan', token: 'new' } });

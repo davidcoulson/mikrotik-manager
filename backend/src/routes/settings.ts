@@ -8,6 +8,7 @@ import { requireAuth, requireAdmin } from '../middleware/auth';
 import { netflowCollector } from '../services/netflow/NetflowCollector';
 import { validatePassword } from '../utils/passwordPolicy';
 import { OIDC_SETTINGS_KEY } from '../services/oidc/oidcConfig';
+import { AI_SETTINGS_KEY } from '../services/mcp/settings';
 import { isTimeFormat } from '../utils/timeFormat';
 
 const router = Router();
@@ -16,7 +17,7 @@ router.use(requireAuth);
 // Settings keys managed through their own dedicated (admin-only) endpoints and
 // never exposed via this generic surface — the OIDC config holds an encrypted
 // client secret and must only be read/written through /api/auth/oidc/config.
-const PROTECTED_SETTING_KEYS = new Set<string>([OIDC_SETTINGS_KEY]);
+const PROTECTED_SETTING_KEYS = new Set<string>([OIDC_SETTINGS_KEY, AI_SETTINGS_KEY]);
 
 // GET /api/settings
 router.get('/', async (_req, res) => {

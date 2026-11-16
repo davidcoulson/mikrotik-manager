@@ -151,7 +151,7 @@ router.post('/', presetMutationLimiter, async (req, res) => {
   const encApi = encrypt(api_password);
   const encSsh = ssh_password ? encrypt(ssh_password) : null;
 
-  const allowOp = allow_operator_use !== false;
+  const allowOp = allow_operator_use === true;
 
   const rows = await query<CredentialPresetRow>(
     `INSERT INTO credential_presets
