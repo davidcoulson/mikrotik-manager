@@ -10,6 +10,7 @@ import { useGuardedWrite, GuardedWriteUi } from '../ChangeGuardDialog';
 import ReviewChangesButton from '../common/ReviewChangesButton';
 import {
   ROUTER, pairKey, draftErrors, policySummary, initialDraft, addZone, removeZone, setPolicy, zoneNameError, customError, protocolName,
+  logsDrops, setLogsDrops,
 } from '../../utils/zones';
 
 const errMsg = (e: unknown) => (e as { response?: { data?: { error?: string } } })?.response?.data?.error || (e as Error)?.message || 'That didn’t work';
@@ -34,6 +35,8 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
   const current = draft ?? base;
   const editing = !!data && !!current && canWrite && (data.enabled || setup);
   const dirty = !!draft && JSON.stringify(draft) !== JSON.stringify(base);
+  const outdated = data?.outdated ?? [];
+  const pending = dirty || setup || !!data?.drift || outdated.length > 0;
 
   const localErrors = current ? draftErrors(current) : {};
   const clean = Object.keys(localErrors).length === 0;
@@ -41,7 +44,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
   const plan = useQuery({
     queryKey: ['zone-plan', deviceId, JSON.stringify(planBody)],
     queryFn: () => zonesApi.plan(deviceId, planBody!).then((r) => r.data),
-    enabled: editing && !!planBody && clean && (dirty || setup || !!data?.drift),
+    enabled: editing && !!planBody && clean && pending,
     placeholderData: keepPreviousData,
     retry: false,
   });
@@ -131,7 +134,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
           </label>
           <label className="flex items-center gap-1.5">
             <input type="checkbox" disabled={!editing} checked={d.config.logDrops} onChange={(e) => update({ ...d, config: { ...d.config, logDrops: e.target.checked } })} />
-            Log what&rsquo;s dropped (shows on Firewall Events)
+            Log what&rsquo;s dropped (shows on Firewall Logs)
           </label>
           {data.manager_ip && (
             <label className="flex items-center gap-1.5">
@@ -149,7 +152,11 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
           )}
         </div>
 
-        {editing && (dirty || setup || data.drift) && (
+        {!dirty && !data.drift && outdated.map((n) => (
+          <p key={n} className="text-xs text-blue-700 dark:text-blue-300 p-3 rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20">{n}</p>
+        ))}
+
+        {editing && pending && (
           <div className="space-y-2">
             {errors.eligibility && <p className="text-xs text-red-600 dark:text-red-400">{errors.eligibility}</p>}
             {errors.zones && <p className="text-xs text-red-600 dark:text-red-400">{errors.zones}</p>}
@@ -168,7 +175,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
         {editing && (
           <div className="flex items-center gap-2 flex-wrap">
             <button className="btn-primary text-xs py-1.5" onClick={apply}
-              disabled={applyMut.isPending || !clean || Object.keys(errors).length > 0 || (!dirty && !setup && !data.drift)}>
+              disabled={applyMut.isPending || !clean || Object.keys(errors).length > 0 || !pending}>
               {applyMut.isPending ? 'Applying…' : setup ? 'Turn on zones' : 'Apply'}
             </button>
             <ReviewChangesButton className="text-xs py-1.5" deviceName={deviceName} applyLabel={setup ? 'Turn on zones' : 'Apply'} onApply={apply}
@@ -246,6 +253,13 @@ function ZoneList({ data, draft, errors, editable, onChange }: {
                 </p>
               )}
             </div>
+            {draft.config.logDrops && (
+              <label className="flex items-center gap-1 text-[11px] text-gray-500 dark:text-slate-400 shrink-0 pt-0.5"
+                title={`Log what's dropped coming from ${z}. Untick for a zone the internet knocks on all day, to keep Firewall Logs readable.`}>
+                <input type="checkbox" disabled={!editable} checked={logsDrops(draft, z)} onChange={(e) => onChange(setLogsDrops(draft, z, e.target.checked))} />
+                Log drops
+              </label>
+            )}
             {editable && (
               <button className="p-1 text-gray-400 hover:text-red-500" title={`Remove the ${z} zone. The interface list stays on the device.`} onClick={() => onChange(removeZone(draft, z))}>
                 <Trash2 className="w-3.5 h-3.5" />

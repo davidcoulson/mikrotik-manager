@@ -39,7 +39,7 @@ import { messagesFrom, SMS_ID } from '../utils/lteSms';
 import { readRules, analyseRules, routesByTable, parseRuleInput } from '../utils/routingRules';
 import { tagOf, withTag, tagsIn, tagParams, planTags } from '../utils/ruleTags';
 import {
-  parseZoneInput, compileZones, planApply, planMembers, zoneEligibility, zoneDrift, unzoned, pairKey, zoneHosts, planHostLists, interfaceZones,
+  parseZoneInput, compileZones, planApply, planMembers, zoneEligibility, zoneDrift, zoneRulesOutdated, unzoned, pairKey, zoneHosts, planHostLists, interfaceZones,
   ROUTER, BUILTIN_LISTS, FORWARD_SERVICES, ROUTER_SERVICES, type ZoneConfig, type CompiledRule,
 } from '../utils/zoneFirewall';
 import { previewContext } from '../utils/previewContext';
@@ -1405,7 +1405,8 @@ function zonePlan(body: unknown, live: ZoneLiveContext, managerIp: string | null
   if (!input.config.zones.some((z) => input.config.policies[pairKey(z, ROUTER)])) {
     warnings.push('No zone can reach the router. Only the manager and replies to the router\'s own connections get in.');
   }
-  const desired = compileZones(input.config, { services: live.services, rosMajor: live.rosMajor, fasttrackHwOffload: live.fasttrackHwOffload, managerIp });
+  const hasLoopback = live.interfaces.some((i) => i.name === 'lo' && i.type === 'loopback');
+  const desired = compileZones(input.config, { services: live.services, rosMajor: live.rosMajor, fasttrackHwOffload: live.fasttrackHwOffload, managerIp, hasLoopback });
   return { input, errors, warnings, desired };
 }
 
@@ -1443,6 +1444,7 @@ router.get('/:id/firewall/zones', async (req, res) => {
       })),
       manager_ip: managerIp,
       drift: row?.enabled ? zoneDrift(live.filter, row.desired) : null,
+      outdated: row?.enabled ? zoneRulesOutdated(row.desired, live.interfaces.some((i) => i.name === 'lo' && i.type === 'loopback')) : [],
       services: { forward: Object.entries(FORWARD_SERVICES).map(([key, s]) => ({ key, label: s.label })), router: Object.entries(ROUTER_SERVICES).map(([key, s]) => ({ key, label: s.label })) },
     });
   } finally {

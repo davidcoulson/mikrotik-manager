@@ -77,6 +77,20 @@ still within the firewall log retention are there to find), and a link can
 open it with `?range=1h|24h|7d|30d`. Results can be filtered by device, action,
 protocol, or text such as an address, port, interface, or log prefix.
 
+**All rules** narrows the page to one rule's lines. It lists the log prefixes that logged in
+the period, each with its device and how many lines it wrote, busiest first; with a device
+picked, a tagged rule is named by its comment. The match is on the whole prefix, so
+`PERMIT-ZT` doesn't also bring in `PERMIT-ZT-ADMIN` the way the search box does. Picking a rule
+picks its device as well, and a link can open it with `?device=ID&rule=<prefix>`. Lines logged
+without a prefix aren't listed: nothing tells their rules apart.
+
+**Hide rules** does the opposite: it leaves the checked rules out and shows everything else,
+which is how to read the page without the internet scans a drop rule logs all day. Each hidden
+rule is one prefix on one device, matched whole like **All rules**, in both views; lines logged
+without a prefix are never hidden. Up to 20 rules can be hidden. The choice is kept in the
+browser, and a hidden rule that didn't log in the period stays in the list so it can be shown
+again. The API takes it as `?hide=<deviceId>|<prefix>`, repeated.
+
 ## Enabling firewall monitoring
 
 Users with write access can select **Configure monitoring** on the Firewall

@@ -23,6 +23,7 @@ import type { Device, DeviceEvent } from '../types';
 import { fleetStatus } from '../utils/fleetStatus';
 import { fleetActionSummary, type FleetActionSummary } from '../utils/fleetAction';
 import { escapeHtml } from '../utils/escapeHtml';
+import { siteMapView } from '../utils/siteMapView';
 import DeviceTypePill from '../components/devices/DeviceTypePill';
 import { byAttention, CARD_ROWS } from '../utils/deviceCards';
 import { filterDevices } from '../utils/devicePicker';
@@ -112,15 +113,12 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
     devices.filter(d => d.effective_location?.lat != null && d.effective_location?.lng != null),
     [devices]
   );
-  // When every device on the map is in one site with a zoom of its own (#362),
-  // the map opens at that zoom instead of fitting the devices.
+  // When the devices on the map that have a site are all in one, and it has a
+  // zoom of its own (#362), the map opens at that zoom, on the site's pin when
+  // it has one, instead of fitting the devices. Devices without a site don't
+  // stop it (Ron: a pin and a zoom should show wherever the site's devices do).
   const { data: sites = [] } = useQuery({ queryKey: ['sites'], queryFn: () => sitesApi.list().then((r) => r.data), staleTime: 300_000 });
-  const siteZoom = useMemo(() => {
-    const ids = new Set(mapped.map((d) => d.site_id ?? null));
-    if (ids.size !== 1) return null;
-    const site = sites.find((s) => s.id === [...ids][0]);
-    return site?.map_zoom ?? null;
-  }, [mapped, sites]);
+  const siteView = useMemo(() => siteMapView(mapped, sites), [mapped, sites]);
 
   useEffect(() => {
     if (!containerRef.current || mapped.length === 0) return;
@@ -175,15 +173,15 @@ function DeviceLocationsMap({ devices }: { devices: Device[] }) {
       markers.push(marker);
     });
 
-    if (siteZoom != null) {
-      map.setView(L.featureGroup(markers).getBounds().getCenter(), siteZoom);
+    if (siteView) {
+      map.setView(siteView.center ?? L.featureGroup(markers).getBounds().getCenter(), siteView.zoom);
     } else if (markers.length === 1) {
       map.setView([Number(mapped[0].effective_location!.lat), Number(mapped[0].effective_location!.lng)], 13);
     } else {
       map.fitBounds(L.featureGroup(markers).getBounds(), { padding: [40, 40] });
     }
     return () => { map.remove(); };
-  }, [mapped, siteZoom]);
+  }, [mapped, siteView]);
 
   if (mapped.length === 0) {
     return (
@@ -1097,16 +1095,23 @@ function OperationsView({
                 <span>Device</span>{!capacityNarrow && <span>CPU 24h</span>}<span>CPU now</span><span className="text-right">Mem</span>
               </div>
               {shownCapacity.map((c) => (
-                <button key={c.id} onClick={() => navigate(`/devices/${c.id}`)}
-                  title={`${c.name}${c.cpu_peak_24h != null ? ` · 24h CPU peak ${c.cpu_peak_24h}%` : ''}`}
+                // The name opens the device; a metric opens its graph (Ron, #448).
+                <div key={c.id}
                   className="w-full text-left grid items-center gap-x-3 py-[5px] group"
                   style={{ gridTemplateColumns: CAPACITY_GRID }}>
-                  <div className="min-w-0">
-                    <div className="text-[12.5px] font-medium truncate" style={{ color: 'var(--ink)' }}>{shortName(c.name, capacityPrefix)}</div>
+                  <button type="button" onClick={() => navigate(`/devices/${c.id}`)} title={c.name} className="min-w-0 text-left">
+                    <div className="text-[12.5px] font-medium truncate hover:underline" style={{ color: 'var(--ink)' }}>{shortName(c.name, capacityPrefix)}</div>
                     {c.model && <div className="text-[10.5px] truncate" style={{ color: 'var(--ink-4)' }}>{c.model}</div>}
-                  </div>
-                  {!capacityNarrow && <CpuTrend points={c.cpu_series} />}
-                  <div className="flex items-center gap-1.5">
+                  </button>
+                  {!capacityNarrow && (
+                    <button type="button" onClick={() => navigate(`/devices/${c.id}?tab=graphs&graph=cpu`)}
+                      title={`CPU graph${c.cpu_peak_24h != null ? ` · 24h peak ${c.cpu_peak_24h}%` : ''}`} className="min-w-0">
+                      <CpuTrend points={c.cpu_series} />
+                    </button>
+                  )}
+                  <button type="button" onClick={() => navigate(`/devices/${c.id}?tab=graphs&graph=cpu`)}
+                    title={`CPU graph${c.cpu_peak_24h != null ? ` · 24h peak ${c.cpu_peak_24h}%` : ''}`}
+                    className="flex items-center gap-1.5">
                     <div className="relative flex-1 h-1.5 rounded-full" style={{ background: 'var(--surface-3)' }}>
                       <div className="h-full rounded-full" style={{ width: `${Math.min(100, c.cpu)}%`, background: loadColor(c.cpu) }} />
                       {c.cpu_peak_24h != null && c.cpu_peak_24h > c.cpu && (
@@ -1115,10 +1120,11 @@ function OperationsView({
                       )}
                     </div>
                     <span className="mono text-[11px] font-semibold num-tab text-right" style={{ color: loadText(c.cpu), width: 30 }}>{c.cpu}%</span>
-                  </div>
-                  <span className="mono text-[11px] num-tab text-right" style={{ color: memText(c.mem_pct) }}
-                    title={memHint(c)}>{c.mem_pct}%</span>
-                </button>
+                  </button>
+                  <button type="button" onClick={() => navigate(`/devices/${c.id}?tab=graphs&graph=memory`)}
+                    className="mono text-[11px] num-tab text-right" style={{ color: memText(c.mem_pct) }}
+                    title={[memHint(c), 'Memory graph'].filter(Boolean).join(' · ')}>{c.mem_pct}%</button>
+                </div>
               ))}
               {sortedCapacity.length > CAPACITY_ROWS && (
                 <div className="pt-2 text-[11.5px] flex items-center gap-2" style={{ color: 'var(--ink-3)' }}>

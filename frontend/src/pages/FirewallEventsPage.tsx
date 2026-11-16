@@ -10,7 +10,8 @@ import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import clsx from 'clsx';
 
 import { devicesApi, eventsApi } from '../services/api';
-import type { FirewallEvent, FirewallGroup } from '../services/api';
+import type { FirewallEvent, FirewallGroup, FirewallRuleOption } from '../services/api';
+import HideRulesPicker, { HIDE_MAX, ruleKey } from '../components/firewall/HideRulesPicker';
 import DevicePicker from '../components/common/DevicePicker';
 import { useSocket } from '../hooks/useSocket';
 import { useCanWrite } from '../hooks/useCanWrite';
@@ -26,6 +27,8 @@ const RANGES: Record<string, { label: string; ms: number }> = {
   '30d': { label: 'Last 30 days', ms: 30 * 24 * 60 * 60 * 1000 },
 };
 const DEFAULT_RANGE = '24h';
+/** How often the rule filter's choices are counted again. */
+const RULES_REFRESH_MS = 5 * 60_000;
 
 function actionClass(action: FirewallEvent['action']): string {
   switch (action) {
@@ -49,6 +52,15 @@ function endpoint(ip: string, port?: number): string {
 type LogView = 'grouped' | 'raw';
 const VIEW_KEY = 'firewall-logs:view';
 const NAMES_KEY = 'firewall-logs:names';
+const HIDE_KEY = 'firewall-logs:hidden-rules';
+
+/** The rules hidden in this browser, as `<deviceId>|<prefix>` keys. */
+function readHidden(): string[] {
+  try {
+    const v: unknown = JSON.parse(readPref(HIDE_KEY) ?? '[]');
+    return Array.isArray(v) ? v.filter((k): k is string => typeof k === 'string' && /^\d+\|./.test(k)).slice(0, HIDE_MAX) : [];
+  } catch { return []; }
+}
 
 function readPref(key: string): string | null {
   try { return localStorage.getItem(key); } catch { return null; }
@@ -122,6 +134,11 @@ export default function FirewallEventsPage() {
   const [deviceId, setDeviceId] = useState(() => (/^\d+$/.test(urlParams.get('device') ?? '') ? urlParams.get('device')! : ''));
   const [action, setAction] = useState('');
   const [protocol, setProtocol] = useState('');
+  // One rule's lines, by its whole log prefix (on the selected device).
+  const [rule, setRule] = useState(() => urlParams.get('rule') ?? '');
+  // Every rule but these (the internet scans, say); kept in this browser.
+  const [hidden, setHiddenState] = useState(readHidden);
+  const setHidden = (v: string[]) => { setHiddenState(v); setPage(0); writePref(HIDE_KEY, JSON.stringify(v)); };
   // ?range=7d lets a link open a longer window; anything else means the default.
   const [range, setRange] = useState(() => {
     const r = urlParams.get('range') ?? DEFAULT_RANGE;
@@ -147,7 +164,7 @@ export default function FirewallEventsPage() {
   const { data, isLoading, isFetching, dataUpdatedAt, refetch } = useQuery({
     queryKey: [
       'firewall-events',
-      { search: debouncedSearch, deviceId, action, protocol, range, page, view, names },
+      { search: debouncedSearch, deviceId, action, protocol, rule, hidden, range, page, view, names },
     ],
     queryFn: async (): Promise<{ events: FirewallEvent[]; groups: FirewallGroup[]; total: number; scanLimit?: number }> => {
       const params = {
@@ -158,6 +175,8 @@ export default function FirewallEventsPage() {
           ? (action as FirewallEvent['action'])
           : undefined,
         protocol: protocol || undefined,
+        prefix: rule || undefined,
+        hide: hidden.length ? hidden : undefined,
         limit: PAGE_SIZE,
         offset: page * PAGE_SIZE,
         names: names ? (1 as const) : undefined,
@@ -172,6 +191,55 @@ export default function FirewallEventsPage() {
     placeholderData: keepPreviousData,
     refetchInterval: 30_000,
   });
+  // The rule filter's choices: what logged in the period, per device.
+  const { data: ruleOptions = [] } = useQuery({
+    queryKey: ['firewall-rules', { deviceId, range }],
+    queryFn: () =>
+      eventsApi
+        .firewallRules({
+          deviceId: deviceId ? Number(deviceId) : undefined,
+          since: new Date(Date.now() - RANGES[range].ms).toISOString(),
+        })
+        .then((r) => r.data.rules),
+    // Counted over the whole period, which on 30 days is every line kept:
+    // the list of rules changes slowly, so it's read every five minutes.
+    staleTime: RULES_REFRESH_MS,
+    refetchInterval: RULES_REFRESH_MS,
+  });
+  // With one device picked, its rules' comments name the choices.
+  const { data: deviceRules = [] } = useQuery({
+    queryKey: ['firewall', Number(deviceId)],
+    queryFn: () => devicesApi.getFirewall(Number(deviceId)).then((r) => r.data),
+    enabled: !!deviceId,
+    staleTime: 60_000,
+    retry: false,
+  });
+  const commentByTag = new Map<string, string>();
+  for (const r of deviceRules) {
+    const t = tagOf(r['log-prefix']);
+    if (t && r.comment) commentByTag.set(t, r.comment);
+  }
+  const ruleName = (o: FirewallRuleOption) => {
+    const base = o.prefix.replace(/(?:^|\s)mtm#[0-9a-z]{4}(?=\s|$)/i, ' ').trim();
+    const comment = o.tag ? commentByTag.get(o.tag) : undefined;
+    return comment ? (base ? `${comment} (${base})` : comment) : (base || `mtm#${o.tag}`);
+  };
+  // Two monitored rules with the same action and no comment to hand (across
+  // all devices) read the same; their tags tell them apart (#443).
+  const nameCount = new Map<string, number>();
+  for (const o of ruleOptions) {
+    const k = `${o.deviceId}|${ruleName(o)}`;
+    nameCount.set(k, (nameCount.get(k) ?? 0) + 1);
+  }
+  const ruleLabel = (o: FirewallRuleOption) => {
+    const name = ruleName(o);
+    const clash = o.tag && (nameCount.get(`${o.deviceId}|${name}`) ?? 0) > 1 && !name.includes(`mtm#${o.tag}`);
+    return `${name}${clash ? ` mtm#${o.tag}` : ''}${deviceId ? '' : ` · ${o.deviceName ?? 'unknown device'}`} — ${o.count.toLocaleString()}`;
+  };
+  // A rule without a prefix can't be told apart from another; leave it out.
+  const ruleChoices = ruleOptions.filter((o) => o.prefix !== '' && o.deviceId != null);
+  const ruleValue = rule ? `${deviceId}|${rule}` : '';
+
   // Refresh asks the devices for their logs now, then reads again as they land.
   const { refresh, refreshing } = useFleetRefresh(['logs'], refetch);
 
@@ -349,6 +417,44 @@ export default function FirewallEventsPage() {
         </select>
 
         <select
+          className="input w-full sm:w-56"
+          aria-label="Rule"
+          title="Lines from one rule, by its log prefix"
+          value={ruleValue}
+          onChange={(e) => {
+            const v = e.target.value;
+            if (!v) {
+              setRule('');
+            } else {
+              // A rule belongs to a device: picking one picks its device too.
+              const cut = v.indexOf('|');
+              setDeviceId(v.slice(0, cut));
+              setRule(v.slice(cut + 1));
+            }
+            setPage(0);
+          }}
+        >
+          <option value="">All rules</option>
+          {rule && !ruleChoices.some((o) => ruleKey(o) === ruleValue) && (
+            <option value={ruleValue}>{rule}</option>
+          )}
+          {ruleChoices.map((o) => (
+            <option key={ruleKey(o)} value={ruleKey(o)}>
+              {ruleLabel(o)}
+            </option>
+          ))}
+        </select>
+
+        <HideRulesPicker
+          choices={ruleChoices}
+          hidden={hidden}
+          onChange={setHidden}
+          label={ruleLabel}
+          deviceId={deviceId}
+          deviceName={(id) => devices.find((d) => d.id === id)?.name}
+        />
+
+        <select
           className="input w-full sm:w-40"
           aria-label="Period"
           value={range}
@@ -370,6 +476,8 @@ export default function FirewallEventsPage() {
           value={deviceId ? Number(deviceId) : null}
           onChange={(id) => {
             setDeviceId(id == null ? '' : String(id));
+            // A rule is one device's; another device has its own.
+            setRule('');
             setPage(0);
           }}
         />
@@ -385,6 +493,11 @@ export default function FirewallEventsPage() {
           <p className="text-gray-500 dark:text-slate-400">
             No firewall events found
           </p>
+          {hidden.length > 0 && (
+            <button type="button" className="text-sm" style={{ color: 'var(--accent)' }} onClick={() => setHidden([])}>
+              {hidden.length} rule{hidden.length === 1 ? ' is' : 's are'} hidden — show all rules
+            </button>
+          )}
         </div>
       ) : view === 'grouped' ? (
         <div className="card overflow-hidden">

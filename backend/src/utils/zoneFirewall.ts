@@ -81,6 +81,11 @@ export interface ZoneConfig {
   fasttrack: boolean;
   logDrops: boolean;
   /**
+   * Zones whose drops aren't logged (#415), such as an untrusted zone the
+   * internet knocks on all day. Missing means every zone's drops are logged.
+   */
+  quietZones?: string[];
+  /**
    * What the manager's own address may reach on the router (#369): everything
    * (missing, as before), or only the ports the manager uses: the API, API-SSL
    * and SSH, on the ports /ip/service has.
@@ -97,6 +102,12 @@ export interface ZoneContext {
   managerIp: string | null;
   /** The device takes hw-offload on a FastTrack rule (some RouterOS 7 builds don't, #369). */
   fasttrackHwOffload?: boolean;
+  /**
+   * The device has the loopback interface, lo (RouterOS 7). Then all the
+   * router sends itself is accepted, not only to 127.0.0.1: a CAPsMAN's own
+   * CAP also broadcasts discovery on lo, which no zone holds (#369).
+   */
+  hasLoopback?: boolean;
 }
 
 // ─── Services ────────────────────────────────────────────────────────────────
@@ -363,8 +374,12 @@ export function parseZoneInput(body: unknown, live: ZoneLive): { input: ZoneInpu
     members[z] = list;
   }
 
+  const logDrops = c.logDrops !== false;
+  const quiet = Array.isArray(c.quietZones) ? zones.filter((z) => (c.quietZones as unknown[]).map(String).includes(z)) : [];
   const config: ZoneConfig = {
-    zones, intra, policies, fasttrack: c.fasttrack !== false, logDrops: c.logDrops !== false,
+    zones, intra, policies, fasttrack: c.fasttrack !== false, logDrops,
+    // Only written when chosen, and only matters while drops are logged.
+    ...(logDrops && quiet.length ? { quietZones: quiet } : {}),
     // Only written when chosen, so a setup saved before the choice existed is unchanged.
     ...(c.managerAccess === 'management' ? { managerAccess: 'management' as const } : {}),
   };
@@ -419,6 +434,12 @@ function serviceRules(key: string, p: ZonePolicy, to: string, ctx: ZoneContext):
   return out;
 }
 
+/**
+ * Logged drops per second, then a burst (#369): 5 a second, bursts of 10.
+ * Written the way RouterOS prints it back, so the rule compares equal.
+ */
+export const DROP_LOG_LIMIT = '5,10';
+
 /** The whole IPv4 filter table for a zone config, in order. */
 export function compileZones(config: ZoneConfig, ctx: ZoneContext): CompiledRule[] {
   const rules: CompiledRule[] = [];
@@ -427,12 +448,26 @@ export function compileZones(config: ZoneConfig, ctx: ZoneContext): CompiledRule
     const p = config.policies[pairKey(from, to)];
     return p && p.action !== 'deny' ? p : null;
   };
-  const dropLog = (where: string): Ros => (config.logDrops ? { log: 'yes', 'log-prefix': `zone drop ${where}` } : {});
+  // A quiet zone's drops go before the logged drop, unlogged (#415).
+  const quiet = config.logDrops ? (config.quietZones ?? []).filter((z) => config.zones.includes(z)) : [];
+  // The end of a chain. A logged drop logs at most DROP_LOG_LIMIT and lets
+  // the rest fall through to an unlogged drop: logging every packet of a scan
+  // or a flood rebooted a hAP ac2 (#369).
+  const finalDrop = (chain: 'input' | 'forward', where: string, description: string) => {
+    for (const z of quiet) add({ chain, action: 'drop', 'in-interface-list': z }, `drop the rest from ${z}${chain === 'input' ? ' to the router' : ''}, not logged`, true);
+    if (!config.logDrops) {
+      add({ chain, action: 'drop' }, description, true);
+      return;
+    }
+    add({ chain, action: 'drop', limit: DROP_LOG_LIMIT, log: 'yes', 'log-prefix': `zone drop ${where}` }, `${description}, logging ${DROP_LOG_LIMIT.split(',')[0]} a second`, true);
+    add({ chain, action: 'drop' }, `${description}, past the log limit`, true);
+  };
 
   // Input: the router itself.
   add({ chain: 'input', action: 'accept', 'connection-state': 'established,related,untracked' }, 'accept established, related, untracked to the router');
   add({ chain: 'input', action: 'drop', 'connection-state': 'invalid' }, 'drop invalid to the router');
-  add({ chain: 'input', action: 'accept', 'dst-address': '127.0.0.1' }, 'accept loopback (CAPsMAN)');
+  if (ctx.hasLoopback) add({ chain: 'input', action: 'accept', 'in-interface': 'lo' }, 'accept from the router itself (loopback, CAPsMAN)');
+  else add({ chain: 'input', action: 'accept', 'dst-address': '127.0.0.1' }, 'accept loopback (CAPsMAN)');
   if (ctx.managerIp && config.managerAccess === 'management') {
     // All the manager connects to: the API (8728 or 8729) and SSH (terminal,
     // SSH-only devices, keys). It doesn't ping or poll SNMP.
@@ -444,7 +479,7 @@ export function compileZones(config: ZoneConfig, ctx: ZoneContext): CompiledRule
   for (const z of config.zones) {
     if (open(z, ROUTER)) add({ chain: 'input', action: 'jump', 'jump-target': pairChain(z, ROUTER), 'in-interface-list': z }, `${z} to router`);
   }
-  add({ chain: 'input', action: 'drop', ...dropLog('in') }, 'drop everything else to the router', true);
+  finalDrop('input', 'in', 'drop everything else to the router');
 
   // Forward: between zones.
   if (config.fasttrack) {
@@ -462,7 +497,7 @@ export function compileZones(config: ZoneConfig, ctx: ZoneContext): CompiledRule
       }
     }
   }
-  add({ chain: 'forward', action: 'drop', ...dropLog('fwd') }, 'drop everything else between zones', true);
+  finalDrop('forward', 'fwd', 'drop everything else between zones');
 
   // Each open pair's chain: its accepts, then back to where it came from.
   for (const from of config.zones) {
@@ -608,6 +643,22 @@ export function unzoned(addresses: Ros[], members: Record<string, string[]>): st
 // ─── Drift ───────────────────────────────────────────────────────────────────
 
 export interface ZoneDrift { missing: string[]; extra: string[] }
+
+/**
+ * Rules applied before MTM changed how it writes them, so an Apply with
+ * nothing edited still brings them up to date. Today: logged final drops
+ * from before the log limit (#369).
+ */
+export function zoneRulesOutdated(desired: CompiledRule[] | null | undefined, hasLoopback = false): string[] {
+  const out: string[] = [];
+  const unlimited = (desired ?? []).some((r) => r.params.action === 'drop' && r.params.log === 'yes'
+    && (r.params['log-prefix'] ?? '').startsWith('zone drop') && !r.params.limit);
+  if (unlimited) out.push(`Dropped traffic is now logged at most ${DROP_LOG_LIMIT.split(',')[0]} times a second, so a flood or a scan can't overload the router. Apply to update the final drops.`);
+  const onlyLocalhost = hasLoopback && (desired ?? []).some((r) => r.params.chain === 'input' && r.params.action === 'accept'
+    && r.params['dst-address'] === '127.0.0.1' && !r.params['in-interface']);
+  if (onlyLocalhost) out.push('All the router sends itself is now accepted, not only to 127.0.0.1, so a CAPsMAN\'s own CAP isn\'t dropped. Apply to update the loopback rule.');
+  return out;
+}
 
 /** What differs between the device and the last apply. Null when they match. */
 export function zoneDrift(current: Ros[], desired: CompiledRule[]): ZoneDrift | null {

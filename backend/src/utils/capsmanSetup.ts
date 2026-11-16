@@ -1,0 +1,379 @@
+/**
+ * CAPsMAN quick set (#438): one SSID and password, and a device becomes a
+ * CAPsMAN controller, optionally serving its own radios as well.
+ *
+ * Two CAPsMANs exist and neither manages the other's access points:
+ *
+ *   wifi    /interface/wifi/{configuration,provisioning,capsman,cap}, in the
+ *           base system since RouterOS 7.13, for wifi-package (ax, ac wave2) APs.
+ *   legacy  /caps-man/{configuration,provisioning,manager} and
+ *           /interface/wireless/cap, with the legacy wireless package.
+ *
+ * What it sets up, either way: one configuration named `mtm-capsman` with the
+ * SSID, WPA2 (and WPA3 on wifi) PSK and the bridge, one provisioning rule
+ * (commented `mtm capsman`) that gives it to every radio, and the manager on.
+ * "Controller and AP" (legacy only) also turns on the device's own CAP
+ * pointed at 127.0.0.1, which is how legacy RouterOS has a controller manage
+ * its own radios. A wifi controller can't serve its own radios through its
+ * CAP, and provisioning them from /interface/wifi/radio wipes their own SSIDs
+ * and virtual APs, so wifi is controller only. Both bands can take a 5 GHz SSID
+ * of their own: a second configuration and rule, `mtm-capsman-5ghz` (#438).
+ * Running it again updates the same items.
+ *
+ * Pure, so it can be tested without a CAPsMAN deployment.
+ */
+
+export type CapsmanFlavor = 'wifi' | 'legacy';
+/** Which radios the setup takes: all of them, or one band's (Ron, #438). */
+export type CapsmanBand = 'both' | '2ghz' | '5ghz';
+type Row = Record<string, string>;
+
+export const MTM_CAPSMAN = 'mtm-capsman';
+export const MTM_CAPSMAN_COMMENT = 'mtm capsman';
+/** The second pair, when 5 GHz has an SSID of its own (#438). */
+export const MTM_CAPSMAN_5G = 'mtm-capsman-5ghz';
+export const MTM_CAPSMAN_5G_COMMENT = 'mtm capsman 5ghz';
+const LOOPBACK = '127.0.0.1';
+
+export const CAPSMAN_PATHS: Record<CapsmanFlavor, { configuration: string; provisioning: string; manager: string; cap: string }> = {
+  wifi: {
+    configuration: '/interface/wifi/configuration',
+    provisioning: '/interface/wifi/provisioning',
+    manager: '/interface/wifi/capsman',
+    cap: '/interface/wifi/cap',
+  },
+  legacy: {
+    configuration: '/caps-man/configuration',
+    provisioning: '/caps-man/provisioning',
+    manager: '/caps-man/manager',
+    cap: '/interface/wireless/cap',
+  },
+};
+
+/** What the device has now, for one flavor. */
+export interface CapsmanLive {
+  flavor: CapsmanFlavor;
+  bridges: string[];
+  configurations: Row[];
+  provisioning: Row[];
+  manager: Row | null;
+  cap: Row | null;
+  /** The device's own radios that its CAP would hand over (legacy: wlan names). */
+  radios: string[];
+  /** Each radio's band, where the device says (legacy: its band setting). */
+  radioBands?: Record<string, '2ghz' | '5ghz'>;
+  /** Legacy: the ids of the radios that have joined (/caps-man/radio). */
+  joinedRadios?: string[];
+}
+
+/**
+ * The radios a setup hands to the controller. One band only: just that band's,
+ * so the other band's radios keep their own settings (Ron, #438). Legacy only,
+ * since its CAP lists the radios; wifi's CAP takes every radio.
+ */
+export function capsmanRadios(live: Pick<CapsmanLive, 'flavor' | 'radios' | 'radioBands'>, band: CapsmanBand): string[] {
+  if (band === 'both' || live.flavor !== 'legacy') return live.radios;
+  return live.radios.filter((r) => live.radioBands?.[r] === band);
+}
+
+export interface CapsmanSetupInput {
+  flavor: CapsmanFlavor;
+  ssid: string;
+  /** Empty keeps the passphrase already set, when the setup exists. */
+  passphrase: string;
+  bridge: string;
+  country: string | null;
+  /** The controller's own radios join it too ("controller and AP"). */
+  localRadios: boolean;
+  band: CapsmanBand;
+  /** Both bands only: a different SSID for 5 GHz radios (#438). Missing means one SSID. */
+  ssid5?: string;
+}
+
+export interface CapsmanStep {
+  /** RouterOS API command, e.g. /interface/wifi/configuration/add. */
+  command: string;
+  params: Row;
+  description: string;
+}
+
+const yes = (v: string | undefined) => v === 'true' || v === 'yes';
+
+/**
+ * The provisioning rule's radio match for a band: wifi matches the bands a
+ * radio supports, legacy its hardware modes. A radio matches when it supports
+ * any of them, so a 2.4 GHz radio never matches the 5 GHz list. Empty matches
+ * every radio. No 2ghz-b: RouterOS 7.20+ has none, and takes it as short for
+ * 2ghz-be (Wi-Fi 7).
+ */
+export const BAND_MATCH: Record<CapsmanFlavor, { key: string; values: Record<Exclude<CapsmanBand, 'both'>, string> }> = {
+  wifi: { key: 'supported-bands', values: { '2ghz': '2ghz-ax,2ghz-g,2ghz-n', '5ghz': '5ghz-a,5ghz-ac,5ghz-ax,5ghz-n' } },
+  legacy: { key: 'hw-supported-modes', values: { '2ghz': 'b,g,gn', '5ghz': 'a,an,ac' } },
+};
+
+const bandMatch = (flavor: CapsmanFlavor, band: CapsmanBand) => (band === 'both' ? '' : BAND_MATCH[flavor].values[band]);
+
+/** The band a rule takes, from its match: 'both' when it matches every radio. */
+export function ruleBand(flavor: CapsmanFlavor, rule: Row | null): CapsmanBand {
+  const v = (rule?.[BAND_MATCH[flavor].key] ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+  if (!v.length) return 'both';
+  const two = v.every((x) => x.startsWith('2ghz') || ['b', 'g', 'gn', 'g-turbo'].includes(x));
+  const five = v.every((x) => x.startsWith('5ghz') || ['a', 'an', 'ac', 'a-turbo'].includes(x));
+  return two ? '2ghz' : five ? '5ghz' : 'both';
+}
+
+/** The configuration and provisioning rule a previous run left. */
+export function ownItems(live: Pick<CapsmanLive, 'configurations' | 'provisioning'>): {
+  configuration: Row | null; rule: Row | null; configuration5: Row | null; rule5: Row | null;
+} {
+  return {
+    configuration: live.configurations.find((c) => c.name === MTM_CAPSMAN) ?? null,
+    rule: live.provisioning.find((p) => p.comment === MTM_CAPSMAN_COMMENT || p['master-configuration'] === MTM_CAPSMAN) ?? null,
+    configuration5: live.configurations.find((c) => c.name === MTM_CAPSMAN_5G) ?? null,
+    rule5: live.provisioning.find((p) => p.comment === MTM_CAPSMAN_5G_COMMENT || p['master-configuration'] === MTM_CAPSMAN_5G) ?? null,
+  };
+}
+
+/** The CAP is pointed at the device itself. */
+export function capIsLocal(cap: Row | null): boolean {
+  return !!cap && yes(cap.enabled) && (cap['caps-man-addresses'] ?? '').split(',').map((s) => s.trim()).includes(LOOPBACK);
+}
+
+/** Checks a request the way the UI does; returns the input or the first problem. */
+export function parseCapsmanSetup(body: unknown, live: CapsmanLive): { input: CapsmanSetupInput } | { error: string } {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const ssid = typeof b.ssid === 'string' ? b.ssid : '';
+  const passphrase = typeof b.passphrase === 'string' ? b.passphrase : '';
+  const bridge = typeof b.bridge === 'string' ? b.bridge : '';
+  const country = typeof b.country === 'string' && b.country.trim() ? b.country.trim().toLowerCase() : null;
+  const localRadios = b.localRadios === true;
+  const band: CapsmanBand = b.band === '2ghz' || b.band === '5ghz' ? b.band : 'both';
+  const existing = ownItems(live).configuration;
+
+  const ssidError = capsmanSsidError(ssid);
+  if (ssidError) return { error: ssidError };
+  const passError = capsmanPassphraseError(passphrase, !!existing);
+  if (passError) return { error: passError };
+  if (!bridge) return { error: 'Choose the bridge the Wi-Fi clients join.' };
+  if (!live.bridges.includes(bridge)) return { error: `${bridge} isn't a bridge on this device.` };
+  if (country && !/^[a-z0-9 .()-]{2,40}$/.test(country)) return { error: 'Enter the country as RouterOS names it, e.g. "united states", or leave it empty.' };
+  // wifi: a controller can't serve its own radios through its own CAP
+  // (MikroTik's wifi docs), and provisioning them from /interface/wifi/radio
+  // replaces their own SSIDs and virtual APs for good (tested on a wAP ax).
+  if (localRadios && live.flavor === 'wifi') {
+    return { error: 'A wifi CAPsMAN can\'t serve its own radios this way. Choose controller only, and set its radios by hand.' };
+  }
+  if (localRadios && live.radios.length === 0) {
+    return { error: `This device has no ${live.flavor === 'wifi' ? 'wifi' : 'legacy wireless'} radios of its own. Choose controller only.` };
+  }
+  if (localRadios && capsmanRadios(live, band).length === 0) {
+    return { error: `This device has no ${band === '2ghz' ? '2.4 GHz' : '5 GHz'} radio of its own. Choose another band, or controller only.` };
+  }
+  // A 5 GHz SSID of its own: both bands only, and a different name (the same is just one SSID).
+  const ssid5Raw = band === 'both' && typeof b.ssid5 === 'string' ? b.ssid5 : '';
+  const ssid5 = ssid5Raw && ssid5Raw !== ssid ? ssid5Raw : undefined;
+  if (ssid5) {
+    const e = capsmanSsidError(ssid5);
+    if (e) return { error: `5 GHz SSID: ${e.replace(/^Enter the SSID\.$/, 'enter it, or untick it.')}` };
+    if (!passphrase && !ownItems(live).configuration5) return { error: 'Enter the Wi-Fi password: the 5 GHz SSID is new.' };
+  }
+  return { input: { flavor: live.flavor, ssid, passphrase, bridge, country, localRadios, band, ...(ssid5 ? { ssid5 } : {}) } };
+}
+
+export function capsmanSsidError(ssid: string): string | null {
+  if (!ssid.trim()) return 'Enter the SSID.';
+  if (Buffer.byteLength(ssid, 'utf8') > 32) return 'An SSID is at most 32 bytes.';
+  return null;
+}
+
+export function capsmanPassphraseError(passphrase: string, canKeep: boolean): string | null {
+  if (!passphrase) return canKeep ? null : 'Enter the Wi-Fi password.';
+  if (/^[0-9a-fA-F]{64}$/.test(passphrase)) return null;
+  if (!/^[\x20-\x7e]{8,63}$/.test(passphrase)) return 'The password is 8 to 63 plain characters (letters, digits, punctuation).';
+  return null;
+}
+
+/** The writes, in order, and what to tell the user before they apply. */
+export function planCapsman(input: CapsmanSetupInput, live: CapsmanLive): { steps: CapsmanStep[]; warnings: string[] } {
+  const p = CAPSMAN_PATHS[input.flavor];
+  const steps: CapsmanStep[] = [];
+  const warnings: string[] = [];
+  const { configuration, rule, configuration5, rule5 } = ownItems(live);
+  // Both bands with a 5 GHz SSID of its own (Ron, #438): the first
+  // configuration and rule take 2.4 GHz, a second pair takes 5 GHz.
+  const split = input.band === 'both' && !!input.ssid5;
+
+  // The configurations first: if RouterOS refuses a value (a country it
+  // doesn't know, say), nothing else has changed yet.
+  const settingsFor = (ssid: string): Row => {
+    const settings: Row = input.flavor === 'wifi'
+      ? {
+        ssid,
+        'security.authentication-types': 'wpa2-psk,wpa3-psk',
+        ...(input.passphrase ? { 'security.passphrase': input.passphrase } : {}),
+        'datapath.bridge': input.bridge,
+      }
+      : {
+        ssid,
+        mode: 'ap',
+        'security.authentication-types': 'wpa2-psk',
+        'security.encryption': 'aes-ccm',
+        ...(input.passphrase ? { 'security.passphrase': input.passphrase } : {}),
+        'datapath.bridge': input.bridge,
+        // Each CAP bridges its own clients, rather than tunnelling them to the controller.
+        'datapath.local-forwarding': 'yes',
+      };
+    if (input.country) settings.country = input.country;
+    return settings;
+  };
+  // Unchanged, and no new password: nothing to send. A password given is
+  // always sent, since the device never shows it to compare.
+  const planConfiguration = (name: string, existing: Row | null, ssid: string) => {
+    const settings = settingsFor(ssid);
+    const current = new Map(Object.entries(existing ?? {}));
+    const unchanged = !!existing && !input.passphrase
+      && Object.entries(settings).every(([k, v]) => (current.get(k) ?? '') === v);
+    if (unchanged) return;
+    if (existing) {
+      steps.push({ command: `${p.configuration}/set`, params: { '.id': existing['.id'], ...settings }, description: `Update the ${name} configuration (SSID ${ssid})` });
+    } else {
+      steps.push({ command: `${p.configuration}/add`, params: { name, ...settings }, description: `Add the ${name} configuration (SSID ${ssid})` });
+    }
+  };
+  planConfiguration(MTM_CAPSMAN, configuration, input.ssid);
+  if (split) planConfiguration(MTM_CAPSMAN_5G, configuration5, input.ssid5!);
+
+  // One band only: the rule goes first, so radios of that band take this
+  // SSID and the other band's radios go on matching the rules already there.
+  const others = live.provisioning.filter((r) => r !== rule && r !== rule5 && !yes(r.disabled));
+  const firstOther = live.provisioning.find((r) => r !== rule && r !== rule5);
+  const planRule = (existing: Row | null, band: CapsmanBand, master: string, comment: string, ssid: string) => {
+    const match = { key: BAND_MATCH[input.flavor].key, value: bandMatch(input.flavor, band) };
+    const bandName = band === '2ghz' ? '2.4 GHz' : '5 GHz';
+    const goFirst = band !== 'both' && !!firstOther;
+    if (!existing) {
+      steps.push({
+        command: `${p.provisioning}/add`,
+        params: {
+          action: 'create-dynamic-enabled', 'master-configuration': master, comment,
+          ...(match.value ? { [match.key]: match.value } : {}),
+          ...(goFirst ? { 'place-before': firstOther['.id'] } : {}),
+        },
+        description: band === 'both' ? 'Provision every radio that connects with it' : `Provision ${bandName} radios with ${ssid}`,
+      });
+      return;
+    }
+    const bandChanged = ruleBand(input.flavor, existing) !== band;
+    if (existing['master-configuration'] !== master || existing.action !== 'create-dynamic-enabled' || yes(existing.disabled)
+      || (bandChanged && match.value)) {
+      steps.push({
+        command: `${p.provisioning}/set`,
+        params: {
+          '.id': existing['.id'], action: 'create-dynamic-enabled', 'master-configuration': master, disabled: 'no',
+          ...(match.value ? { [match.key]: match.value } : {}),
+        },
+        description: band === 'both' ? 'Point the provisioning rule at it' : `Point the provisioning rule at it, for ${bandName} radios`,
+      });
+    }
+    // Back to every radio: wifi takes the match off with unset; legacy
+    // /caps-man has no unset ("no such command", #438), so it is set empty.
+    if (bandChanged && !match.value) {
+      steps.push(input.flavor === 'legacy'
+        ? {
+          command: `${p.provisioning}/set`,
+          params: { '.id': existing['.id'], [match.key]: '' },
+          description: 'Provision every radio with it, not one band',
+        }
+        : {
+          command: `${p.provisioning}/unset`,
+          params: { numbers: existing['.id'], 'value-name': match.key },
+          description: 'Provision every radio with it, not one band',
+        });
+    }
+    if (goFirst && live.provisioning.indexOf(existing) > live.provisioning.indexOf(firstOther)) {
+      steps.push({
+        command: `${p.provisioning}/move`,
+        params: { numbers: existing['.id'], destination: firstOther['.id'] },
+        description: 'Move the provisioning rule first',
+      });
+    }
+  };
+  planRule(rule, split ? '2ghz' : input.band, MTM_CAPSMAN, MTM_CAPSMAN_COMMENT, input.ssid);
+  if (split) {
+    planRule(rule5, '5ghz', MTM_CAPSMAN_5G, MTM_CAPSMAN_5G_COMMENT, input.ssid5!);
+  } else {
+    // One SSID again: the 5 GHz pair goes, the rule before its configuration.
+    if (rule5) steps.push({ command: `${p.provisioning}/remove`, params: { '.id': rule5['.id'] }, description: `Remove the ${MTM_CAPSMAN_5G} provisioning rule` });
+    if (configuration5) steps.push({ command: `${p.configuration}/remove`, params: { '.id': configuration5['.id'] }, description: `Remove the ${MTM_CAPSMAN_5G} configuration` });
+  }
+
+  const bandName = input.band === '2ghz' ? '2.4 GHz' : '5 GHz';
+  if (split) {
+    warnings.push(`2.4 GHz radios take ${input.ssid} and 5 GHz radios take ${input.ssid5}, with the same password.`);
+    if (others.length) warnings.push(`Both rules go before the device's own provisioning ${others.length === 1 ? 'rule' : 'rules'}.`);
+  } else if (others.length && input.band === 'both') {
+    warnings.push(`The device already has ${others.length === 1 ? 'a provisioning rule' : `${others.length} provisioning rules`} of its own. `
+      + 'RouterOS uses the first rule that matches a radio, so radios those match keep their configuration.');
+  } else if (others.length) {
+    warnings.push(`The rule goes before the device's own provisioning ${others.length === 1 ? 'rule' : 'rules'}: `
+      + `${bandName} radios take ${input.ssid}, and the other band's radios keep matching ${others.length === 1 ? 'it' : 'them'}.`);
+  }
+
+  if (!yes(live.manager?.enabled)) {
+    steps.push({ command: `${p.manager}/set`, params: { enabled: 'yes' }, description: 'Turn on CAPsMAN' });
+  }
+
+  const cap = live.cap;
+  const radios = capsmanRadios(live, input.band);
+  if (input.localRadios) {
+    const params: Row = { enabled: 'yes', 'caps-man-addresses': LOOPBACK };
+    if (input.flavor === 'legacy') {
+      params.interfaces = radios.join(',');
+      params.bridge = input.bridge;
+    }
+    const capNow = new Map(Object.entries(cap ?? {}));
+    const same = capIsLocal(cap) && Object.entries(params).every(([k, v]) => k === 'enabled' || (capNow.get(k) ?? '') === v);
+    if (!same) {
+      steps.push({ command: `${p.cap}/set`, params, description: `Have its own radios (${radios.join(', ')}) join it` });
+      if (yes(cap?.enabled) && !capIsLocal(cap)) {
+        warnings.push('This device is a CAP of another controller now. Its radios will be managed by itself instead.');
+      }
+      warnings.push(input.band === 'both'
+        ? `Its own radios (${radios.join(', ')}) switch to ${input.ssid}. Clients on their current networks reconnect to it.`
+        : input.flavor === 'legacy'
+          ? `Its own ${bandName} ${radios.length === 1 ? 'radio' : 'radios'} (${radios.join(', ')}) ${radios.length === 1 ? 'switches' : 'switch'} to ${input.ssid}. Clients on their current networks reconnect to it.`
+          : `Its own ${bandName} radios switch to ${input.ssid}. Clients on their current networks reconnect to it.`);
+      const kept = live.radios.filter((r) => !radios.includes(r));
+      if (kept.length) warnings.push(`${kept.join(', ')} ${kept.length === 1 ? 'keeps its' : 'keep their'} own settings.`);
+    }
+  } else if (capIsLocal(cap)) {
+    // Controller only, after "controller and AP": its radios go back to their own settings.
+    steps.push({ command: `${p.cap}/set`, params: { enabled: 'no' }, description: 'Stop managing its own radios' });
+    warnings.push('Its own radios stop taking the controller\'s SSID and go back to their own settings.');
+  }
+
+  // Legacy applies provisioning rules only when a radio joins, so radios
+  // already joined keep the SSID they were given (Ron, #438). Provision them
+  // again, unless the CAP is about to rejoin anyway.
+  const rulesChanged = steps.some((s) => s.command.startsWith(`${p.provisioning}/`));
+  const capRejoins = steps.some((s) => s.command === `${p.cap}/set`);
+  if (input.flavor === 'legacy' && rulesChanged && !capRejoins && live.joinedRadios?.length) {
+    steps.push({
+      command: '/caps-man/radio/provision',
+      params: { numbers: live.joinedRadios.join(',') },
+      description: 'Provision the joined radios again, so they take the new rules',
+    });
+    warnings.push('Radios that have already joined are provisioned again: their clients reconnect.');
+  } else if (input.flavor === 'wifi' && rulesChanged) {
+    warnings.push('Access points that have already joined take the new rules when they next connect.');
+  }
+
+  return { steps, warnings };
+}
+
+/** The flavor to offer first: the one the device's own radios use. */
+export function defaultFlavor(available: CapsmanFlavor[], wifiPackage: string | null | undefined): CapsmanFlavor | null {
+  if (available.includes('legacy') && wifiPackage === 'wireless') return 'legacy';
+  if (available.includes('wifi')) return 'wifi';
+  return available[0] ?? null;
+}

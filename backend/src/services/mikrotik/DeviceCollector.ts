@@ -16,6 +16,7 @@ import { lease, dropSessions, type Lease, type SessionLane } from './sessionPool
 import { RouterOSClient, RouterOSTrapError, isNoSuchCommand, type ReadSpec } from './RouterOSClient';
 import { usesApiTls } from '../../utils/apiTls';
 import { query, queryOne } from '../../config/database';
+import { expectReboot } from '../offlineAlerts';
 import { bootChange } from '../../utils/bootTime';
 import { logSafe } from '../../utils/logSafe';
 import { legacyScanScript, parseLegacyScanOutput } from '../../utils/apScan';
@@ -34,7 +35,7 @@ import { aggregateBridgeVlans, portVlanMembership, expandVlanIds, rosList } from
 import {
   classifyWifiRole, isCapsmanManaged, parseCapsmanStatus, parseCapStatus,
   normalizeRadios, macIndexKeys, parseRadioMonitor, resolveDatapath,
-  clientsPerRadio, buildMacIndex, matchRadiosToDevices, lookupDeviceForMac,
+  clientsPerRadio, buildMacIndex, matchRadiosToDevices, matchLegacyRadio,
   legacyManagerEnabled, legacyCapInterfaces, legacyRadios, hasRadios, chooseWifiPackage,
   type WifiRole,
 } from './capsman';
@@ -55,6 +56,8 @@ const legacyScanMode = new Map<number, 'script' | 'api'>();
 // 4: the package is the one whose menu lists radios; the wifi menu answers on
 // every RouterOS 7.13+ device, which hid a hAP ac²'s legacy radios.
 const WIFI_ROLE_PROBE = 4;
+/** The menus the CAPsMAN quick set reads and writes (#438). */
+const CAPSMAN_MENU = /^\/(interface\/wifi\/(configuration|provisioning|capsman|cap|radio)|caps-man\/(configuration|provisioning|manager|radio)|interface\/wireless(\/cap)?)$/;
 
 /**
  * How often a device found to have no wireless role is checked again. CAPsMAN
@@ -252,6 +255,77 @@ export interface NewLogEvent { id: number; event_time: Date; severity: string; m
 
 /** Longest log message kept; RouterOS's own are a few hundred characters at most. */
 const MAX_LOG_MESSAGE = 4096;
+
+/**
+ * One client sighting: mac, hostname, ip, interface, vlan, tx, rx, signal,
+ * type, tx rate, rx rate.
+ */
+type ClientRow = [string, string | null, string | null, string | null, number | null,
+  number, number, number | null, string, number | null, number | null];
+const CLIENT_BATCH = 500;
+
+const CLIENT_UPSERT_SET = `
+  ON CONFLICT (device_id, mac_address) DO UPDATE SET
+    hostname=COALESCE(EXCLUDED.hostname, clients.hostname),
+    ip_address=COALESCE(NULLIF(EXCLUDED.ip_address,''), clients.ip_address),
+    interface_name=COALESCE(EXCLUDED.interface_name, clients.interface_name),
+    -- The VLAN of this sighting, not one kept from an earlier sighting on
+    -- another port: a client seen by ARP on vrrp20 kept VLAN 98 from the
+    -- bridge (#363). Kept only when the port isn't known either.
+    vlan_id=CASE WHEN EXCLUDED.interface_name IS NULL THEN clients.vlan_id ELSE EXCLUDED.vlan_id END,
+    tx_bytes=EXCLUDED.tx_bytes,
+    rx_bytes=EXCLUDED.rx_bytes,
+    signal_strength=EXCLUDED.signal_strength,
+    client_type=EXCLUDED.client_type,
+    tx_rate_bps=EXCLUDED.tx_rate_bps,
+    rx_rate_bps=EXCLUDED.rx_rate_bps,
+    active=TRUE,
+    last_seen=NOW(),
+    first_seen=COALESCE(clients.first_seen, NOW())`;
+
+/**
+ * Store a device's clients, 500 to a statement (#442). One statement per
+ * client was thousands of round trips a fast poll on a campus switch, whose
+ * bridge sees every MAC on the network, and the polls queued for the database
+ * pool behind each other until some ran past their time limit. A batch that
+ * fails is retried one row at a time, so one bad row still costs only itself
+ * (P2-20). Returns the MACs stored.
+ */
+export async function upsertClients(deviceId: number, deviceName: string, rows: ClientRow[]): Promise<string[]> {
+  const stored: string[] = [];
+  for (let i = 0; i < rows.length; i += CLIENT_BATCH) {
+    const batch = rows.slice(i, i + CLIENT_BATCH);
+    const col = (n: number) => batch.map((r) => r[n]);
+    try {
+      await query(
+        `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes,
+                              signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
+         SELECT $1, u.*, TRUE, NOW(), NOW()
+           FROM unnest($2::varchar[], $3::varchar[], $4::varchar[], $5::varchar[], $6::int[], $7::bigint[], $8::bigint[],
+                       $9::int[], $10::varchar[], $11::bigint[], $12::bigint[])
+        ${CLIENT_UPSERT_SET}`,
+        [deviceId, col(0), col(1), col(2), col(3), col(4), col(5), col(6), col(7), col(8), col(9), col(10)],
+      );
+      stored.push(...batch.map((r) => r[0]));
+    } catch {
+      for (const row of batch) {
+        try {
+          await query(
+            `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes,
+                                  signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW(),NOW())
+            ${CLIENT_UPSERT_SET}`,
+            [deviceId, ...row],
+          );
+          stored.push(row[0]);
+        } catch (err) {
+          console.error(`[${deviceName}] Skipped client ${row[0]}:`, (err as Error).message);
+        }
+      }
+    }
+  }
+  return stored;
+}
 
 export class DeviceCollector {
   private client: RouterOSClient;
@@ -1691,8 +1765,7 @@ export class DeviceCollector {
         ...Object.keys(bridgeHostMap),
       ]);
 
-      let totalClients = 0;
-      const seenMacs: string[] = [];
+      const rows: ClientRow[] = [];
       for (const mac of allMacs) {
         if (!normalizeMac(mac)) continue; // not a MAC address; nothing to key a client on
         const isWireless = mac in wifiSignal;
@@ -1700,53 +1773,22 @@ export class DeviceCollector {
         const interfaceName = isWireless
           ? (wifiInterface[mac] || entry?.port || null)
           : (entry?.port || arpInterfaces[mac] || null);
-        const vlanId = entry?.vid ?? null;
-
-        // One bad row costs only itself (P2-20): it used to end the loop and
-        // leave every client after it stale.
-        try {
-          await query(
-            `INSERT INTO clients (device_id, mac_address, hostname, ip_address, interface_name, vlan_id, tx_bytes, rx_bytes, signal_strength, client_type, tx_rate_bps, rx_rate_bps, active, last_seen, first_seen)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,NOW(),NOW())
-             ON CONFLICT (device_id, mac_address) DO UPDATE SET
-               hostname=COALESCE($3, clients.hostname),
-               ip_address=COALESCE(NULLIF($4,''), clients.ip_address),
-               interface_name=COALESCE($5, clients.interface_name),
-               -- The VLAN of this sighting, not one kept from an earlier
-               -- sighting on another port: a client seen by ARP on vrrp20
-               -- kept VLAN 98 from the bridge (#363). Kept only when the
-               -- port isn't known either.
-               vlan_id=CASE WHEN $5::varchar IS NULL THEN clients.vlan_id ELSE $6::integer END,
-               tx_bytes=$7,
-               rx_bytes=$8,
-               signal_strength=$9,
-               client_type=$10,
-               tx_rate_bps=$11,
-               rx_rate_bps=$12,
-               active=TRUE,
-               last_seen=NOW(),
-               first_seen=COALESCE(clients.first_seen, NOW())`,
-            [
-              this.device.id,
-              mac,
-              fit(dhcpHostnames[mac] || regComments[mac] || null, 255),
-              fit(dhcpIPs[mac] || arpIPs[mac] || wifiLastIp[mac] || null, 45),
-              fit(interfaceName, 50),
-              vlanId,
-              wifiTx[mac] || 0,
-              wifiRx[mac] || 0,
-              isWireless && !noSignal.has(mac) ? wifiSignal[mac] : null,
-              isWireless ? 'wireless' : 'wired',
-              isWireless ? wifiTxRate[mac] ?? null : null,
-              isWireless ? wifiRxRate[mac] ?? null : null,
-            ]
-          );
-          seenMacs.push(mac);
-          totalClients++;
-        } catch (err) {
-          console.error(`[${this.device.name}] Skipped client ${mac}:`, (err as Error).message);
-        }
+        rows.push([
+          mac,
+          fit(dhcpHostnames[mac] || regComments[mac] || null, 255),
+          fit(dhcpIPs[mac] || arpIPs[mac] || wifiLastIp[mac] || null, 45),
+          fit(interfaceName, 50),
+          entry?.vid ?? null,
+          wifiTx[mac] || 0,
+          wifiRx[mac] || 0,
+          isWireless && !noSignal.has(mac) ? wifiSignal[mac] : null,
+          isWireless ? 'wireless' : 'wired',
+          isWireless ? wifiTxRate[mac] ?? null : null,
+          isWireless ? wifiRxRate[mac] ?? null : null,
+        ]);
       }
+      const seenMacs = await upsertClients(this.device.id, this.device.name, rows);
+      const totalClients = seenMacs.length;
 
       // Clients this device no longer sees go inactive, but only when every
       // read succeeded; after a failed read their absence means nothing (P2-21).
@@ -3064,10 +3106,22 @@ export class DeviceCollector {
     this.capsmanFlavor = newController && legacyController ? 'both'
       : newController ? 'wifi' : legacyController ? 'legacy' : null;
     this.legacyCapIfaces = legacyCapInterfaces(legacyCap);
+    // A controller's own radios (#438). The wifi interface list includes every
+    // CAP's, so the radios marked local say; the legacy wireless list is only
+    // the device's own. Unknown (an older build without the radio menu) keeps
+    // the controller as it was classified before.
+    let ownRadios: boolean | undefined;
+    if (newController && pkg === 'wifi') {
+      const radios = await this.client.execute('/interface/wifi/radio/print').catch(() => null);
+      if (radios) ownRadios = radios.some((r) => r['local'] === 'true' || r['local'] === 'yes');
+    } else if (legacyController && pkg === 'wireless') {
+      ownRadios = (ifaces ?? []).length > 0;
+    }
     const role = classifyWifiRole(
       newController || legacyController ? [{ enabled: 'yes' }] : capsman,
       this.legacyCapIfaces.length > 0 ? [{ enabled: 'yes' }] : cap,
       (ifaces ?? []).length > 0,
+      ownRadios,
     );
     return role;
   }
@@ -3076,6 +3130,26 @@ export class DeviceCollector {
   private capsmanFlavor: 'wifi' | 'legacy' | 'both' | null = null;
   /** Interfaces this device hands to a legacy controller, when it is a legacy CAP (#250). */
   private legacyCapIfaces: string[] = [];
+
+  /**
+   * The SSID a legacy controller put on the air for each interface this device
+   * hands it, by MAC: the interface's own SSID no longer applies (#250, #447).
+   * Call after detectWifiRole.
+   */
+  private async legacyControllerSsids(wlans: Record<string, string>[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    if (this.legacyCapIfaces.length === 0) return out;
+    const macs = wlans.filter((w) => this.legacyCapIfaces.includes(w['name']))
+      .map((w) => (w['mac-address'] || '').toUpperCase()).filter(Boolean);
+    if (macs.length === 0) return out;
+    const rows = await query<{ radio_mac: string; ssid: string | null }>(
+      `SELECT DISTINCT ON (radio_mac) radio_mac, ssid FROM capsman_radios
+        WHERE radio_mac = ANY($1::text[]) AND ssid IS NOT NULL ORDER BY radio_mac, updated_at DESC`,
+      [macs]
+    ).catch(() => []);
+    for (const r of rows) out.set(r.radio_mac, r.ssid as string);
+    return out;
+  }
 
   /**
    * Controller-side inventory: the radios it manages, the named configurations, and
@@ -3244,21 +3318,24 @@ export class DeviceCollector {
       const seen: string[] = [];
       for (const r of radios) {
         seen.push(r.radioMac);
+        // The controller's own radios, through its own CAP, are its own (#447).
+        const match = matchLegacyRadio(r.radioMac, macIndex, this.device.id);
         await query(
           `INSERT INTO capsman_radios
              (controller_device_id, radio_mac, interface_name, local, hw_type,
               current_channel, remote_cap_name, matched_device_id, config_json,
               state, registered_peers, authorized_peers, tx_power, ssid, updated_at)
-           VALUES ($1,$2,$3,false,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+           VALUES ($1,$2,$3,$13,NULL,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
            ON CONFLICT (controller_device_id, radio_mac) DO UPDATE SET
-             interface_name=$3, local=false, hw_type=NULL, current_channel=$4,
+             interface_name=$3, local=$13, hw_type=NULL, current_channel=$4,
              remote_cap_name=$5, matched_device_id=$6, config_json=$7,
              state=$8, registered_peers=$9, authorized_peers=$10, tx_power=$11,
              ssid=$12, updated_at=NOW()`,
           [
             this.device.id, r.radioMac, r.interfaceName, r.channel, r.capIdentity,
-            lookupDeviceForMac(r.radioMac, macIndex, this.device.id),
+            match.deviceId,
             JSON.stringify(r.raw), r.state, r.registeredPeers, r.authorizedPeers, r.txPower, r.ssid,
+            match.local,
           ]
         );
       }
@@ -3451,19 +3528,7 @@ export class DeviceCollector {
       // A legacy CAP keeps its old local settings on the interfaces it hands to
       // the controller, which no longer apply. The controller's view of the radio
       // (same MAC) has the SSID actually on the air (#250).
-      const controllerSsid = new Map<string, string>();
-      if (this.legacyCapIfaces.length > 0) {
-        const macs = wlans.filter((w) => this.legacyCapIfaces.includes(w['name']))
-          .map((w) => (w['mac-address'] || '').toUpperCase()).filter(Boolean);
-        if (macs.length > 0) {
-          const rows = await query<{ radio_mac: string; ssid: string | null }>(
-            `SELECT DISTINCT ON (radio_mac) radio_mac, ssid FROM capsman_radios
-              WHERE radio_mac = ANY($1::text[]) AND ssid IS NOT NULL ORDER BY radio_mac, updated_at DESC`,
-            [macs]
-          ).catch(() => []);
-          for (const r of rows) controllerSsid.set(r.radio_mac, r.ssid as string);
-        }
-      }
+      const controllerSsid = await this.legacyControllerSsids(wlans);
 
       for (const wlan of wlans) {
         const name = wlan['name'];
@@ -3946,15 +4011,21 @@ export class DeviceCollector {
     // annotation has to be applied here too — otherwise the Radios tab shows blank
     // fields with no indication that a controller owns them.
     const role = await this.detectWifiRole();
+    // A legacy CAP's interfaces keep their own SSIDs, which no longer apply:
+    // show the controller's (#447).
+    const legacyCap = pkg === 'wireless' ? this.legacyCapIfaces : [];
+    const controllerSsid = await this.legacyControllerSsids(rawNormalized);
     const ifaces = rawNormalized.map((iface, i) => {
       const status = parseCapsmanStatus(rawIfaces[i] ?? iface);
-      const managed = isCapsmanManaged(rawIfaces[i] ?? iface, role);
+      const managed = isCapsmanManaged(rawIfaces[i] ?? iface, role) || legacyCap.includes(iface['name']);
       if (!managed && !status) return iface;
+      const fromController = controllerSsid.get((iface['mac-address'] || '').toUpperCase());
       return {
         ...iface,
         managed_by_capsman: 'true',
         ...(status?.controllerMac ? { capsman_controller_mac: status.controllerMac } : {}),
-        ...(status?.ssid && !iface['ssid'] ? { ssid: status.ssid } : {}),
+        ...(fromController ? { ssid: fromController } : {}),
+        ...(status?.ssid && !iface['ssid'] && !fromController ? { ssid: status.ssid } : {}),
         ...(status?.mode && !iface['mode'] ? { mode: status.mode } : {}),
         ...(status?.channel ? { capsman_channel: status.channel } : {}),
       };
@@ -5000,6 +5071,32 @@ export class DeviceCollector {
 
   async setPppoeServerDisabled(id: string, disabled: boolean): Promise<void> {
     await this.client.execute('/interface/pppoe-server/server/set', { '.id': id, disabled: disabled ? 'yes' : 'no' });
+  }
+
+  // ─── CAPsMAN quick set (#438) ────────────────────────────────────────────────
+
+  /** Reads a CAPsMAN menu; null when the device doesn't have it. */
+  async readCapsmanMenu(path: string): Promise<Record<string, string>[] | null> {
+    if (!CAPSMAN_MENU.test(path)) throw new Error(`Not a CAPsMAN menu: ${path}`);
+    try {
+      return await this.client.execute(`${path}/print`);
+    } catch {
+      return null;
+    }
+  }
+
+  /** One CAPsMAN setup write, from utils/capsmanSetup's plan. */
+  async writeCapsman(command: string, params: Record<string, string>): Promise<void> {
+    const path = command.replace(/\/(add|set|unset|move|remove|provision)$/, '');
+    if (path === command || !CAPSMAN_MENU.test(path)) throw new Error(`Not a CAPsMAN write: ${command}`);
+    // Provisioning: only legacy's joined radios, again after a rule change (#438).
+    // Never wifi's radio menu, where it replaces a local radio's own setup.
+    if ((command.endsWith('/provision') || path === '/caps-man/radio') && command !== '/caps-man/radio/provision') {
+      throw new Error(`Not a CAPsMAN write: ${command}`);
+    }
+    // Removing: only the setup's own configurations and rules (a 5 GHz pair, #438).
+    if (command.endsWith('/remove') && !/\/(configuration|provisioning)$/.test(path)) throw new Error(`Not a CAPsMAN write: ${command}`);
+    await this.client.execute(command, params);
   }
 
   /** End an active PPP session; the client usually dials straight back in. */
@@ -6616,6 +6713,8 @@ export class DeviceCollector {
    * a device that had in fact rebooted and upgraded correctly.
    */
   async reboot(): Promise<void> {
+    // Said first, so the poll that finds it gone doesn't alert (#442).
+    await expectReboot(this.device.id);
     try {
       await this.client.execute('/system/reboot');
     } catch (e) {

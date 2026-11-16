@@ -453,6 +453,9 @@ header. Click a header to fold a section, or use the chips at the top to hide on
 both are remembered in your browser. Sections only appear where the device has the data: a switch
 without connection tracking has no Connections section, a single-core device no per-core chart.
 
+On the dashboard's **Capacity & health** card, a device's CPU opens this tab at its CPU graph and
+its memory at the Memory graph; the name opens the device.
+
 | Section | What it shows |
 |---|---|
 | **CPU** | Load as 5-minute (or longer) averages, with a light band up to the highest reading in each window, and each core on its own when there are several: one core pinned at 100% hardly moves the overall load |
@@ -600,7 +603,8 @@ and how many rules it adds, removes and keeps. **Show the rules** lists them all
 Every rule is commented `mtm zone: …`. In order:
 
 - **Input** (traffic to the router): accept established, related and untracked; drop invalid;
-  accept to the loopback (for CAPsMAN); accept the manager's own address, when MTM can see it on
+  accept what the router sends itself (in on `lo` on RouterOS 7, so a CAPsMAN's own CAP isn't
+  dropped; to `127.0.0.1` on RouterOS 6); accept the manager's own address, when MTM can see it on
   the device; a jump per zone that can reach the router, to `<zone>-to-router`; then drop the rest.
 - **Forward** (traffic between zones): FastTrack established and related (optional, with hardware
   offload on RouterOS 7); accept established, related and untracked; drop invalid; an accept per
@@ -615,8 +619,18 @@ set in **IP > Services**, so an SSH server moved to 2222 is the port allowed. Th
 appears when MTM can see its own address on the device.
 
 The two final drops log by default with the prefixes `zone drop in` and `zone drop fwd`, tagged so
-[Firewall Events](firewall-events.md#which-rule-logged-it) links each line to its rule. Untick **Log
+[Firewall Logs](firewall-events.md#which-rule-logged-it) links each line to its rule. Untick **Log
 what's dropped** to leave them quiet. The returns and the final drops aren't shown in the matrix.
+
+A logged drop logs at most 5 packets a second (bursts of 10, `limit=5,10`). What goes past that
+is dropped by an unlogged rule right after it, `… past the log limit`, so a scan or a flood
+can't overload a small router with logging. Zones applied before 1.1.0-beta.46 log every drop;
+the Zones card says so, and **Apply** updates them.
+
+To quiet one zone, such as an untrusted zone the internet knocks on all day, untick **Log drops**
+on that zone. Its traffic is then dropped just before each final drop by an unlogged rule, `drop
+the rest from <zone>`, so the rest of what's dropped is still logged. Only traffic coming *from*
+the zone is affected; a drop on the way into it still logs.
 
 Replies always get back: a connection allowed one way is tracked, and the stateful accepts let its
 replies through. Port forwards (dstnat) are matched after the address is changed, so allow the

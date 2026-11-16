@@ -3,6 +3,147 @@
 1.1 is in beta on the `dev` branch and the `:beta` images
 ([release channels](configuration.md#release-channels)). For stable, stay on 1.0 below.
 
+## 1.1.0-beta.55
+
+- **Saving a site could remove its map pin**
+  ([#362](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/362)). Changing only a
+  site's map zoom, its name or its group cleared its position. A save now changes the pin only
+  when it sends one or when the address changes. Also in 1.0.17. Thanks to Ron.
+
+## 1.1.0-beta.54
+
+- **CAPsMAN quick set: a 5 GHz SSID of its own now reaches radios already joined**
+  ([#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438)). Legacy CAPsMAN
+  applies provisioning rules only when a radio joins, so a joined 5 GHz radio kept the old SSID.
+  When the rules change, the setup now provisions the joined radios again (their clients
+  reconnect). On wifi CAPsMAN, joined access points take new rules when they next connect, and
+  the form says so. Thanks to Ron.
+- **A legacy controller's own radios count as its own**
+  ([#447](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/447)). A controller
+  serving its own wlans showed 0 clients on the Wireless page and a banner calling its own CAP an
+  access point not in the fleet. Wireless Settings now marks wlans CAPsMAN manages and shows the
+  SSID the controller puts on the air. Thanks to Ron.
+- **Capacity & health metrics open their graph**
+  ([#448](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/448)). On the dashboard,
+  a device's CPU opens its CPU graph and its memory the Memory graph; the name still opens the
+  device. Thanks to Ron.
+- **The sites map opens on the default site** when it has a pin
+  ([#362](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/362)), at its map zoom.
+  Thanks to Ron.
+
+## 1.1.0-beta.53
+
+- **CAPsMAN quick set couldn't go back to both bands on legacy CAPsMAN**
+  ([#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438)). After a one-band
+  run, choosing 2.4 GHz and 5 GHz again stopped with "no such command": legacy `/caps-man` has no
+  `unset`, so the band match is now cleared by setting it empty, and the controller's own CAP takes
+  both radios again. Thanks to Ron.
+
+## 1.1.0-beta.52
+
+- **CAPsMAN quick set can give 5 GHz an SSID of its own**
+  ([#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438)). With both bands,
+  tick **A different SSID on 5 GHz**: 2.4 GHz radios take the first SSID and 5 GHz radios the
+  second, with the same password. Unticking it removes the second one again. Thanks to Ron.
+- **Wifi CAPsMAN is controller only in the quick set.** A wifi controller can't serve its own
+  radios through its own CAP, so **Controller and AP** did nothing there, and the only way
+  RouterOS offers replaces the radios' own SSIDs and virtual APs for good. Legacy CAPsMAN keeps
+  the option. See [CAPsMAN](capsman.md#current-limits).
+- **A site's map zoom applies wherever its devices show**
+  ([#362](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/362)). The dashboard map
+  no longer ignores it when some devices have no site, and centres on the site's pin; a device's
+  own map opens at its site's zoom too. Thanks to Ron.
+
+## 1.1.0-beta.51
+
+- **Zones dropped a CAPsMAN's own CAP**
+  ([#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369)). A controller that
+  serves its own radios has its CAP broadcast discovery in on the loopback interface, `lo`, which
+  no zone holds, so the final drop caught and logged it. On RouterOS 7 the loopback rule now
+  accepts everything in on `lo`, not only traffic to 127.0.0.1. A device with zones already
+  applied says so on its Zones tab: **Apply** once to update the rule. Thanks to Ron for the report.
+
+## 1.1.0-beta.50
+
+- **CAPsMAN quick set with one band took the other band's radio too**
+  ([#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438)). On legacy CAPsMAN
+  with **Controller and AP**, choosing 5 GHz only handed every wlan to the controller, so the
+  2.4 GHz one matched no rule and lost its own SSID. Now only the chosen band's wlans join, and
+  running the setup again takes the other band's wlan back out. Thanks to Ron for the report.
+- **Known limit:** on wifi CAPsMAN, **Controller and AP** doesn't hand the device's own radios over
+  yet; they keep their own settings. See [CAPsMAN](capsman.md#current-limits).
+
+## 1.1.0-beta.49
+
+- **Firewall Logs can hide rules**, from aziz's request and patch in
+  [#446](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/446). **Hide rules** shows
+  everything except the rules you pick, for example a busy drop rule you already know about. It
+  hides a rule on its own device only, works in the grouped view too, and remembers your choice in
+  this browser. Up to 20 rules.
+- **Rules that would read the same in All rules show their tags**
+  ([#443](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/443)), so two rules with
+  the same comment on one device can be told apart.
+- **After an update, the dashboard said the latest release was older than the one running**
+  ([#443](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/443)). Also in 1.0.16.
+
+## 1.1.0-beta.48
+
+- **Firewall Logs can show one rule's lines**, from aziz's request and patch in
+  [#443](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/443). **All rules** sits
+  next to actions and protocols. It lists the log prefixes that logged in the period, busiest
+  first, named by the rule's comment when a device is picked. Unlike the search box, it matches
+  the whole prefix, so `PERMIT-ZT` doesn't bring in `PERMIT-ZT-ADMIN`. Picking a rule picks its
+  device too. See [Firewall Logs](firewall-events.md).
+
+## 1.1.0-beta.47
+
+- **Fewer false "device offline" alerts**, from aziz's report and patch in
+  [#442](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/442). A device is marked
+  offline only after a number of missed polls in a row (**Missed polls before offline** in
+  Settings → Alerting, 2 by default), and when most of a site goes quiet at once you get one
+  alert for the site, and one "back online" for it, instead of one per device. See
+  [When a device counts as offline](alerting.md#when-a-device-counts-as-offline).
+- **Polls no longer stall on large networks** (#442). Clients were written to the database one
+  at a time, and a campus switch sees every MAC on the network, so polls queued behind each other
+  and some ran out of time, which made healthy devices look offline. They're now written in
+  batches. Poller health also shows how long the server was busy and how many database queries
+  were waiting in the last 15 seconds. See [Is it keeping up?](scaling.md#is-it-keeping-up).
+- **Down on purpose doesn't alert** (#442). A reboot sent from the manager (Reboot, RouterBOOT
+  upgrade, firmware rollout), a rollout step in progress, or a maintenance window holds the alert.
+  If the device is still down afterwards, it alerts then. Maintenance windows used to hide the
+  alert and never send one later.
+- **Set up CAPsMAN on one band**, from Ron's request in
+  [#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438). **Radios** picks
+  2.4 GHz and 5 GHz, 2.4 GHz only or 5 GHz only, so a 5 GHz network can be tried without touching
+  an existing 2.4 GHz one. See [Set up CAPsMAN](capsman.md#set-up-capsman).
+- **Source builds behind a proxy**, from eskyuu in
+  [#436](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/436): set `HTTPS_PROXY`
+  in `.env` and `docker compose build` uses it. The GHCR images don't need it. See
+  [Configuration](configuration.md).
+- **The faceplate fits the device**: it's sized to the ports and centred, with the model name top
+  right as on the real device, and virtual interfaces in their own box. See
+  [Ports and the faceplate](devices.md#ports-and-the-faceplate).
+
+## 1.1.0-beta.46
+
+- **Set up CAPsMAN**, from Ron's request in
+  [#438](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/438). The Wireless page
+  has a **Set up CAPsMAN** button: pick a device, an SSID, a password and a bridge, and it becomes
+  a CAPsMAN controller (wifi or legacy), either controller only or serving its own radios too.
+  Running it again on the same device changes the same setup. It goes through Change Guard and
+  Review changes. See [Set up CAPsMAN](capsman.md#set-up-capsman).
+- **A controller with radios of its own shows as Controller and AP.** A wifi controller whose own
+  radios are managed by it was shown as Controller only.
+- **Log drops per zone**, from Ron in
+  [#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415). Each zone has a
+  **Log drops** checkbox, so a noisy zone such as WAN can stay out of Firewall Logs while the
+  rest still logs. See [Zones](devices.md#zones).
+- **Logged drops are capped at 5 a second**
+  ([#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369)). Logging every
+  dropped packet kept rebooting Ron's hAP ac². The final drops now log at most 5 packets a second
+  and drop the rest unlogged. Zones applied before this keep logging every drop until they're
+  applied again; the Zones card says so and **Apply** updates them.
+
 ## 1.1.0-beta.45
 
 - **Firewall Logs looks more like Ron's mockup** in
@@ -716,6 +857,34 @@ tested on real fleets.
 1.0 is the first stable release: a version to run in production, where updates on the 1.0.x
 line only fix things. It's the result of more than 130 beta releases since April 2026, many of them
 shaped by people running MikroTik Manager on their own fleets.
+
+## 1.0.17
+
+Released on Sunday 15 November 2026.
+
+- **Saving a site could remove its map pin**
+  ([#362](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/362)). Renaming a site
+  or changing its group, without touching the address, cleared its position. A save now changes
+  the pin only when it sends one or when the address changes. Thanks to Ron for the report.
+
+## 1.0.16
+
+Released on Friday 13 November 2026.
+
+- **After an update, the dashboard said the latest release was older than the one running**
+  ([#443](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/443)). The update check
+  keeps its answer for a day, and the new version kept using the answer the old one had saved. The
+  saved answer now records which version and channel asked, and the check runs again when either
+  changes.
+
+## 1.0.15
+
+Released on Wednesday 11 November 2026.
+
+- **Switching to API-SSL or HTTPS explains "not enough permissions"**
+  ([#417](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/417)): which step the
+  router refused, and that the user the manager logs in as needs the `full` group or the missing
+  policies.
 
 ## 1.0.14
 

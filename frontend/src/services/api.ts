@@ -30,6 +30,9 @@ import type {
 /** Backups and restores of large configurations run for minutes, not seconds. */
 const LONG_DEVICE_OP_MS = 11 * 60_000;
 
+/** Arrays as `?hide=a&hide=b`, not axios's default `hide[]=a`. */
+const REPEAT_PARAMS = { indexes: null };
+
 const api = axios.create({
   baseURL: '/api',
   timeout: 30000,
@@ -585,7 +588,11 @@ export interface PollerHealth {
   workers: {
     concurrency: number; job_timeout_ms: number; poll_interval_ms: number; fast_interval_sec?: number;
     /** Each process running poll workers, when there are worker containers (#301). */
-    processes?: { role: string; concurrency: number; sessions: number }[];
+    processes?: {
+      role: string; concurrency: number; sessions: number;
+      /** The last 15 s (#442): the longest event-loop block, and the most queries waiting for a database connection. */
+      load?: { loop_max_ms: number; loop_p99_ms: number; db_waiting_max: number; db_connections: number } | null;
+    }[];
   };
   capacity: {
     devices: number;
@@ -1377,6 +1384,15 @@ export const systemApi = {
 
 // ─── Events ───────────────────────────────────────────────────────────────────
 
+export interface FirewallRuleOption {
+  deviceId: number | null;
+  deviceName: string | null;
+  prefix: string;
+  tag: string | null;
+  count: number;
+  lastSeen: string;
+}
+
 export interface FirewallEvent {
   id: number;
   deviceId: number | null;
@@ -1470,6 +1486,10 @@ export const eventsApi = {
     since?: string;
     action?: FirewallEvent['action'];
     protocol?: string;
+    /** One rule's lines: its whole log prefix. */
+    prefix?: string;
+    /** Every rule but these, each `<deviceId>|<prefix>`. */
+    hide?: string[];
     limit?: number;
     offset?: number;
     names?: 1;
@@ -1477,7 +1497,7 @@ export const eventsApi = {
     api.get<{
       events: FirewallEvent[];
       total: number;
-    }>('/events/firewall', { params }),
+    }>('/events/firewall', { params, paramsSerializer: REPEAT_PARAMS }),
   /** The same filters, folded into groups (#415). */
   firewallGrouped: (params?: {
     deviceId?: number;
@@ -1485,11 +1505,18 @@ export const eventsApi = {
     since?: string;
     action?: FirewallEvent['action'];
     protocol?: string;
+    /** One rule's lines: its whole log prefix. */
+    prefix?: string;
+    /** Every rule but these, each `<deviceId>|<prefix>`. */
+    hide?: string[];
     limit?: number;
     offset?: number;
     names?: 1;
   }) =>
-    api.get<{ groups: FirewallGroup[]; total: number; scanLimit: number }>('/events/firewall', { params: { ...params, view: 'grouped' } }),
+    api.get<{ groups: FirewallGroup[]; total: number; scanLimit: number }>('/events/firewall', { params: { ...params, view: 'grouped' }, paramsSerializer: REPEAT_PARAMS }),
+  /** The rules (log prefixes) that logged in the window, per device: the rule filter's choices. */
+  firewallRules: (params: { deviceId?: number; since?: string }) =>
+    api.get<{ rules: FirewallRuleOption[] }>('/events/firewall/rules', { params }),
   clearFirewall: (deviceId?: number) =>
     api.delete<{ message: string; deleted: number }>('/events/firewall', {
       params: deviceId ? { deviceId } : {},
@@ -2036,6 +2063,8 @@ export interface ZoneConfig {
   policies: Record<string, ZonePolicy>;
   fasttrack: boolean;
   logDrops: boolean;
+  /** Zones whose drops aren't logged (#415); missing means all are. */
+  quietZones?: string[];
   /** The manager reaches only its API, API-SSL and SSH ports on the router; missing means everything (#369). */
   managerAccess?: 'management';
 }
@@ -2051,6 +2080,8 @@ export interface ZonesData {
   interfaces: { name: string; type: string; running: boolean; disabled: boolean; bridge_port: boolean; addresses: string[] }[];
   manager_ip: string | null;
   drift: { missing: string[]; extra: string[] } | null;
+  /** MTM writes these rules differently now; Apply updates them (#369 log limit). */
+  outdated?: string[];
   services: { forward: { key: string; label: string }[]; router: { key: string; label: string }[] };
 }
 export interface ZonePlan {
@@ -2341,6 +2372,42 @@ export interface CapsmanController {
   ssids: CapsmanSsid[];
 }
 
+/** CAPsMAN quick set (#438): what a device offers, per CAPsMAN. */
+export type CapsmanFlavor = 'wifi' | 'legacy';
+export interface CapsmanFlavorState {
+  configured: boolean;
+  ssid: string | null;
+  bridge: string | null;
+  country: string | null;
+  enabled: boolean;
+  local_radios: boolean;
+  radios: string[];
+  other_rules: number;
+  /** The radios its provisioning rule takes (#438). */
+  band: CapsmanBand;
+  /** Both bands with a 5 GHz SSID of its own (#438), else null. */
+  ssid5?: string | null;
+}
+/** All radios, or one band's: 2.4 GHz or 5 GHz (#438). */
+export type CapsmanBand = 'both' | '2ghz' | '5ghz';
+export interface CapsmanSetupInfo {
+  flavors: CapsmanFlavor[];
+  default_flavor: CapsmanFlavor | null;
+  bridges: string[];
+  state: Partial<Record<CapsmanFlavor, CapsmanFlavorState>>;
+}
+export interface CapsmanSetupRequest {
+  flavor: CapsmanFlavor;
+  ssid: string;
+  passphrase: string;
+  bridge: string;
+  country: string;
+  localRadios: boolean;
+  band: CapsmanBand;
+  /** Both bands only: a different SSID for 5 GHz radios (#438). */
+  ssid5?: string;
+}
+
 export const wirelessApi = {
   alignment: (deviceId: number, signal?: AbortSignal) =>
     api.get<AlignmentSnapshot>(`/wireless/${deviceId}/alignment`, { signal, timeout: 20_000 }),
@@ -2348,6 +2415,11 @@ export const wirelessApi = {
   list: () => api.get('/wireless'),
   // CAPsMAN controllers with the APs they provision (read-only)
   capsman: () => api.get<{ controllers: CapsmanController[] }>('/wireless/capsman'),
+  // CAPsMAN quick set (#438)
+  capsmanSetup: (deviceId: number) => api.get<CapsmanSetupInfo>(`/wireless/${deviceId}/capsman/setup`, { timeout: 30_000 }),
+  applyCapsmanSetup: (deviceId: number, body: CapsmanSetupRequest, confirmLockout = false) =>
+    api.post<{ message: string; warnings?: string[]; steps?: string[] }>(`/wireless/${deviceId}/capsman/setup`,
+      { ...body, ...(confirmLockout ? { confirm_lockout: true } : {}) }, { timeout: 120_000 }),
 
   // Multi-AP SSID deployment
   bulkCreateInterfaces: (data: { apIds: number[] } & Record<string, unknown>) =>

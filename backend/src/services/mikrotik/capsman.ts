@@ -99,12 +99,19 @@ const isYes = (v: string | undefined): boolean => v === 'yes' || v === 'true';
 export function classifyWifiRole(
   capsman: Record<string, string>[] | null,
   cap: Record<string, string>[] | null,
-  hasWifiInterfaces: boolean
+  hasWifiInterfaces: boolean,
+  /**
+   * A controller's radios of its own, when known. A wifi controller lists every
+   * CAP's interfaces as its own, so its interface count can't say; its radios
+   * marked local can. A controller with its own radios set locally ("controller
+   * only" on an access point, #438) still has radios.
+   */
+  ownRadios?: boolean
 ): WifiRole {
   const isController = !!capsman?.some((r) => isYes(r['enabled']));
   const isCap = !!cap?.some((r) => isYes(r['enabled']));
 
-  if (isController && isCap) return 'controller_cap';
+  if (isController && (isCap || ownRadios === true)) return 'controller_cap';
   if (isController) return 'controller';
   if (isCap) return 'cap';
   return hasWifiInterfaces ? 'standalone' : 'none';
@@ -313,6 +320,27 @@ export function lookupDeviceForMac(
     if (hit !== undefined) return hit;
   }
   return null;
+}
+
+/**
+ * A legacy controller's radio: on another managed device, or one of the
+ * controller's own, served through its own CAP (#447). The legacy radio list
+ * has no `local` flag, so the MAC says; another device holding the MAC wins.
+ */
+export function matchLegacyRadio(
+  mac: string | null,
+  index: Map<string, number[]>,
+  controllerDeviceId: number
+): { deviceId: number | null; local: boolean } {
+  if (!mac) return { deviceId: null, local: false };
+  for (const key of macIndexKeys(mac)) {
+    const candidates = index.get(key);
+    if (!candidates) continue;
+    const other = candidates.find((id) => id !== controllerDeviceId);
+    if (other !== undefined) return { deviceId: other, local: false };
+    return { deviceId: controllerDeviceId, local: true };
+  }
+  return { deviceId: null, local: false };
 }
 
 export interface RadioLiveState {
