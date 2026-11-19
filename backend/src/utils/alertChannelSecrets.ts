@@ -32,50 +32,65 @@ export function maskConfig(type: string, config: Record<string, unknown>): Recor
  * server they run, keep the masked token, press Test, and receive the token.
  */
 const DESTINATION_KEYS: Record<string, string[]> = {
-  email:  ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_tls_verify'],
+  email:  ['smtp_host', 'smtp_port'],
   ntfy:   ['server_url'],
   gotify: ['server_url'],
 };
 
 /**
- * When updating, a sensitive field sent back as the mask placeholder keeps its
- * saved value, unless the destination changed (see DESTINATION_KEYS).
+ * Email settings that protect the password on its way to the server. Turning
+ * either off counts as a new destination (GHSA-qm4w-hmcg-7rq9): without
+ * certificate checks, whoever sits in the path can take the login.
  */
+const TLS_WEAKENED: Record<string, (existing: Record<string, unknown>, incoming: Record<string, unknown>) => boolean> = {
+  email: (existing, incoming) =>
+    ('smtp_secure' in incoming && !!existing.smtp_secure && !incoming.smtp_secure)
+    || ('smtp_tls_verify' in incoming && existing.smtp_tls_verify !== false && incoming.smtp_tls_verify === false),
+};
+
+export const PLAIN_SECRET_ERROR = 'Enter the password or token itself. A value starting with "enc:" isn\'t accepted.';
+
 /**
- * A secret typed into a channel is plain text. One that already looks sealed was
- * copied from somewhere else (another setting's ciphertext), and sending it
- * would have the manager decrypt it for the sender.
+ * True when a secret field holds what looks like an encrypted value. Secrets
+ * are typed in plain; one that arrives sealed was copied from elsewhere, and
+ * accepting it would have the manager decrypt it and send the plaintext to
+ * the channel's server (GHSA-qm4w-hmcg-7rq9). The value already saved for the
+ * channel is the one exception, since it changes nothing.
  */
-export function sealedSecretInput(type: string, incoming: Record<string, unknown>, existing: Record<string, unknown> = {}): boolean {
-  return (SENSITIVE_KEYS[type] ?? []).some((k) => {
-    const v = incoming[k];
-    return typeof v === 'string' && isSealed(v) && v !== existing[k];
-  });
+export function sealedSecretInput(
+  type: string,
+  incoming: Record<string, unknown>,
+  existing: Record<string, unknown> = {},
+): boolean {
+  return (SENSITIVE_KEYS[type] ?? []).some((k) => isSealed(incoming[k]) && incoming[k] !== existing[k]);
 }
 
+/**
+ * When updating, a secret sent back as the mask placeholder, or left out,
+ * keeps its saved value, unless the destination changed (DESTINATION_KEYS)
+ * or the email TLS protection was turned off. A secret left out used to skip
+ * that check, so it could be carried to another server (GHSA-qm4w-hmcg-7rq9).
+ */
 export function mergeConfig(
   type: string,
   existing: Record<string, unknown>,
   incoming: Record<string, unknown>
 ): { merged: Record<string, unknown> } | { error: string } {
-  if (sealedSecretInput(type, incoming, existing)) return { error: 'Enter the password or token as plain text.' };
+  if (sealedSecretInput(type, incoming, existing)) return { error: PLAIN_SECRET_ERROR };
   const merged = { ...existing, ...incoming };
   const destinationChanged = (DESTINATION_KEYS[type] ?? []).some(
     (k) => k in incoming && String(incoming[k] ?? '') !== String(existing[k] ?? '')
-  );
+  ) || (TLS_WEAKENED[type]?.(existing, incoming) ?? false);
   for (const key of SENSITIVE_KEYS[type] ?? []) {
-    // A secret left out of the request is kept just like a masked one, so it needs the same check.
     const kept = !(key in incoming) || incoming[key] === '••••••••';
-    if (kept) {
-      if (destinationChanged && existing[key]) {
-        return { error: 'The server changed, so re-enter the password or token. A saved secret is only sent to the server it was saved for.' };
-      }
-      merged[key] = existing[key]; // restore original
+    if (!kept) continue;
+    if (destinationChanged && existing[key]) {
+      return { error: 'The server or its TLS settings changed, so re-enter the password or token. A saved secret is only sent to the server it was saved for.' };
     }
+    if (key in incoming) merged[key] = existing[key]; // restore original
   }
   return { merged };
 }
-
 
 const SENSITIVE = new Map(Object.entries(SENSITIVE_KEYS));
 

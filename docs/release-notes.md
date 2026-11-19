@@ -3,6 +3,196 @@
 1.1 is in beta on the `dev` branch and the `:beta` images
 ([release channels](configuration.md#release-channels)). For stable, stay on 1.0 below.
 
+## 1.1.0-beta.69
+
+- **Filter Firewall Logs by zone.** With zones on a device in the selected site or group,
+  **From any zone** and **To any zone** narrow the page to traffic from one zone, to one, or one
+  direction such as WAN to LAN. **Router** is traffic from or to the router itself. See
+  [Zones](firewall-events.md#zones). Thanks to Ron
+  ([#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415)).
+
+## 1.1.0-beta.68
+
+- **Less load from the Devices page and Dashboard.** Every device poll told an open Devices page
+  or Dashboard to fetch the whole device list again, which on a large fleet meant several times a
+  second. They now wait a second and fetch once for everything that changed in it. Also in
+  1.0.23. Thanks to eskyuu
+  ([#467](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/467)).
+
+## 1.1.0-beta.67
+
+- **Add a device without checking it first.** **Force add without checking connectivity** in
+  Add Device saves a device straight away with an unknown status, for one that isn't reachable
+  yet. Its first poll connects (finding the API port when none was given) and checks its serial:
+  a duplicate of a device in the same site is removed if that device is online, or merged into it
+  if not. Until that first poll succeeds it isn't marked offline and can't be synced. See
+  [Adding devices](devices.md#adding-devices). Thanks to eskyuu
+  ([#441](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/441)).
+
+## 1.1.0-beta.66
+
+- **A bridge's addresses from the Bridges tab.** **Edit** next to a bridge's addresses opens
+  them under it: add, change or remove one, through Change Guard as on **Config**, **IP
+  Addresses**. See [Bridges](devices.md#bridges). Thanks to Ron
+  ([#466](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/466)).
+- **The only router is chosen for PPP too.** **PPP Users and Sessions** on Tunnels & PPP opens on
+  the router when the selected site or group has just one, as DHCP, DNS and NTP do since
+  beta.64. Thanks to Ron
+  ([#464](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/464)).
+
+## 1.1.0-beta.65
+
+- **Chart text you couldn't read.** A client's Signal Strength chart drew its Excellent, Good
+  and Fair names over bars of the same colour; they sit beside the chart now. Every chart was
+  then checked in light, dark and Midnight: axis text is the theme's muted ink throughout,
+  tooltips follow the theme, a client's traffic tooltips say Download and Upload again, RF Health
+  numbers are dark where white didn't read, and the roaming timeline shows signal as a coloured
+  dot. Also in 1.0.22. Thanks to Stanley
+  ([Discussion #85](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/85)).
+
+## 1.1.0-beta.64
+
+- **Port ranges in port names.** Under **Settings → Firewall Logs**, a port name can cover a
+  range such as `5000-5100`, for TCP, UDP or both. It names every port in it in the Firewall Logs
+  Application column and in Traffic; a single port listed too keeps its own name. See
+  [Firewall Logs](firewall-events.md#application-and-row-colours). Thanks to Ron
+  ([#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415)).
+- **The only device is chosen for you.** On DHCP, DNS and NTP under Network Services, a site or
+  group with one device opens on that device rather than asking you to choose it. Thanks to Ron
+  ([#464](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/464)).
+
+## 1.1.0-beta.63
+
+- **Zoom in on a time in Traffic.** Drag across the Network Traffic or Inbound Packets chart and
+  the whole page covers just that window: the totals, the charts in steps down to a minute, Top
+  Talkers, Traffic by Application, Top Destinations and the names looked up. **Back to** returns
+  to the range you were on. See [Traffic](traffic.md#zooming-in-on-a-time). Thanks to Ron
+  ([#463](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/463)).
+- **MVRP on VLAN interfaces.** A VLAN interface can declare its VLAN to MVRP neighbours on its
+  parent: tick **MVRP** in the VLAN Interfaces card (RouterOS 7.15 and later). See
+  [Devices](devices.md#vlan-interfaces)
+  ([#449](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/449)).
+
+## 1.1.0-beta.62
+
+- **MVRP forbidden ports.** Adding or editing a VLAN on a bridge running MVRP can name ports
+  that never register or declare it, so MVRP can't carry that VLAN over those links (RouterOS
+  7.15 and later). The VLANs table lists them when any VLAN has some. See
+  [Devices](devices.md#q-in-q-and-mvrp)
+  ([#449](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/449)).
+- **Editing a bridge VLAN dropped its name.** An edit removes the entry and adds it back, and
+  the new one lost the entry's comment, which the manager shows as the VLAN's name, along with
+  whether it was disabled and its forbidden ports. All of them carry over now.
+
+## 1.1.0-beta.61
+
+- **Your port names name Traffic's applications too.** A name added under **Settings → Firewall
+  Logs** now also names traffic on that port where Traffic would count it as Other TCP or Other
+  UDP, so a VPN on UDP 1198 becomes an application of its own in the chart, Where it goes and
+  Sessions. Built-in names stay as they are, and traffic already recorded keeps its name. See
+  [Traffic](traffic.md#names-for-addresses). Thanks to aziz
+  ([#366](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/366)).
+- **Top Destinations says when recording began**, so right after the upgrade that added it a
+  24-hour view doesn't read as missing traffic.
+- **AdGuard Home as a Home Assistant add-on**: how to set its port, and why its **ssl** option
+  without certificates stops the add-on, DNS included. See
+  [Traffic](traffic.md#names-looked-up-adguard-home-and-pi-hole).
+
+## 1.1.0-beta.60
+
+- **Spanning tree you can set, site by site.** A **Spanning Tree** card under the topology map
+  lists every tree in view: its root, and each bridge's priority, root port and cost to the root,
+  with the priority editable in place. It warns when one network has split into several trees
+  (a link dropping BPDUs, so neither protects the other from a loop), when a root won only by
+  having the lowest MAC, and when a root isn't managed. See
+  [Topology](topology.md#the-spanning-tree-card).
+- **A bridge port's spanning tree.** Click a port on the **Bridges** tab to set its priority and
+  path cost, edge, point-to-point, BPDU guard, restricted role and restricted TCN, under Change
+  Guard. BPDU guard warns first on a port that's hearing a switch. See
+  [Devices](devices.md#a-ports-spanning-tree).
+- **Connection Path goes all the way up.** A client's page shows each step from its device to
+  the top of the site, with the ports, following spanning tree where it says and neighbour
+  discovery where it doesn't. A managed device's own address starts at the device rather than
+  leading back to it, a client seen only on uplinks is placed where it really is, and a path
+  follows a cable into another site when the neighbour proves which device it is. See
+  [Clients](clients.md).
+- **The spanning-tree role fix in 1.0.20 below.**
+- **Layout.** Traffic: Top Talkers shows five rows and scrolls, beside Traffic by Application at
+  the same height, with Top Destinations below it. Dashboard: Devices shows five and scrolls, and
+  on Operations so do Capacity & Health (every device, not eight), Security Posture (every
+  device, not the worst three) and Recent Activity. A healthy fleet's status dot is a pulsing
+  green. Headings across the app are in title case.
+
+## 1.1.0-beta.59
+
+- **Device tools work on RouterOS 6, and Traceroute shows its hops on every version**, as in
+  1.0.19 below ([#460](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/460)).
+
+## 1.1.0-beta.58
+
+- **Traffic: where it goes, and the names behind it**
+  ([#366](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/366), steps 2 and 3).
+  An application's card has **Where it goes**, the Traffic page has **Top destinations**, and a
+  client's page lists its own. Each address is named by the organisation that owns it, with its
+  country and reverse DNS name, from a list built into each release and refreshed weekly unless
+  Dark Site Mode turns that off. Add your AdGuard Home and Pi-hole servers (as many as share a
+  site's DNS) under **Settings → DNS Query Log** to see the names each client looked up and which
+  were blocked. Destinations, Firewall Logs and Sessions show the name behind each address, from
+  AdGuard Home's answers or the DNS cache of routers that answer DNS. See
+  [Traffic](traffic.md#where-traffic-goes). Thanks to aziz for the request.
+- **WireGuard: a peer's client config and QR code**
+  ([#444](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/444), PR #445 by
+  [@Lithiuhm](https://github.com/Lithiuhm)). **View** on a peer shows the `.conf` and a QR code
+  when the router keeps the client's key, as WinBox's wizard does, and **Add Peer** can generate a
+  key pair to do the same. See [Network services](network-services.md#client-config-and-qr-code).
+- **802.1X, with User Manager**
+  ([#360](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/360)). Switches and
+  routers have an **802.1X** tab: ports that authenticate (802.1X and MAC, with guest, reject
+  and server-down VLANs), who's authenticated now, RADIUS servers, and a supplicant for an
+  uplink, all under Change Guard. User Manager can now add and edit users, with a VLAN for
+  802.1X, and link a switch to itself in one step with a fresh shared secret on both ends. See
+  [Devices](devices.md#8021x) and [User Manager](user-manager.md#8021x-with-user-manager).
+  Thanks to Ron for the request.
+- **Zone presets** ([#330](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/330)).
+  Setting up zones can start from a preset: home or small office, an office with a guest
+  network, a management network, or servers in a DMZ. See [Zones](devices.md#turning-zones-on).
+  Thanks to Ron for the idea.
+- Dependency updates (Dependabot #450 and #452 to #459).
+
+## 1.1.0-beta.57
+
+Security fixes, reported by [@davidcoulson](https://github.com/davidcoulson); update as soon as
+you can.
+
+- **The fixes in 1.0.18 below**: saved alert passwords and tokens stay with the server they
+  were saved for, command templates and post-upgrade commands are admin-only, and site checks
+  read every spelling of an address the same way.
+- **Scheduled commands run only while their creator is an admin**
+  ([GHSA-fv5m-vfmw-8h9v](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-fv5m-vfmw-8h9v)).
+  A schedule kept running after its creator lost admin, and a tag or site in it could reach
+  devices where the creator was only an operator. Those devices are now left out, and a
+  schedule whose creator is no longer an admin is marked missed.
+- **AI Connections settings are no longer readable by every account**
+  ([GHSA-qm4w-hmcg-7rq9](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-qm4w-hmcg-7rq9)).
+  The general settings list included them, with the OAuth client secret encrypted. They're now
+  read only through their own admin page, like the single sign-on settings.
+- **Turning the session log on or off checks the device's site for every spelling of the
+  address** ([GHSA-4rjj-7mfg-vrpg](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-4rjj-7mfg-vrpg)).
+
+## 1.1.0-beta.56
+
+- **Firewall Logs: an Application column, and colours for DHCP and multicast**
+  ([#415](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/415)). Each line names
+  the service behind its port (443 HTTPS, 587 SUBMISSION, 8291 WINBOX) from a built-in list based
+  on `/etc/services`. DHCP lines and multicast/broadcast lines are tinted. Change the colours and
+  add or rename ports under **Settings**, **Firewall Logs**
+  ([how](firewall-events.md#application-and-row-colours)). Thanks to Ron.
+- **Bridges: Q-in-Q and MVRP**
+  ([#449](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/449)). A bridge's VLAN tag
+  type (0x8100, the 802.1ad 0x88a8, or 0x9100) and MVRP, a port's tag stacking and MVRP applicant
+  and registrar, and the 802.1ad service tag on VLAN interfaces. A bridge running MVRP lists each
+  port's registered and declared VLANs ([how](devices.md#q-in-q-and-mvrp)). Thanks to Ron.
+
 ## 1.1.0-beta.55
 
 - **Saving a site could remove its map pin**
@@ -857,6 +1047,88 @@ tested on real fleets.
 1.0 is the first stable release: a version to run in production, where updates on the 1.0.x
 line only fix things. It's the result of more than 130 beta releases since April 2026, many of them
 shaped by people running MikroTik Manager on their own fleets.
+
+## 1.0.23
+
+Released on Thursday 19 November 2026.
+
+- **Less load from the Devices page and Dashboard.** Every device poll told an open Devices page
+  or Dashboard to fetch the whole device list again, which on a large fleet meant several times a
+  second. They now wait a second and fetch once for everything that changed in it. Thanks to
+  eskyuu ([#467](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/467)).
+
+## 1.0.22
+
+Released on Wednesday 18 November 2026.
+
+- **Chart text you couldn't read.** A client's Signal Strength chart drew its Excellent, Good
+  and Fair names in green and amber over bars of the same colour; they now sit beside the chart.
+  Thanks to Stanley ([Discussion #85](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/85)).
+  Going through every chart in light and dark mode found more, also fixed:
+    - Axis numbers and titles were a faint grey on the dark theme. They now use the theme's
+      muted text colour everywhere.
+    - Tooltips on the client page, Hardware, a port's packets and Radios were always dark, or
+      had no background. They follow the theme now.
+    - A client's traffic tooltips had lost the words Download and Upload.
+    - RF Health on the Wireless page put white numbers on bright green, lime and amber. They're
+      dark where that reads better, and empty retry tiles no longer show light grey in dark mode.
+    - The roaming timeline wrote signal values in those same bright colours; the colour is a dot
+      beside the value now.
+    - The Dashboard's Connected Clients times fell back to a serif font.
+
+## 1.0.21
+
+Released on Tuesday 17 November 2026.
+
+- **Editing a bridge VLAN dropped its name.** An edit on the VLANs tab removes the entry and
+  adds it back, and the new one lost the entry's comment, which the manager shows as the VLAN's
+  name, along with whether it was disabled. Both now carry over, as do MVRP forbidden ports set
+  on the device.
+
+## 1.0.20
+
+Released on Monday 16 November 2026.
+
+- **Spanning-tree roles were lost seconds after being read.** Each poll read the spanning tree
+  and marked every link's role, then re-read neighbours, which rebuilt the links without it. The
+  topology map rarely showed a blocked link for long, and a client's way up couldn't use the
+  root port to tell which way is up, so on some networks two switches each named the other as
+  their way up. Roles now survive the rebuild.
+
+## 1.0.19
+
+- **Device tools: Ping failed on RouterOS 6, and Traceroute showed no results**
+  ([#460](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/460)). Ping asked for
+  `/tool/ping`, which only RouterOS 7 has; it now uses `/ping`, which both have. Traceroute
+  results were dropped on every version: RouterOS sends a snapshot of the whole route per round
+  of probes, and the last one is now shown. Ping's summary also showed the totals after the first
+  packet, and loss in red when there was none. Thanks to schmitt330 for the report.
+
+## 1.0.18
+
+Released on Monday 16 November 2026. Security fixes, reported by
+[@davidcoulson](https://github.com/davidcoulson); update as soon as you can.
+
+- **Saved alert passwords and tokens could be sent to another server**
+  ([GHSA-qm4w-hmcg-7rq9](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-qm4w-hmcg-7rq9)).
+  Changing an alert channel's server needs its password or token typed again, but a request
+  that left the secret out skipped that check, so an operator could point the channel at their
+  own server and press **Test**. A left-out secret is now treated like the masked one, turning
+  off an email channel's TLS or certificate check counts as a new server, and a secret that
+  arrives already encrypted is refused everywhere the manager would decrypt it (alert channels,
+  webhook signing secrets and bulk device adds).
+- **Operators could run commands as the router's admin through a firmware rollout**
+  ([GHSA-fv5m-vfmw-8h9v](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-fv5m-vfmw-8h9v)).
+  Running commands has been admin-only since 1.0.9, but an operator could still write a command
+  template and pick it as a rollout's post-upgrade command. Templates are now written by fleet
+  admins only, and a post-upgrade command needs admin access to every device in the rollout
+  ([Bulk commands](commands.md#templates)).
+- **Site-scoped accounts could reach other sites through a differently spelled address**
+  ([GHSA-4rjj-7mfg-vrpg](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-4rjj-7mfg-vrpg)).
+  `/api/firmware/ROLLOUTS/…` or a trailing slash reached the same action as the usual address
+  but skipped the site check, so a rollout, update channel, tag, metric or backup in another
+  site could be reached. The checks now read every spelling the same way. Installs without
+  site-scoped accounts weren't affected.
 
 ## 1.0.17
 

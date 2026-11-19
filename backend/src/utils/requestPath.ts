@@ -7,14 +7,16 @@ import type { Request } from 'express';
  * spelled path could be checked as one thing and handled as another.
  * Returns null for a segment that can't be decoded, which callers refuse.
  *
- * Lower-cased and without a trailing slash, because Express routes
- * `/ROLLOUTS/42/start` and `/channel/` to the same handlers as the plain
- * spellings; a check that only knew the plain one let the others through.
+ * Lower-cased, with one trailing slash dropped: Express routes `/ROLLOUTS/4/start`
+ * and `/channel/` to the same handlers as `/rollouts/4/start` and `/channel`,
+ * so a check that only knew the plain spelling let the others through
+ * (GHSA-4rjj-7mfg-vrpg). Every caller matches lower-case words, ids and MAC
+ * hex, which lower-casing leaves the same.
  */
 export function decodedPath(req: Pick<Request, 'path'>): string | null {
   try {
-    const p = req.path.split('/').map((seg) => decodeURIComponent(seg)).join('/').toLowerCase();
-    return p.length > 1 && p.endsWith('/') ? p.slice(0, -1) : p;
+    const path = req.path.split('/').map((seg) => decodeURIComponent(seg)).join('/').toLowerCase();
+    return path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
   } catch {
     return null;
   }

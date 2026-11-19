@@ -10,6 +10,7 @@ import { validatePassword } from '../utils/passwordPolicy';
 import { OIDC_SETTINGS_KEY } from '../services/oidc/oidcConfig';
 import { AI_SETTINGS_KEY } from '../services/mcp/settings';
 import { isTimeFormat } from '../utils/timeFormat';
+import { FIREWALL_LOG_COLORS_KEY, FIREWALL_LOG_SERVICES_KEY, colorsError, servicesError } from '../utils/firewallLogSettings';
 
 const router = Router();
 router.use(requireAuth);
@@ -17,6 +18,8 @@ router.use(requireAuth);
 // Settings keys managed through their own dedicated (admin-only) endpoints and
 // never exposed via this generic surface — the OIDC config holds an encrypted
 // client secret and must only be read/written through /api/auth/oidc/config.
+// The AI Connections settings hold an encrypted OAuth client secret the same way
+// (GHSA-qm4w-hmcg-7rq9); they have their own admin-only endpoints too.
 const PROTECTED_SETTING_KEYS = new Set<string>([OIDC_SETTINGS_KEY, AI_SETTINGS_KEY]);
 
 // GET /api/settings
@@ -49,6 +52,15 @@ router.put('/', requireAdmin, async (req, res) => {
   if ('change_guard_enabled' in updates && typeof updates['change_guard_enabled'] !== 'boolean') {
     return res.status(400).json({ error: 'change_guard_enabled must be true or false.' });
   }
+  // Firewall Logs names and colours (#415): every viewer's page reads them.
+  if (FIREWALL_LOG_SERVICES_KEY in updates) {
+    const err = servicesError(updates[FIREWALL_LOG_SERVICES_KEY]);
+    if (err) return res.status(400).json({ error: err });
+  }
+  if (FIREWALL_LOG_COLORS_KEY in updates) {
+    const err = colorsError(updates[FIREWALL_LOG_COLORS_KEY]);
+    if (err) return res.status(400).json({ error: err });
+  }
   for (const [key, value] of Object.entries(updates)) {
     if (PROTECTED_SETTING_KEYS.has(key)) continue;
     await query(
@@ -59,7 +71,8 @@ router.put('/', requireAdmin, async (req, res) => {
   }
   // Apply NetFlow listener changes immediately instead of waiting for the
   // collector's periodic settings reconcile.
-  if (Object.keys(updates).some((k) => k.startsWith('netflow_'))) {
+  // Port names also name Traffic applications, so take them at once too.
+  if (Object.keys(updates).some((k) => k.startsWith('netflow_') || k === FIREWALL_LOG_SERVICES_KEY)) {
     netflowCollector.reconcile().catch(() => {});
   }
   res.json({ message: 'Settings updated' });

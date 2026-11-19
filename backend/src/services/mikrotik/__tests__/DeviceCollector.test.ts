@@ -751,6 +751,32 @@ describe('collectStp with a bonded root port (#363)', () => {
   });
 });
 
+describe('collectNeighbors keeps the spanning-tree roles', () => {
+  it('writes each port\'s role back onto the rebuilt links', async () => {
+    const c = new DeviceCollector({ ...testDevice, id: 9202 });
+    const execute = jest.fn(async (cmd: string) => cmd === '/ip/neighbor/print'
+      ? [{ interface: 'sfp28-2,bridge', identity: 'core', address: '192.0.2.40', 'mac-address': 'F4:1E:57:00:00:01', 'discovered-by': 'lldp' },
+         { interface: 'ether5,bridge', identity: 'ap', address: '192.0.2.41', 'mac-address': 'F4:1E:57:00:00:02', 'discovered-by': 'mndp' }]
+      : []);
+    (c as unknown as { client: { execute: typeof execute } }).client = { execute };
+    const q = query as jest.Mock;
+    q.mockReset();
+    q.mockImplementation(async (sql: string) => /DELETE FROM topology_links/.test(sql)
+      ? [{ from_interface: 'sfp28-2', stp_role: 'root', stp_state: 'forwarding', bridge_name: 'bridge' },
+         { from_interface: 'ether9', stp_role: null, stp_state: null, bridge_name: null }]
+      : []);
+    await c.collectNeighbors();
+    const inserts = q.mock.calls.filter(([sql]) => /INSERT INTO topology_links/.test(sql)).map(([, p]) => p as unknown[]);
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0][1]).toBe('sfp28-2');
+    expect(inserts[0].slice(-3)).toEqual(['root', 'forwarding', 'bridge']);
+    // A port the spanning-tree read hasn't seen yet gets its role on the next read.
+    expect(inserts[1][1]).toBe('ether5');
+    expect(inserts[1].slice(-3)).toEqual([null, null, null]);
+    q.mockReset();
+  });
+});
+
 // ── Wireless role checked again (#365) ───────────────────────────────────────
 
 describe('a device without a wireless role is checked again (#365)', () => {
@@ -1197,3 +1223,40 @@ describe('writeCapsman remove (#438)', () => {
   });
 });
 
+
+describe('bridge VLAN edits keep what they don\'t change (#449)', () => {
+  function withVlanTable(rows: Record<string, string>[]) {
+    const collector = new DeviceCollector(testDevice);
+    const calls: Array<[string, Record<string, string> | undefined]> = [];
+    const execute = jest.fn(async (cmd: string, params?: Record<string, string>) => {
+      calls.push([cmd, params]);
+      return cmd.endsWith('/print') ? rows : [];
+    });
+    (collector as unknown as { client: { execute: typeof execute } }).client = { execute };
+    const added = () => calls.find(([c]) => c === '/interface/bridge/vlan/add')?.[1];
+    return { collector, added };
+  }
+
+  it('carries the comment, disabled state and MVRP forbidden ports through an edit', async () => {
+    const { collector, added } = withVlanTable([
+      { '.id': '*1', bridge: 'bridge1', 'vlan-ids': '20', tagged: 'ether1', comment: 'cameras', disabled: 'true', 'mvrp-forbidden': 'ether5' },
+    ]);
+    await collector.updateBridgeVlan('bridge1', 20, ['ether1', 'ether2'], []);
+    expect(added()).toEqual({ bridge: 'bridge1', 'vlan-ids': '20', tagged: 'ether1,ether2', comment: 'cameras', disabled: 'yes', 'mvrp-forbidden': 'ether5' });
+  });
+
+  it('sets or clears the forbidden ports when asked', async () => {
+    const t1 = withVlanTable([{ '.id': '*1', bridge: 'bridge1', 'vlan-ids': '20', tagged: 'ether1', 'mvrp-forbidden': 'ether5', disabled: 'false' }]);
+    await t1.collector.updateBridgeVlan('bridge1', 20, ['ether1'], [], { mvrpForbidden: [] });
+    expect(t1.added()).toEqual({ bridge: 'bridge1', 'vlan-ids': '20', tagged: 'ether1' });
+    const t2 = withVlanTable([{ '.id': '*1', bridge: 'bridge1', 'vlan-ids': '20', tagged: 'ether1' }]);
+    await t2.collector.updateBridgeVlan('bridge1', 20, ['ether1'], [], { mvrpForbidden: ['ether6', 'ether7'] });
+    expect(t2.added()).toMatchObject({ 'mvrp-forbidden': 'ether6,ether7' });
+  });
+
+  it('adds without the property when there are none, for RouterOS without it', async () => {
+    const { collector, added } = withVlanTable([]);
+    await collector.addBridgeVlan('bridge1', 30, ['ether1'], ['ether3'], { mvrpForbidden: [] });
+    expect(added()).toEqual({ bridge: 'bridge1', 'vlan-ids': '30', tagged: 'ether1', untagged: 'ether3' });
+  });
+});

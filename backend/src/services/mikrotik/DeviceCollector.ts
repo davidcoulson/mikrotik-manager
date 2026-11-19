@@ -136,6 +136,7 @@ import { planNtpWrites, isLegacyClient, legacyServerList, type NtpForm } from '.
 import { recordInterfaceCounters } from '../interfaceErrors';
 import { parseRateBps } from '../../utils/wifiRate';
 import { probeUserManager, USER_MANAGER_RECHECK_MS } from '../userManager';
+import { cachePairs, due as dnsPairsDue, writeCachePairs } from '../dns/dnsCacheStore';
 import { poolSize, usedPerPool } from '../../utils/dhcpPools';
 import { recordOptics } from '../opticLevels';
 import { routeOf } from '../jumpHosts';
@@ -232,6 +233,8 @@ export interface DeviceRow {
   ros_version?: string;
   device_type: string;
   status: string;
+  /** Force-added without a successful first poll. */
+  force_add_pending?: boolean;
   /** Added over SSH only; the API isn't enabled yet (#174). */
   ssh_only?: boolean;
   /** The jump host it's reached through; null for direct. */
@@ -329,6 +332,7 @@ export async function upsertClients(deviceId: number, deviceName: string, rows: 
 
 export class DeviceCollector {
   private client: RouterOSClient;
+  reportedSerial: string | null = null;
 
   constructor(private device: DeviceRow, timeouts: { connectTimeoutMs?: number; readTimeoutMs?: number } = {}) {
     this.client = new RouterOSClient(
@@ -433,6 +437,7 @@ export class DeviceCollector {
     try {
       const rb = await this.client.execute('/system/routerboard/print');
       serial = rb[0]?.['serial-number'];
+      this.reportedSerial = serial?.trim() || null;
     } catch {
       return;
     }
@@ -519,6 +524,7 @@ export class DeviceCollector {
     await this.collectResourceUsage();
     await this.collectGraphMetrics();
     if (this.modules.clients) await this.updateClients();
+    if (this.modules.dnsCache && (this.device as unknown as { dns_resolver?: boolean }).dns_resolver) await this.collectDnsCache();
     // Radios of its own, whatever it was added as: an all-in-one router such
     // as the hAP ac² is an access point too.
     if (hasRadios(this.device as unknown as { device_type: string; wifi_role?: string | null })) {
@@ -590,6 +596,38 @@ export class DeviceCollector {
     }
     await this.checkUserManager();
     await this.collectDhcpPools();
+    if (this.modules.dnsCache) await this.checkDnsResolver();
+  }
+
+  /**
+   * Does this router answer DNS for its network (#366)? Its cache then holds
+   * the names behind the addresses its clients reach. Asked each slow poll; a
+   * failed read keeps what was stored.
+   */
+  private async checkDnsResolver(): Promise<void> {
+    try {
+      const dns = (await this.client.execute('/ip/dns/print'))[0];
+      if (!dns) return;
+      const on = dns['allow-remote-requests'] === 'true' || dns['allow-remote-requests'] === 'yes';
+      if (on !== Boolean((this.device as unknown as { dns_resolver?: boolean }).dns_resolver)) {
+        await query(`UPDATE devices SET dns_resolver = $2 WHERE id = $1`, [this.device.id, on]);
+        (this.device as unknown as { dns_resolver?: boolean }).dns_resolver = on;
+      }
+    } catch { /* advisory */ }
+  }
+
+  /**
+   * The names in a resolving router's DNS cache (#366), each fast poll since
+   * records last only their TTL. Only pairs not written in the last ten
+   * minutes are written.
+   */
+  private async collectDnsCache(): Promise<void> {
+    try {
+      const rows = await this.client.execute('/ip/dns/cache/print', { '.proplist': 'name,type,data' }, [], { timeoutMs: 20_000 });
+      const siteId = (this.device as unknown as { site_id?: number | null }).site_id ?? 0;
+      const pairs = dnsPairsDue(siteId, cachePairs(rows));
+      if (pairs.length) await writeCachePairs(siteId, pairs);
+    } catch { /* a missed minute is a small gap */ }
   }
 
   /**
@@ -1005,6 +1043,7 @@ export class DeviceCollector {
     // User Manager too, whenever it was last checked: Sync is how someone who
     // just switched it on gets it found, and its page into the sidebar.
     await this.checkUserManager(true);
+    if (this.modules.dnsCache) await this.checkDnsResolver();
     await this.saveFullConfig();
     this.assertStillConnected();
     await this.updateDeviceStatus('online');
@@ -2183,8 +2222,19 @@ export class DeviceCollector {
         if (mac && ip && !ip.includes(':') && !macToIpv4[mac]) macToIpv4[mac] = ip;
       }
 
-      // Wipe existing rows for this device so removed neighbors don't linger
-      await query(`DELETE FROM topology_links WHERE from_device_id = $1`, [this.device.id]);
+      // Wipe existing rows for this device so removed neighbors don't linger,
+      // keeping each port's spanning-tree role. collectStp writes it onto these
+      // rows and the slow poll runs that just before this, so rebuilding them
+      // bare cleared every role within seconds of reading it: the topology map
+      // lost blocked links and a client's way up lost its root port.
+      const prior = await query<{ from_interface: string | null; stp_role: string | null; stp_state: string | null; bridge_name: string | null }>(
+        `DELETE FROM topology_links WHERE from_device_id = $1
+         RETURNING from_interface, stp_role, stp_state, bridge_name`,
+        [this.device.id]
+      );
+      const stpByPort = new Map(prior
+        .filter((r) => r.from_interface && (r.stp_role || r.stp_state || r.bridge_name))
+        .map((r) => [r.from_interface as string, r]));
 
       for (const nb of neighbors) {
         // RouterOS returns comma-separated interface names like "ether1,bridge1" — the
@@ -2260,8 +2310,9 @@ export class DeviceCollector {
         await query(
           `INSERT INTO topology_links
              (from_device_id, from_interface, to_interface, neighbor_address, neighbor_identity,
-              neighbor_platform, neighbor_mac, neighbor_caps, link_type, discovered_by, neighbor_description, discovered_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())`,
+              neighbor_platform, neighbor_mac, neighbor_caps, link_type, discovered_by, neighbor_description, discovered_at,
+              stp_role, stp_state, bridge_name)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12,$13,$14)`,
           [
             this.device.id,
             fromInterface,
@@ -2274,6 +2325,9 @@ export class DeviceCollector {
             discoveredBy,
             discoveredByStored,
             neighborDescription,
+            stpByPort.get(fromInterface)?.stp_role ?? null,
+            stpByPort.get(fromInterface)?.stp_state ?? null,
+            stpByPort.get(fromInterface)?.bridge_name ?? null,
           ]
         );
       }
@@ -2966,7 +3020,9 @@ export class DeviceCollector {
 
   async updateDeviceStatus(status: string): Promise<void> {
     await query(
-      `UPDATE devices SET status = $1, last_seen = NOW(), updated_at = NOW() WHERE id = $2`,
+      `UPDATE devices SET status = $1::varchar, last_seen = NOW(), updated_at = NOW(),
+         force_add_pending = CASE WHEN $1::varchar = 'online' THEN FALSE ELSE force_add_pending END
+       WHERE id = $2`,
       [status, this.device.id]
     );
   }
@@ -5925,6 +5981,7 @@ export class DeviceCollector {
   async getBridgesDetail(): Promise<{
     bridges: Record<string, string>[]; ports: Record<string, string>[];
     vlans: Record<string, string>[]; addresses: Record<string, string>[]; interfaces: Record<string, string>[];
+    mvrp: Record<string, string>[];
   }> {
     const none = () => [] as Record<string, string>[];
     const [bridges, ports, vlans, addresses, interfaces] = await Promise.all([
@@ -5935,7 +5992,24 @@ export class DeviceCollector {
       // Each port's L2 MTU, the ceiling for the bridge's MTU.
       this.client.execute('/interface/print', { '.proplist': 'name,l2mtu,max-l2mtu' }).catch(none),
     ]);
-    return { bridges, ports, vlans, addresses, interfaces };
+    // What MVRP registered and declared on each port of a bridge running it
+    // (#449). A monitor, read once; nothing to show if it fails.
+    const mvrpBridges = new Set(bridges.filter((b) => b['mvrp'] === 'true' || b['mvrp'] === 'yes').map((b) => b['name']));
+    const mvrpPorts = ports.filter((p) => mvrpBridges.has(p['bridge']) && p['.id'] && p['dynamic'] !== 'true');
+    const mvrp = mvrpPorts.length
+      ? await this.client.execute('/interface/bridge/port/monitor', { numbers: mvrpPorts.map((p) => p['.id']).join(','), once: '' })
+        .then((rows) => rows.map((r, i) => ({ ...r, interface: r['interface'] || mvrpPorts[i]?.['interface'] || '' })))
+        .catch(none)
+      : [];
+    return { bridges, ports, vlans, addresses, interfaces, mvrp };
+  }
+
+  /** A bridge port's own settings, by its interface (#449). Static entries only. */
+  async updateBridgePort(iface: string, fields: Record<string, string>): Promise<void> {
+    const port = (await this.client.execute('/interface/bridge/port/print'))
+      .find((p) => p['interface'] === iface && p['dynamic'] !== 'true');
+    if (!port?.['.id']) throw new Error(`${iface} isn't a port of any bridge on this device.`);
+    await this.setItem('/interface/bridge/port', port['.id'], fields);
   }
 
   async addBridge(fields: Record<string, string>): Promise<void> {
@@ -6087,17 +6161,52 @@ export class DeviceCollector {
 
   // ─── VLAN management ──────────────────────────────────────────────────────
 
-  async addBridgeVlan(bridge: string, vlanId: number, taggedPorts: string[], untaggedPorts: string[]): Promise<void> {
-    const params: Record<string, string> = { bridge, 'vlan-ids': String(vlanId) };
+  /**
+   * `mvrpForbidden`: ports that never register or declare this VLAN through MVRP
+   * (#449, RouterOS 7.15+). Left out when empty, so older RouterOS, which has no
+   * such property, takes the add as before.
+   */
+  async addBridgeVlan(
+    bridge: string, vlanId: number, taggedPorts: string[], untaggedPorts: string[],
+    opts: { mvrpForbidden?: string[]; carry?: Record<string, string> } = {},
+  ): Promise<void> {
+    const params: Record<string, string> = { ...opts.carry, bridge, 'vlan-ids': String(vlanId) };
     if (taggedPorts.length) params['tagged'] = taggedPorts.join(',');
     if (untaggedPorts.length) params['untagged'] = untaggedPorts.join(',');
+    if (opts.mvrpForbidden !== undefined) {
+      if (opts.mvrpForbidden.length) params['mvrp-forbidden'] = opts.mvrpForbidden.join(',');
+      else delete params['mvrp-forbidden'];
+    }
     await this.client.execute('/interface/bridge/vlan/add', params);
   }
 
-  async updateBridgeVlan(bridge: string, vlanId: number, taggedPorts: string[], untaggedPorts: string[]): Promise<void> {
+  /**
+   * What an edit keeps from the entry it replaces. An edit removes the entry and
+   * adds it back, so without these its comment, its disabled state and its MVRP
+   * forbidden ports, set on the device or by an earlier edit, were dropped.
+   */
+  private static readonly BRIDGE_VLAN_CARRY = ['comment', 'disabled', 'mvrp-forbidden'] as const;
+
+  async updateBridgeVlan(
+    bridge: string, vlanId: number, taggedPorts: string[], untaggedPorts: string[],
+    opts: { mvrpForbidden?: string[] } = {},
+  ): Promise<void> {
+    const rows = await this.client
+      .execute('/interface/bridge/vlan/print', { detail: '' }, [`?bridge=${bridge}`])
+      .catch(() => [] as Record<string, string>[]);
+    const old = (rows as Record<string, string>[]).find((e) =>
+      e['dynamic'] !== 'true' && expandVlanIds(e['vlan-ids']).includes(vlanId));
+    const carry: Record<string, string> = {};
+    for (const key of DeviceCollector.BRIDGE_VLAN_CARRY) {
+      const v = old?.[key];
+      if (v === undefined || v === '') continue;
+      // RouterOS prints disabled as true/false; set takes yes/no.
+      carry[key] = key === 'disabled' ? (v === 'true' || v === 'yes' ? 'yes' : 'no') : v;
+    }
+    if (carry['disabled'] === 'no') delete carry['disabled'];
     await this.removeBridgeVlan(bridge, vlanId);
     try {
-      await this.addBridgeVlan(bridge, vlanId, taggedPorts, untaggedPorts);
+      await this.addBridgeVlan(bridge, vlanId, taggedPorts, untaggedPorts, { ...opts, carry });
     } catch (err) {
       // The old row is already gone: the VLAN does not exist now.
       throw new PartialApplyError(
@@ -7168,7 +7277,51 @@ export class DeviceCollector {
     await this.client.execute(cmd, { '.id': id });
   }
 
+  // 802.1X (#360) ─────────────────────────────────────────────────────────────
+
+  /**
+   * Everything the 802.1X tab shows: authenticators, each port's state, who is
+   * authenticated, supplicants, and the RADIUS servers asked. A menu RouterOS
+   * doesn't have (an SMIPS device) reads as empty, with `supported` false.
+   */
+  async getDot1x(): Promise<{
+    supported: boolean;
+    servers: Record<string, string>[]; state: Record<string, string>[]; active: Record<string, string>[];
+    clients: Record<string, string>[]; radius: Record<string, string>[];
+  }> {
+    const run = (cmd: string) => this.client.execute(cmd, { detail: '' });
+    let supported = true;
+    const servers = await run('/interface/dot1x/server/print').catch((e) => {
+      if (e instanceof RouterOSTrapError) supported = false;
+      return [] as Record<string, string>[];
+    });
+    const [state, active, clients, radius] = await Promise.all([
+      supported ? run('/interface/dot1x/server/state/print').catch(() => []) : [],
+      supported ? run('/interface/dot1x/server/active/print').catch(() => []) : [],
+      supported ? run('/interface/dot1x/client/print').catch(() => []) : [],
+      run('/radius/print').catch(() => []),
+    ]);
+    return { supported, servers, state, active, clients, radius };
+  }
+
+  async addMenuItem(menu: '/interface/dot1x/server' | '/interface/dot1x/client' | '/radius', fields: Record<string, string>): Promise<void> {
+    const entries = Object.entries(fields).filter(([k, v]) => ROS_PROPERTY.test(k) && v !== '');
+    await this.client.execute(`${menu}/add`, Object.fromEntries(entries));
+  }
+
+  async setMenuItem(menu: '/interface/dot1x/server' | '/interface/dot1x/client' | '/radius', id: string, fields: Record<string, string>): Promise<void> {
+    await this.setItem(menu, id, fields);
+  }
+
+  async removeMenuItem(menu: '/interface/dot1x/server' | '/interface/dot1x/client' | '/radius', id: string): Promise<void> {
+    await this.client.execute(`${menu}/remove`, { '.id': id });
+  }
+
   async getWireGuardPeers(): Promise<Record<string, string>[]> {
+    // The API already returns a responder peer's stored private-key without
+    // asking — show-sensitive is a CLI-only concept (and some RouterOS builds
+    // reject it over the API as an unknown parameter, which broke the whole
+    // read). No extra flag needed here.
     return this.client.execute('/interface/wireguard/peers/print', { detail: '' }).catch(() => [] as Record<string, string>[]);
   }
 

@@ -2,6 +2,7 @@
 // came from and went to, and, when asked, names instead of addresses.
 import { Resolver } from 'dns/promises';
 import { query } from '../config/database';
+import { namesForAddresses } from '../utils/addressNames';
 
 /** The zone column for traffic to or from the router itself. */
 export const ROUTER_ZONE = 'Router';
@@ -44,6 +45,54 @@ export async function zoneMaps(deviceIds: (number | null)[]): Promise<Map<number
   // A device switched to zones before the map existed gets an empty one until
   // it is next read, so the columns still read as zones.
   return new Map(rows.map((r) => [r.device_id, r.interface_zones ?? {}]));
+}
+
+/**
+ * The zone-managed devices' interface maps, as the zone filters see them:
+ * one device, or every device the site scope allows (`scopeSql` is a
+ * predicate on `z.device_id`).
+ */
+export async function zoneMapsInScope(deviceId: number | undefined, scopeSql: string | null): Promise<Map<number, Record<string, string>>> {
+  const filters = ['z.enabled'];
+  const params: unknown[] = [];
+  if (deviceId !== undefined) { params.push(deviceId); filters.push(`z.device_id = $${params.length}`); }
+  if (scopeSql) filters.push(scopeSql);
+  const rows = await query<{ device_id: number; interface_zones: Record<string, string> | null }>(
+    `SELECT z.device_id, z.interface_zones FROM firewall_zone_configs z WHERE ${filters.join(' AND ')}`, params);
+  return new Map(rows.map((r) => [r.device_id, r.interface_zones ?? {}]));
+}
+
+/** The zone filters' choices (#415): Router, then every zone an interface is in, A to Z. */
+export function zoneNames(maps: Map<number, Record<string, string>>): string[] {
+  if (!maps.size) return [];
+  const zones = new Set<string>();
+  for (const map of maps.values()) for (const z of Object.values(map)) if (typeof z === 'string' && z && z !== ROUTER_ZONE) zones.add(z);
+  return [ROUTER_ZONE, ...[...zones].sort((a, b) => a.localeCompare(b))];
+}
+
+/**
+ * SQL for "this line came from (or went to) zone `zone`" (#415), the way
+ * zonesOf() reads a line: by the in (or out) interface on a zone-managed
+ * device, and Router for traffic from (or to) the router itself. `p` adds a
+ * parameter and returns its placeholder.
+ */
+export function zoneFilterSql(side: 'from' | 'to', zone: string, maps: Map<number, Record<string, string>>,
+  p: (v: unknown) => string, alias = 'e'): string {
+  const own = side === 'from' ? 'output' : 'input';
+  const chain = `substring(${alias}.message from '(input|forward|output):')`;
+  const iface = `substring(${alias}.message from '[[:space:]]${side === 'from' ? 'in' : 'out'}:([^[:space:],]+)')`;
+  const pairs: string[] = [];
+  for (const [deviceId, map] of maps) {
+    for (const [name, z] of Object.entries(map)) if (z === zone) pairs.push(`${deviceId}|${name}`);
+  }
+  const parts: string[] = [];
+  if (pairs.length) {
+    parts.push(`(${chain} IS DISTINCT FROM '${own}' AND (${alias}.device_id::text || '|' || ${iface}) = ANY(${p(pairs)}::text[]))`);
+  }
+  if (zone === ROUTER_ZONE && maps.size) {
+    parts.push(`(${chain} = '${own}' AND ${alias}.device_id = ANY(${p([...maps.keys()])}::int[]))`);
+  }
+  return parts.length ? `(${parts.join(' OR ')})` : 'FALSE';
 }
 
 export async function withZones<T extends LogLine>(lines: T[]): Promise<(T & ZoneFields)[]> {
@@ -89,12 +138,31 @@ export function clearNameCache() { ptrCache.clear(); pending.clear(); }
 
 interface Endpoints { deviceId: number | null; srcIp: string; dstIp: string }
 
+/** How far back a DNS name still counts for an address (#366): the DNS retention default. */
+const DNS_NAME_WINDOW_MS = 7 * 86_400_000;
+
+/** For each site, the name a lookup answered with for each address (AdGuard Home, routers' DNS caches). */
+type ForwardNames = (bySite: Map<number, string[]>) => Promise<Map<string, string>>;
+
+async function dnsNamesBySite(bySite: Map<number, string[]>): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const since = new Date(Date.now() - DNS_NAME_WINDOW_MS);
+  for (const [site, ips] of bySite) {
+    const names = await namesForAddresses(ips, { sites: [site], since, perAddress: 1 });
+    for (const [ip, list] of names) if (list[0]) out.set(`${site}|${ip}`, list[0]);
+  }
+  return out;
+}
+
 /**
- * Names for the addresses in these lines: a client's hostname from the same
- * site as the device that logged it, else reverse DNS from the manager's own
- * resolver. Addresses with neither stay as they are.
+ * Names for the addresses in these lines, best first: a client's hostname
+ * from the same site as the device that logged it; the name a lookup in that
+ * site answered with (AdGuard Home, or a resolving router's DNS cache, #366);
+ * else reverse DNS from the manager's own resolver. Addresses with none stay
+ * as they are.
  */
-export async function withNames<T extends Endpoints>(lines: T[], lookup: (ip: string) => Promise<string | null> = ptr):
+export async function withNames<T extends Endpoints>(lines: T[], lookup: (ip: string) => Promise<string | null> = ptr,
+  forward: ForwardNames = dnsNamesBySite):
   Promise<(T & { srcName?: string; dstName?: string })[]> {
   const ips = [...new Set(lines.flatMap((l) => [l.srcIp, l.dstIp]))];
   if (!ips.length) return lines;
@@ -119,8 +187,22 @@ export async function withNames<T extends Endpoints>(lines: T[], lookup: (ip: st
   const clientName = (deviceId: number | null, ip: string) =>
     deviceId != null ? clientNames.get(`${sites.get(deviceId) ?? ''}|${ip}`) : undefined;
 
+  // Names lookups answered with, per site (a device with no site is site 0, as the caches store it).
+  const siteKey = (deviceId: number | null) => (deviceId != null ? sites.get(deviceId) ?? 0 : 0);
+  const bySite = new Map<number, string[]>();
+  for (const l of lines) {
+    for (const ip of [l.srcIp, l.dstIp]) {
+      if (clientName(l.deviceId, ip)) continue;
+      const list = bySite.get(siteKey(l.deviceId)) ?? [];
+      if (!list.includes(ip)) list.push(ip);
+      bySite.set(siteKey(l.deviceId), list);
+    }
+  }
+  const forwardNames = bySite.size ? await forward(bySite).catch(() => new Map<string, string>()) : new Map<string, string>();
+  const dnsName = (deviceId: number | null, ip: string) => forwardNames.get(`${siteKey(deviceId)}|${ip}`);
+
   // Reverse DNS for the rest, as far as the budget allows.
-  const rest = ips.filter((ip) => lines.some((l) => (l.srcIp === ip || l.dstIp === ip) && !clientName(l.deviceId, ip)));
+  const rest = ips.filter((ip) => lines.some((l) => (l.srcIp === ip || l.dstIp === ip) && !clientName(l.deviceId, ip) && !dnsName(l.deviceId, ip)));
   const dns = new Map<string, string>();
   let timer: NodeJS.Timeout | undefined;
   await Promise.race([
@@ -130,8 +212,8 @@ export async function withNames<T extends Endpoints>(lines: T[], lookup: (ip: st
   clearTimeout(timer);
 
   return lines.map((l) => {
-    const src = clientName(l.deviceId, l.srcIp) ?? dns.get(l.srcIp);
-    const dst = clientName(l.deviceId, l.dstIp) ?? dns.get(l.dstIp);
+    const src = clientName(l.deviceId, l.srcIp) ?? dnsName(l.deviceId, l.srcIp) ?? dns.get(l.srcIp);
+    const dst = clientName(l.deviceId, l.dstIp) ?? dnsName(l.deviceId, l.dstIp) ?? dns.get(l.dstIp);
     return { ...l, ...(src ? { srcName: src } : {}), ...(dst ? { dstName: dst } : {}) };
   });
 }

@@ -2039,6 +2039,7 @@ CREATE TABLE IF NOT EXISTS proxy_certs (
 -- Session log from NetFlow (#415 step 2): one row per connection, both
 -- directions paired, client to server. Off until turned on per device.
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS netflow_sessions BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS force_add_pending BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS netflow_sessions (
   id              BIGSERIAL PRIMARY KEY,
   device_id       INTEGER REFERENCES devices(id) ON DELETE CASCADE,
@@ -2084,6 +2085,80 @@ ALTER TABLE devices ADD COLUMN IF NOT EXISTS reboot_expected_until TIMESTAMPTZ;
 -- 'device', 'site' (one alert for the site), or 'deferred' (down on purpose,
 -- not alerted unless it stays down after the reason has passed).
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS offline_alert VARCHAR(10);
+-- Where clients' traffic goes (#366 step 2): per hour, client and application,
+-- the remote addresses that carried the most (top 20 a minute; the rest summed
+-- under remote ''). site_id 0 is traffic with no site. Organisation names are
+-- looked up when read, so a refreshed ASN list renames old rows too.
+CREATE TABLE IF NOT EXISTS client_destinations (
+  hour        TIMESTAMPTZ NOT NULL,
+  site_id     INTEGER NOT NULL DEFAULT 0,
+  mac         VARCHAR(17) NOT NULL,
+  app         VARCHAR(32) NOT NULL,
+  remote      VARCHAR(45) NOT NULL,
+  upload_bytes   BIGINT NOT NULL DEFAULT 0,
+  download_bytes BIGINT NOT NULL DEFAULT 0,
+  packets     BIGINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour, site_id, mac, app, remote)
+);
+CREATE INDEX IF NOT EXISTS idx_client_destinations_app ON client_destinations(site_id, app, hour);
+CREATE INDEX IF NOT EXISTS idx_client_destinations_mac ON client_destinations(site_id, mac, hour);
+CREATE INDEX IF NOT EXISTS idx_client_destinations_remote ON client_destinations(remote, hour);
+-- DNS query logs from AdGuard Home (#366 step 3). A source belongs to a site,
+-- whose clients its queries are matched to by address. The password is sealed.
+CREATE TABLE IF NOT EXISTS dns_sources (
+  id            SERIAL PRIMARY KEY,
+  name          VARCHAR(100) NOT NULL,
+  site_id       INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+  url           VARCHAR(500) NOT NULL,
+  username      VARCHAR(200) NOT NULL DEFAULT '',
+  password      TEXT NOT NULL DEFAULT '',
+  tls_verify    BOOLEAN NOT NULL DEFAULT TRUE,
+  enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+  -- The newest query already counted, so each poll takes only newer ones.
+  cursor_at     TIMESTAMPTZ,
+  last_polled_at TIMESTAMPTZ,
+  last_error    TEXT,
+  queries_counted BIGINT NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+-- Lookups per hour, client address and name, allowed and blocked.
+CREATE TABLE IF NOT EXISTS dns_name_counts (
+  hour       TIMESTAMPTZ NOT NULL,
+  site_id    INTEGER NOT NULL,
+  client_ip  VARCHAR(45) NOT NULL,
+  name       VARCHAR(255) NOT NULL,
+  allowed    INTEGER NOT NULL DEFAULT 0,
+  blocked    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (hour, site_id, client_ip, name)
+);
+CREATE INDEX IF NOT EXISTS idx_dns_name_counts_client ON dns_name_counts(site_id, client_ip, hour);
+-- Which name answered with which address, per client: how a destination gets
+-- the domain its client actually asked for.
+CREATE TABLE IF NOT EXISTS dns_answers (
+  site_id    INTEGER NOT NULL,
+  client_ip  VARCHAR(45) NOT NULL,
+  ip         VARCHAR(45) NOT NULL,
+  name       VARCHAR(255) NOT NULL,
+  first_seen TIMESTAMPTZ NOT NULL,
+  last_seen  TIMESTAMPTZ NOT NULL,
+  count      INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (site_id, ip, client_ip, name)
+);
+CREATE INDEX IF NOT EXISTS idx_dns_answers_seen ON dns_answers(last_seen);
+-- Pi-hole as well as AdGuard Home (#366).
+ALTER TABLE dns_sources ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'adguard';
+-- Routers that answer DNS for their network, and the names their caches hold
+-- (#366): what names addresses wherever the clients' resolver sits.
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS dns_resolver BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS dns_cache_names (
+  site_id    INTEGER NOT NULL,
+  ip         VARCHAR(45) NOT NULL,
+  name       VARCHAR(255) NOT NULL,
+  first_seen TIMESTAMPTZ NOT NULL,
+  last_seen  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (site_id, ip, name)
+);
+CREATE INDEX IF NOT EXISTS idx_dns_cache_names_seen ON dns_cache_names(last_seen);
 `;
 
 const DEFAULT_SETTINGS = [
@@ -2136,6 +2211,10 @@ const DEFAULT_SETTINGS = [
   // are kept only when this is on, and sessions are kept this many days.
   { key: 'netflow_sessions_unidentified', value: false },
   { key: 'retention_sessions_days', value: 3 },
+  // Traffic destinations (#366): kept this many days.
+  { key: 'retention_destinations_days', value: 7 },
+  // DNS query counts and answers from AdGuard Home (#366 step 3).
+  { key: 'retention_dns_days', value: 7 },
   // A device is marked offline after this many failed fast polls in a row.
   { key: 'offline_after_failed_polls', value: 2 },
   { key: 'change_guard_enabled', value: true },
@@ -2153,6 +2232,7 @@ const DEFAULT_SETTINGS = [
   { key: 'poll_neighbors_enabled', value: true },
   { key: 'poll_logs_enabled', value: true },
   { key: 'poll_certificates_enabled', value: true },
+  { key: 'poll_dns_cache_enabled', value: true },
   { key: 'config_health_enabled', value: true },
   { key: 'config_health_interval_min', value: 60 },
   // Geocoding and map tiles are third-party requests that also disclose device
@@ -2164,6 +2244,7 @@ const DEFAULT_SETTINGS = [
   { key: 'device_update_check_enabled', value: true },
   { key: 'firmware_changelog_enabled', value: true },
   { key: 'oui_download_enabled', value: true },
+  { key: 'asn_download_enabled', value: true },
   { key: 'docs_link_enabled', value: true },
 ];
 

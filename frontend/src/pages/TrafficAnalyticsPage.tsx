@@ -1,5 +1,6 @@
 import { useDateTimeFormat } from '../hooks/useDateTimeFormat';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { useRowsHeight } from '../hooks/useRowsHeight';
 import { useRememberedRange } from '../hooks/useRememberedRange';
 import { Link } from 'react-router-dom';
 import LoadError from '../components/common/LoadError';
@@ -7,14 +8,16 @@ import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend,
+  PieChart, Pie, Cell, Legend, ReferenceArea, type MouseHandlerDataParam,
 } from 'recharts';
 import { chartTooltip, pieTooltip } from '../components/common/chartTooltip';
-import { Activity, ArrowDown, ArrowUp, BarChart3, Router as RouterIcon, Settings2, AlertTriangle, X } from 'lucide-react';
+import { Activity, ArrowDown, ArrowUp, BarChart3, Router as RouterIcon, Settings2, AlertTriangle, X, Globe, MapPin, ZoomIn, ZoomOut } from 'lucide-react';
 import { format, parseISO, formatDistanceToNow } from 'date-fns';
 import type { DateTimeFormatters } from '../utils/dateTimeFormat';
 import clsx from 'clsx';
 import { trafficApi, type TrafficApp } from '../services/api';
+import DestinationsList from '../components/traffic/DestinationsList';
+import DnsNamesList from '../components/traffic/DnsNamesList';
 
 type Range = '1h' | '24h' | '7d' | '30d';
 const RANGES: Range[] = ['1h', '24h', '7d', '30d'];
@@ -40,15 +43,30 @@ function formatCount(n: number): string {
   return `${(n / 1_000_000_000).toFixed(2)}B`;
 }
 
-function timeFormatter(range: Range, formatTime: DateTimeFormatters['formatTime']) {
+/** Axis labels: dates when the view spans days, else times. */
+function timeFormatter(days: boolean, formatTime: DateTimeFormatters['formatTime']) {
   return (t: string) => {
     try {
       const d = parseISO(t);
-      return range === '7d' || range === '30d' ? format(d, 'MMM d') : formatTime(d);
+      return days ? format(d, 'MMM d') : formatTime(d);
     } catch {
       return t;
     }
   };
+}
+
+// Destinations and DNS names are stored by the UTC hour (which is the local
+// hour except in half-hour time zones).
+const HOUR_MS = 3_600_000;
+const onHour = (t: string) => Date.parse(t) % HOUR_MS === 0;
+const floorHour = (t: string) => new Date(Math.floor(Date.parse(t) / HOUR_MS) * HOUR_MS).toISOString();
+const ceilHour = (t: string) => new Date(Math.ceil(Date.parse(t) / HOUR_MS) * HOUR_MS).toISOString();
+
+/** "Nov 17, 8:00 PM – 9:00 PM", or both dates when the window crosses a day. */
+function windowLabel(w: { from: string; to: string }, formatDateTime: DateTimeFormatters['formatDateTime'], formatTime: DateTimeFormatters['formatTime']): string {
+  const a = new Date(w.from), b = new Date(w.to);
+  const sameDay = a.toDateString() === b.toDateString();
+  return `${formatDateTime(a, { year: undefined })} – ${sameDay ? formatTime(b) : formatDateTime(b, { year: undefined })}`;
 }
 
 function clientLabel(c: { mac: string; custom_name: string | null; hostname: string | null; vendor: string | null }): string {
@@ -57,9 +75,62 @@ function clientLabel(c: { mac: string; custom_name: string | null; hostname: str
   return c.custom_name || c.hostname || c.vendor || c.mac;
 }
 
-/** Who generates one application's traffic (#366 step 1). */
-function AppClientsCard({ app, range, onClose }: { app: string; range: Range; onClose: () => void }) {
+/**
+ * Dragging across a chart picks a window to zoom to (#463). Both charts share
+ * one drag, so the band shows on each. Points are labelled with the end of the
+ * span they sum, so the window starts one span before the first point picked.
+ */
+function useDragZoom(series: { time: string }[], onPick: (from: string, to: string) => void) {
+  // Recharts calls these on the next animation frame, with the handler that was
+  // current when the event fired, and works out the point under the mouse on a
+  // frame of its own. So a quick drag's moves can carry a handler from before
+  // the mouse-down rendered, and a mouse-down can come before its point is
+  // known. The ref is always the latest drag, and a drag whose mouse-down had
+  // no point starts at the first move that has one.
+  type Drag = { a: string | null; b: string | null };
+  const [drag, setDragState] = useState<Drag | null>(null);
+  const dragRef = useRef<Drag | null>(null);
+  const setDrag = (d: Drag | null) => { dragRef.current = d; setDragState(d); };
+  const label = (s: MouseHandlerDataParam | null | undefined) => (s?.activeLabel != null ? String(s.activeLabel) : null);
+  const step = (() => {
+    let min = Infinity;
+    for (let i = 1; i < series.length; i++) min = Math.min(min, Date.parse(series[i].time) - Date.parse(series[i - 1].time));
+    return Number.isFinite(min) && min > 0 ? min : 60_000;
+  })();
+  const handlers = {
+    onMouseDown: (s: MouseHandlerDataParam) => { const l = label(s); setDrag({ a: l, b: l }); },
+    onMouseMove: (s: MouseHandlerDataParam) => {
+      const l = label(s), d = dragRef.current;
+      if (d && l && l !== d.b) setDrag({ a: d.a ?? l, b: l });
+    },
+    onMouseUp: (s: MouseHandlerDataParam) => {
+      const l = label(s), d = dragRef.current;
+      const a = d?.a, b = l ?? d?.b;
+      if (a && b && a !== b) {
+        const [from, to] = [Date.parse(a), Date.parse(b)].sort((x, y) => x - y);
+        onPick(new Date(from - step).toISOString(), new Date(to).toISOString());
+      }
+      setDrag(null);
+    },
+    onMouseLeave: () => setDrag(null),
+  };
+  const band = drag?.a && drag.b && drag.a !== drag.b
+    ? <ReferenceArea x1={drag.a} x2={drag.b} fill="#3b82f6" fillOpacity={0.12} stroke="#3b82f6" strokeOpacity={0.4} />
+    : null;
+  return { handlers, band };
+}
+
+/**
+ * One application's traffic (#366): who generates it, and where it goes. A
+ * client's "Where to" opens its destinations for this application.
+ */
+function AppClientsCard({ app, range, onClose }: { app: string; range: string; onClose: () => void }) {
   const navigate = useNavigate();
+  const [tab, setTab] = useState<'clients' | 'destinations' | 'names'>('clients');
+  // DNS traffic also has the names behind it, from AdGuard Home (#366 step 3).
+  const isDns = app === 'DNS';
+  const tabs = isDns ? (['clients', 'destinations', 'names'] as const) : (['clients', 'destinations'] as const);
+  const [whereTo, setWhereTo] = useState<string | null>(null);
   const { data, isLoading, isError } = useQuery({
     queryKey: ['traffic-app-clients', app, range],
     queryFn: () => trafficApi.appClients(app, range).then((r) => r.data),
@@ -67,15 +138,25 @@ function AppClientsCard({ app, range, onClose }: { app: string; range: Range; on
   const max = Math.max(1, ...(data?.clients ?? []).map((c) => c.total_bytes));
   return (
     <div className="card overflow-hidden">
-      <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
+      <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2 flex-wrap">
         <Activity className="w-4 h-4 text-indigo-500" />
-        <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200 truncate">{app}: who&rsquo;s using it</h2>
+        <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200 truncate">{app}</h2>
+        <div className="flex rounded-lg border border-gray-200 dark:border-slate-700 overflow-hidden text-xs" role="tablist">
+          {tabs.map((t) => (
+            <button key={t} role="tab" aria-selected={tab === t} onClick={() => setTab(t)}
+              className={clsx('px-2.5 py-1', tab === t ? 'bg-indigo-500 text-white' : 'text-gray-600 dark:text-slate-300 hover:bg-gray-50 dark:hover:bg-slate-700/40')}>
+              {t === 'clients' ? 'Who\u2019s using it' : t === 'destinations' ? 'Where it goes' : 'Names looked up'}
+            </button>
+          ))}
+        </div>
         <span className="text-xs text-gray-400 dark:text-slate-500 ml-auto flex-shrink-0">
           {data ? `${data.client_count} client${data.client_count === 1 ? '' : 's'} · ${formatBytes(data.total_bytes)}` : ''}
         </span>
         <button onClick={onClose} className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-slate-200" title="Close"><X className="w-4 h-4" /></button>
       </div>
-      {isLoading ? <div className="p-6 text-center text-sm text-gray-400">Loading…</div>
+      {tab === 'names' ? <DnsNamesList range={range} className="max-h-[28rem] overflow-y-auto" />
+        : tab === 'destinations' ? <DestinationsList range={range} app={app} className="max-h-[28rem] overflow-y-auto" />
+        : isLoading ? <div className="p-6 text-center text-sm text-gray-400">Loading…</div>
         : isError ? <div className="p-6 text-center text-sm text-red-500">The metrics database could not be read, so this data is unavailable right now.</div>
         : !data || data.clients.length === 0 ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">No client traffic for {app} in this range.</div>
         : (
@@ -99,7 +180,20 @@ function AppClientsCard({ app, range, onClose }: { app: string; range: Range; on
                   <div className="mt-0.5 flex gap-3 text-xs text-gray-400 dark:text-slate-500">
                     <span className="inline-flex items-center gap-0.5"><ArrowDown className="w-3 h-3" />{formatBytes(c.download_bytes)}</span>
                     <span className="inline-flex items-center gap-0.5"><ArrowUp className="w-3 h-3" />{formatBytes(c.upload_bytes)}</span>
+                    {c.mac !== 'other' && (
+                      <button type="button" className="ml-auto inline-flex items-center gap-0.5 text-teal-600 dark:text-teal-400 hover:underline"
+                        onClick={(e) => { e.stopPropagation(); setWhereTo(whereTo === c.mac ? null : c.mac); }}>
+                        <MapPin className="w-3 h-3" />{whereTo === c.mac ? 'Hide' : isDns ? 'Names' : 'Where to'}
+                      </button>
+                    )}
                   </div>
+                  {whereTo === c.mac && (
+                    <div className="mt-2 -mx-5 border-t border-gray-100 dark:border-slate-800 bg-gray-50/60 dark:bg-slate-900/40" onClick={(e) => e.stopPropagation()}>
+                      {isDns && c.mac !== 'unknown'
+                        ? <DnsNamesList range={range} mac={c.mac} limit={15} />
+                        : <DestinationsList range={range} app={app} mac={c.mac} limit={10} />}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -114,7 +208,16 @@ function AppClientsCard({ app, range, onClose }: { app: string; range: Range; on
 
 export default function TrafficAnalyticsPage() {
   const { formatDateTime, formatTime } = useDateTimeFormat();
-  const [range, setRange] = useRememberedRange<Range>('traffic-analytics', '24h', RANGES);
+  const [range, setPreset] = useRememberedRange<Range>('traffic-analytics', '24h', RANGES);
+  // A window picked on the chart (#463), inside the preset; everything on the
+  // page follows it. Picking a preset leaves it.
+  const [zoom, setZoom] = useState<{ from: string; to: string } | null>(null);
+  const setRange = (r: Range) => { setZoom(null); setPreset(r); };
+  const view = zoom ? `${zoom.from}/${zoom.to}` : range;
+  const spanMs = zoom ? Date.parse(zoom.to) - Date.parse(zoom.from) : { '1h': 1, '24h': 24, '7d': 168, '30d': 720 }[range] * 3_600_000;
+  const showDays = spanMs > 2 * 86_400_000;
+  // A window in the past doesn't change; only a preset keeps up with now.
+  const refetch = zoom ? false : 60_000;
   const [selectedApp, setSelectedApp] = useState<string | null>(null);
   // Top Talkers was a fixed list of ten with no way to look anything up, which
   // is unusable on a network of any size — you could see the loudest ten and
@@ -123,24 +226,27 @@ export default function TrafficAnalyticsPage() {
   // accurate.
   const [clientQuery, setClientQuery] = useState('');
   const [topLimit, setTopLimit] = useState(10);
+  // Top Talkers shows five rows and scrolls for the rest, so it stays the
+  // height of Traffic by Application beside it.
+  const [talkerListRef, talkerListPx] = useRowsHeight(5, 64, 1);
   const navigate = useNavigate();
 
   const { data: series = [], isLoading: seriesLoading, isError: seriesError, error: seriesErr } = useQuery({
-    queryKey: ['traffic-timeseries', range],
-    queryFn: () => trafficApi.timeseries(range).then(r => r.data),
-    refetchInterval: 60_000,
+    queryKey: ['traffic-timeseries', view],
+    queryFn: () => trafficApi.timeseries(view).then(r => r.data),
+    refetchInterval: refetch,
   });
 
   const { data: topClients = [], isLoading: clientsLoading, isError: clientsError } = useQuery({
-    queryKey: ['traffic-top-clients', range, topLimit],
-    queryFn: () => trafficApi.topClients(range, topLimit).then(r => r.data),
-    refetchInterval: 60_000,
+    queryKey: ['traffic-top-clients', view, topLimit],
+    queryFn: () => trafficApi.topClients(view, topLimit).then(r => r.data),
+    refetchInterval: refetch,
   });
 
   const { data: apps = [], isLoading: appsLoading, isError: appsError } = useQuery({
-    queryKey: ['traffic-apps', range],
-    queryFn: () => trafficApi.apps(range).then(r => r.data),
-    refetchInterval: 60_000,
+    queryKey: ['traffic-apps', view],
+    queryFn: () => trafficApi.apps(view).then(r => r.data),
+    refetchInterval: refetch,
   });
 
   const { data: status } = useQuery({
@@ -150,7 +256,13 @@ export default function TrafficAnalyticsPage() {
   });
 
   const isLoading = seriesLoading || clientsLoading || appsLoading;
-  const hasData = series.length > 0 || topClients.length > 0 || apps.length > 0;
+  // A zoomed window with nothing in it still shows the page, so you can zoom back out.
+  const hasData = series.length > 0 || topClients.length > 0 || apps.length > 0 || !!zoom;
+  const { handlers: zoomHandlers, band: zoomBand } = useDragZoom(series, (from, to) => setZoom({ from, to }));
+  const zoomLabel = zoom ? windowLabel(zoom, formatDateTime, formatTime) : '';
+  // Destinations and DNS names are kept by the hour, so they cover every hour the window touches.
+  const hourly = zoom && !(onHour(zoom.from) && onHour(zoom.to))
+    ? windowLabel({ from: floorHour(zoom.from), to: ceilHour(zoom.to) }, formatDateTime, formatTime) : null;
 
   const totalUpload = series.reduce((s, p) => s + p.upload, 0);
   const totalDownload = series.reduce((s, p) => s + p.download, 0);
@@ -196,8 +308,10 @@ export default function TrafficAnalyticsPage() {
             {RANGES.map(r => (
               <button key={r} onClick={() => setRange(r)}
                 className={clsx('px-3 py-1 rounded-md text-sm font-medium transition-colors',
-                  range === r
+                  range === r && !zoom
                     ? 'bg-blue-600 text-white shadow-sm'
+                    : range === r
+                    ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
                     : 'text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700')}>
                 {r}
               </button>
@@ -209,6 +323,20 @@ export default function TrafficAnalyticsPage() {
           </Link>
         </div>
       </div>
+
+      {zoom && (
+        <div className="card px-4 py-2.5 flex items-center gap-3 flex-wrap text-sm">
+          <ZoomIn className="w-4 h-4 text-blue-500 flex-shrink-0" />
+          <span className="text-gray-700 dark:text-slate-200">Zoomed to <span className="font-semibold">{zoomLabel}</span></span>
+          {hourly && (
+            <span className="text-xs text-gray-400 dark:text-slate-500">Destinations and names are kept by the hour, so they cover {hourly}.</span>
+          )}
+          <button onClick={() => setZoom(null)}
+            className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-lg border border-gray-300 dark:border-slate-600 text-xs text-gray-600 dark:text-slate-300 hover:bg-gray-100 dark:hover:bg-slate-700 transition-colors">
+            <ZoomOut className="w-3.5 h-3.5" />Back to {range}
+          </button>
+        </div>
+      )}
 
       {/* Empty state */}
       {/* A failed read is an error, not "set up NetFlow" (outside review J3). */}
@@ -240,7 +368,7 @@ export default function TrafficAnalyticsPage() {
                 <ArrowDown className="w-5 h-5 text-blue-600 dark:text-blue-400" />
               </div>
               <div>
-                <div className="text-xs text-gray-400 dark:text-slate-500">Download ({range})</div>
+                <div className="text-xs text-gray-400 dark:text-slate-500">Download ({zoom ? 'selection' : range})</div>
                 <div className="text-lg font-bold text-gray-900 dark:text-white">{formatBytes(totalDownload)}</div>
               </div>
             </div>
@@ -249,7 +377,7 @@ export default function TrafficAnalyticsPage() {
                 <ArrowUp className="w-5 h-5 text-violet-600 dark:text-violet-400" />
               </div>
               <div>
-                <div className="text-xs text-gray-400 dark:text-slate-500">Upload ({range})</div>
+                <div className="text-xs text-gray-400 dark:text-slate-500">Upload ({zoom ? 'selection' : range})</div>
                 <div className="text-lg font-bold text-gray-900 dark:text-white">{formatBytes(totalUpload)}</div>
               </div>
             </div>
@@ -257,9 +385,16 @@ export default function TrafficAnalyticsPage() {
 
           {/* Throughput chart */}
           <div className="card p-5">
-            <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200 mb-4">Network Traffic</h2>
+            <div className="flex items-baseline justify-between gap-2 flex-wrap mb-4">
+              <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Network Traffic</h2>
+              <span className="text-xs text-gray-400 dark:text-slate-500">Drag across a chart to zoom in</span>
+            </div>
+            {zoom && series.length === 0 && (
+              <div className="text-sm text-gray-400 dark:text-slate-500 text-center py-2">No traffic in this window.</div>
+            )}
+            <div className="select-none cursor-crosshair">
             <ResponsiveContainer width="100%" height={280}>
-              <AreaChart data={series}>
+              <AreaChart data={series} {...zoomHandlers}>
                 <defs>
                   <linearGradient id="dl" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#3b82f6" stopOpacity={0.35} />
@@ -271,7 +406,7 @@ export default function TrafficAnalyticsPage() {
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200 dark:stroke-slate-700" />
-                <XAxis dataKey="time" tickFormatter={timeFormatter(range, formatTime)} tick={{ fontSize: 11 }} stroke="currentColor" />
+                <XAxis dataKey="time" tickFormatter={timeFormatter(showDays, formatTime)} tick={{ fontSize: 11 }} stroke="currentColor" />
                 <YAxis tickFormatter={v => formatBytes(v)} tick={{ fontSize: 11 }} width={70} stroke="currentColor" />
                 <Tooltip
                   labelFormatter={t => { try { return formatDateTime(parseISO(String(t)), { year: undefined }); } catch { return String(t); } }}
@@ -281,15 +416,18 @@ export default function TrafficAnalyticsPage() {
                 <Legend formatter={(v: string) => (v === 'download' ? 'Download' : 'Upload')} />
                 <Area type="monotone" dataKey="download" stroke="#3b82f6" fill="url(#dl)" strokeWidth={2} />
                 <Area type="monotone" dataKey="upload" stroke="#8b5cf6" fill="url(#ul)" strokeWidth={2} />
+                {zoomBand}
               </AreaChart>
             </ResponsiveContainer>
+            </div>
           </div>
 
           {/* Inbound packets chart */}
           <div className="card p-5">
             <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200 mb-4">Inbound Packets</h2>
+            <div className="select-none cursor-crosshair">
             <ResponsiveContainer width="100%" height={220}>
-              <AreaChart data={series}>
+              <AreaChart data={series} {...zoomHandlers}>
                 <defs>
                   <linearGradient id="pktIn" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#10b981" stopOpacity={0.35} />
@@ -297,7 +435,7 @@ export default function TrafficAnalyticsPage() {
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-gray-200 dark:stroke-slate-700" />
-                <XAxis dataKey="time" tickFormatter={timeFormatter(range, formatTime)} tick={{ fontSize: 11 }} stroke="currentColor" />
+                <XAxis dataKey="time" tickFormatter={timeFormatter(showDays, formatTime)} tick={{ fontSize: 11 }} stroke="currentColor" />
                 <YAxis tickFormatter={v => formatCount(v)} tick={{ fontSize: 11 }} width={55} stroke="currentColor" />
                 <Tooltip
                   labelFormatter={t => { try { return formatDateTime(parseISO(String(t)), { year: undefined }); } catch { return String(t); } }}
@@ -305,13 +443,15 @@ export default function TrafficAnalyticsPage() {
                   {...chartTooltip}
                 />
                 <Area type="monotone" dataKey="downloadPackets" stroke="#10b981" fill="url(#pktIn)" strokeWidth={2} />
+                {zoomBand}
               </AreaChart>
             </ResponsiveContainer>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-            {/* Top talkers */}
-            <div className="card overflow-hidden">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Top talkers: five rows high, scrolling for the rest */}
+            <div className="card overflow-hidden lg:col-start-1 lg:row-start-1">
               <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 space-y-2">
                 <div className="flex items-center gap-2 flex-wrap">
                   <BarChart3 className="w-4 h-4 text-blue-500" />
@@ -340,13 +480,13 @@ export default function TrafficAnalyticsPage() {
                 </div>
               </div>
               {topClients.length === 0
-                ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">No client traffic recorded.</div>
+                ? <div className="p-6 flex items-center justify-center text-center text-sm text-gray-400 dark:text-slate-500" style={{ height: talkerListPx }}>No client traffic recorded.</div>
                 : visibleClients.length === 0
-                ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">
+                ? <div className="p-6 flex items-center justify-center text-center text-sm text-gray-400 dark:text-slate-500" style={{ height: talkerListPx }}>
                     No client in the top {topClients.length} matches “{clientQuery.trim()}”.
                   </div>
                 : (
-                  <div className="divide-y divide-gray-100 dark:divide-slate-800">
+                  <div ref={talkerListRef} className="divide-y divide-gray-100 dark:divide-slate-800 overflow-y-auto" style={{ height: talkerListPx }}>
                     {visibleClients.map(c => {
                       const isReal = c.mac !== 'unknown' && c.mac !== 'other';
                       return (
@@ -376,18 +516,18 @@ export default function TrafficAnalyticsPage() {
                 )}
             </div>
 
-            {/* Right column: protocol breakdown + data health, stacked to align with Top Talkers */}
-            <div className="space-y-6">
-            {/* App categories */}
-            <div className="card overflow-hidden">
+            {/* App categories: beside Top Talkers and the same height. On wide
+                screens contain:size keeps its own content out of the row's sizing,
+                so Top Talkers sets the height and this card fills it. */}
+            <div className="card overflow-hidden flex flex-col lg:col-start-2 lg:row-start-1 lg:[contain:size]">
               <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
                 <Activity className="w-4 h-4 text-indigo-500" />
                 <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Traffic by Application</h2>
               </div>
               {apps.length === 0
-                ? <div className="p-6 text-center text-sm text-gray-400 dark:text-slate-500">No application data recorded.</div>
+                ? <div className="p-6 flex-1 flex items-center justify-center text-sm text-gray-400 dark:text-slate-500">No application data recorded.</div>
                 : (
-                  <div className="p-5 flex flex-col sm:flex-row sm:items-center gap-5">
+                  <div className="p-5 flex-1 min-h-0 overflow-y-auto flex flex-col sm:flex-row sm:items-center gap-5">
                     {/* Donut — grows to fill the available space */}
                     <div className="relative w-full sm:w-1/2 flex-shrink-0">
                       <ResponsiveContainer width="100%" height={260}>
@@ -433,7 +573,11 @@ export default function TrafficAnalyticsPage() {
                 )}
             </div>
 
-            {selectedApp && <AppClientsCard app={selectedApp} range={range} onClose={() => setSelectedApp(null)} />}
+            {/* Right column under it: who uses the picked application, then data
+                health. Before Top Destinations in the page so on a phone the
+                picked application's clients open right under the donut. */}
+            <div className="space-y-6 lg:col-start-2 lg:row-start-2 self-start">
+            {selectedApp && <AppClientsCard app={selectedApp} range={view} onClose={() => setSelectedApp(null)} />}
 
             {/* Flow sources & data health */}
             <div className="card overflow-hidden">
@@ -518,6 +662,16 @@ export default function TrafficAnalyticsPage() {
                 )}
             </div>
             </div>
+            </div>
+
+            {/* Where the site's traffic goes (#366 step 2), under Top Talkers */}
+            <div className="card overflow-hidden self-start lg:col-start-1 lg:row-start-2">
+              <div className="px-5 py-3 border-b border-gray-200 dark:border-slate-700 flex items-center gap-2">
+                <Globe className="w-4 h-4 text-teal-500" />
+                <h2 className="text-sm font-semibold text-gray-700 dark:text-slate-200">Top Destinations</h2>
+                <span className="text-xs text-gray-400 dark:text-slate-500 ml-auto">Click one to see who used it</span>
+              </div>
+              <DestinationsList range={view} limit={15} className="max-h-[32rem] overflow-y-auto" />
             </div>
           </div>
         </>

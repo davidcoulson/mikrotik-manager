@@ -6,7 +6,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Settings, Users, Key, Plus, Trash2, CheckCircle, AlertCircle, Pencil, X,
   ShieldCheck, ShieldAlert, RefreshCw, Upload, Lock, Bell, Send, ClipboardList, Zap, LogIn,
-  Activity, Moon, Globe, HardDrive, Bot } from 'lucide-react';
+  Activity, Moon, Globe, HardDrive, Bot, Flame, Waypoints } from 'lucide-react';
 import { settingsApi, authApi, certApi, alertsApi, auditLogApi, tagsApi } from '../services/api';
 import { docsUrl } from '../version';
 import MaintenanceWindowsCard from '../components/settings/MaintenanceWindowsCard';
@@ -25,6 +25,8 @@ import FirmwareTimeoutCard from '../components/settings/FirmwareTimeoutCard';
 import PollModulesCard from '../components/settings/PollModulesCard';
 import TagRow from '../components/settings/TagRow';
 import DarkSiteCard from '../components/settings/DarkSiteCard';
+import FirewallLogSettingsCard from '../components/settings/FirewallLogSettingsCard';
+import DnsSourcesCard from '../components/settings/DnsSourcesCard';
 import FleetSshKeysCard from '../components/settings/FleetSshKeysCard';
 import AutomationSettings from '../components/settings/AutomationSettings';
 import EncryptionKeyCard from '../components/settings/EncryptionKeyCard';
@@ -61,7 +63,7 @@ interface EditUserState {
 }
 
 const SETTINGS_TABS = ['general', 'users', 'sso', 'ai', 'security', 'certificate', 'alerting', 'audit', 'tags',
-  'maintenance', 'automation', 'poller', 'darksite', 'sshkeys', 'platformbackup'] as const;
+  'maintenance', 'automation', 'poller', 'darksite', 'sshkeys', 'platformbackup', 'firewalllogs', 'dns'] as const;
 type SettingsTab = typeof SETTINGS_TABS[number];
 
 export default function SettingsPage() {
@@ -508,6 +510,9 @@ export default function SettingsPage() {
         ...(isAdmin ? [{ key: 'sshkeys' as const, label: 'SSH Keys', icon: Key }] : []),
         { key: 'alerting' as const, label: 'Alerting', icon: Bell },
         { key: 'automation' as const, label: 'Automation', icon: Zap },
+        { key: 'firewalllogs' as const, label: 'Firewall Logs', icon: Flame },
+        // AdGuard Home sources (#366): the manager calls them with a saved login, so fleet admins only.
+        ...(isAdmin && !user?.siteRoles ? [{ key: 'dns' as const, label: 'DNS Query Log', icon: Waypoints }] : []),
         ...(isAdmin ? [
           { key: 'tags' as const, label: 'Tags', icon: ShieldCheck },
           { key: 'maintenance' as const, label: 'Maintenance', icon: ShieldAlert },
@@ -904,6 +909,8 @@ export default function SettingsPage() {
                 { key: 'netflow_retention_days', label: 'Traffic detail retention', desc: 'Auto-delete per-client NetFlow time-series data older than this many days' },
                 { key: 'netflow_daily_retention_days', label: 'Traffic daily rollup retention', desc: 'Auto-delete per-client daily traffic totals older than this many days' },
                 { key: 'retention_sessions_days', label: 'Session log retention', desc: 'Auto-delete NetFlow sessions that ended more than this many days ago' },
+                { key: 'retention_destinations_days', label: 'Traffic destinations retention', desc: 'Auto-delete where-it-goes traffic (per client, application and remote address, by hour) older than this many days' },
+                { key: 'retention_dns_days', label: 'DNS lookup retention', desc: 'Auto-delete lookup counts and answers read from AdGuard Home older than this many days' },
               ].map(({ key, label, desc }) => (
                 <div key={key} className="flex items-center justify-between gap-4">
                   <div>
@@ -1113,6 +1120,18 @@ export default function SettingsPage() {
       ))}
 
       {/* ── Users ── */}
+      {activeTab === 'firewalllogs' && (
+        <div className="max-w-2xl">
+          <FirewallLogSettingsCard isAdmin={isAdmin} />
+        </div>
+      )}
+
+      {activeTab === 'dns' && isAdmin && !user?.siteRoles && (
+        <div className="max-w-2xl">
+          <DnsSourcesCard />
+        </div>
+      )}
+
       {activeTab === 'darksite' && (
         <div className="max-w-2xl">
           <DarkSiteCard isAdmin={isAdmin} />
@@ -1893,7 +1912,7 @@ export default function SettingsPage() {
 
           {/* Hardware health limit (#168) */}
           <div className="card p-5">
-            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Hardware health</h3>
+            <h3 className="font-semibold text-gray-900 dark:text-white mb-1">Hardware Health</h3>
             <p className="text-xs text-gray-400 dark:text-slate-500 mb-3">
               A device shows as degraded when a power supply or fan reports a failure, or a temperature
               reaches this limit. Readings can be ignored per device on its Overview tab.

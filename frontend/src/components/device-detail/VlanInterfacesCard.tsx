@@ -18,7 +18,7 @@ const PARENT: Record<VlanInterface['parentKind'], { label: string; help: string 
   unknown: { label: 'unknown', help: 'The parent interface was not found' },
 };
 
-const EMPTY: VlanInterfaceForm = { vlanId: '', name: '', parent: '', mtu: '', comment: '', enabled: true, address: '' };
+const EMPTY: VlanInterfaceForm = { vlanId: '', name: '', parent: '', mtu: '', comment: '', enabled: true, address: '', serviceTag: false };
 
 function errText(e: unknown): string {
   return (e as { response?: { data?: { error?: string } } })?.response?.data?.error || (e as Error)?.message || 'That didn’t work';
@@ -72,6 +72,8 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
       ...(form.mtu ? { mtu: Number(form.mtu) } : {}),
       ...(form.comment.trim() ? { comment: form.comment.trim() } : {}),
       ...(form.enabled ? {} : { disabled: true }),
+      ...(form.serviceTag ? { use_service_tag: true } : {}),
+      ...(form.mvrp ? { mvrp: true } : {}),
       ...(form.address.trim() ? { address: form.address.trim() } : {}),
     };
     return devicesApi.addVlanInterface(deviceId, { ...input, ...lock });
@@ -108,12 +110,15 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
   const valid = !!form && !nameError && !mtuError && !addressError && /^\d+$/.test(form.vlanId) && Number(form.vlanId) >= 1 && Number(form.vlanId) <= 4094
     && !!form.parent && (!editing || Object.keys(changes ?? {}).length > 0);
   const set = (patch: Partial<VlanInterfaceForm>) => setForm((f) => (f ? { ...f, ...patch } : f));
+  // MVRP is RouterOS 7.15+, which prints it on every VLAN interface. With none
+  // to go by, offer it; an older router refuses it with its own message.
+  const mvrpAvailable = editing ? editing.mvrp != null : rows.length === 0 || rows.some((r) => r.mvrp != null);
 
   return (
     <div className="card p-4 space-y-3">
       <div className="flex items-center gap-2 flex-wrap">
         <Layers className="w-4 h-4 text-indigo-500" />
-        <h3 className="text-sm font-semibold text-gray-900 dark:text-white">VLAN interfaces</h3>
+        <h3 className="text-sm font-semibold text-gray-900 dark:text-white">VLAN Interfaces</h3>
         <span className="text-xs text-gray-400 dark:text-slate-500">{rows.length}</span>
         {(isFetching || busy) && <RefreshCw className="w-3.5 h-3.5 animate-spin text-gray-400 ml-auto" />}
       </div>
@@ -164,6 +169,18 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
                       title={PARENT[v.parentKind].help}>
                       {PARENT[v.parentKind].label}
                     </span>
+                    {v.useServiceTag && (
+                      <span className="ml-1.5 px-1.5 py-0.5 rounded text-[11px] bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300"
+                        title="Tagged with the 802.1ad service tag (0x88a8), as on a Q-in-Q bridge">
+                        service tag
+                      </span>
+                    )}
+                    {v.mvrp && (
+                      <span className="ml-1.5 px-1.5 py-0.5 rounded text-[11px] bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-300"
+                        title="MVRP declares this VLAN to MVRP neighbours on its parent">
+                        MVRP
+                      </span>
+                    )}
                   </td>
                   <td className="py-2 pr-3 font-mono text-gray-600 dark:text-slate-400">
                     {v.addresses.length ? v.addresses.map((a) => <div key={a}>{a}</div>) : '—'}
@@ -184,7 +201,7 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
                           onClick={() => {
                             setNote(null);
                             setEditing(v);
-                            setForm({ vlanId: String(v.vlanId ?? ''), name: v.name, parent: v.parent, mtu: v.mtu, comment: v.comment, enabled: !v.disabled, address: '' });
+                            setForm({ vlanId: String(v.vlanId ?? ''), name: v.name, parent: v.parent, mtu: v.mtu, comment: v.comment, enabled: !v.disabled, address: '', serviceTag: !!v.useServiceTag, ...(v.mvrp != null ? { mvrp: v.mvrp } : {}) });
                           }}
                           className="p-1 text-gray-400 hover:text-blue-500 disabled:opacity-40"><Pencil className="w-3.5 h-3.5" /></button>
                         <button type="button" title={`Remove ${v.name}`} disabled={busy || !v.id}
@@ -215,7 +232,7 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
       {canWrite && form && (
         <div className="p-3 rounded-lg border border-blue-200 dark:border-slate-600 bg-blue-50/40 dark:bg-slate-800/60 space-y-3">
           <h4 className="text-xs font-semibold text-gray-700 dark:text-slate-200">
-            {editing ? `Edit ${editing.name}` : 'Add VLAN interface'}
+            {editing ? `Edit ${editing.name}` : 'Add VLAN Interface'}
           </h4>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <div>
@@ -260,6 +277,16 @@ export default function VlanInterfacesCard({ deviceId, deviceName }: { deviceId:
             <label className="flex items-center gap-2 text-xs text-gray-700 dark:text-slate-300 self-end pb-2">
               <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} /> Enabled
             </label>
+            <label className="flex items-center gap-2 text-xs text-gray-700 dark:text-slate-300 self-end pb-2"
+              title="Tag with the 802.1ad service tag (0x88a8) rather than 802.1Q. Needed on a bridge whose VLAN tag is 0x88a8 (Q-in-Q).">
+              <input type="checkbox" checked={!!form.serviceTag} onChange={(e) => set({ serviceTag: e.target.checked })} /> Service tag (802.1ad)
+            </label>
+            {mvrpAvailable && (
+              <label className="flex items-center gap-2 text-xs text-gray-700 dark:text-slate-300 self-end pb-2"
+                title="Declare this VLAN to MVRP neighbours on the parent, so switches running MVRP add it to their links toward this device. Needs RouterOS 7.15 or later.">
+                <input type="checkbox" checked={!!form.mvrp} onChange={(e) => set({ mvrp: e.target.checked })} /> MVRP
+              </label>
+            )}
           </div>
           {parentIsBridge && form.vlanId && (
             <p className="flex gap-1.5 text-[11px] text-gray-500 dark:text-slate-400">

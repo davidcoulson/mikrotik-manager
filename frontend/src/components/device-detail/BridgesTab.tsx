@@ -2,9 +2,11 @@ import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Network, Plus, Pencil, Trash2, Check, X, RefreshCw, AlertCircle, Cpu } from 'lucide-react';
 import clsx from 'clsx';
-import { devicesApi, type BridgeView } from '../../services/api';
+import { devicesApi, type BridgeView, type BridgePortView, type BridgePortUpdate } from '../../services/api';
+import { portPriorityValue, portPriorityError, pathCostError, bpduGuardWarning } from '../../utils/portStp';
 import { useCanWrite } from '../../hooks/useCanWrite';
 import { bridgeMtuCeiling, bridgeMtuError } from '../../utils/mtu';
+import IpAddressesCard from './IpAddressesCard';
 import { LockoutVerdictDialog, lockoutVerdictOf, guardOutcomeMessage, type LockoutVerdict, type GuardResult } from '../ChangeGuardDialog';
 
 const MODES = [
@@ -18,7 +20,57 @@ function errText(e: unknown): string {
   return (e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'That didn’t work';
 }
 
-interface EditForm { name: string; protocol_mode: string; priority: string; comment: string; enabled: boolean; mtu: string }
+interface EditForm { name: string; protocol_mode: string; priority: string; comment: string; enabled: boolean; mtu: string; ether_type: string; mvrp: boolean }
+
+/** The tag a bridge reads as a VLAN (#449). */
+const ETHER_TYPES = [
+  { value: '0x8100', label: '0x8100 (802.1Q)' },
+  { value: '0x88a8', label: '0x88a8 (802.1ad service tag, Q-in-Q)' },
+  { value: '0x9100', label: '0x9100 (older Q-in-Q)' },
+];
+
+interface PortForm {
+  tag_stacking: boolean; mvrp_applicant_state: string; mvrp_registrar_state: string;
+  stp_priority: string; path_cost: string; edge: string; point_to_point: string;
+  bpdu_guard: boolean; restricted_role: boolean; restricted_tcn: boolean;
+}
+const portFormOf = (p: BridgePortView): PortForm => ({
+  tag_stacking: !!p.tagStacking,
+  mvrp_applicant_state: p.mvrpApplicant ?? 'normal-participant',
+  mvrp_registrar_state: p.mvrpRegistrar ?? 'normal',
+  stp_priority: p.stpPriority ?? '',
+  path_cost: p.pathCost ?? '',
+  edge: p.edge ?? 'auto',
+  point_to_point: p.pointToPoint ?? 'auto',
+  bpdu_guard: !!p.bpduGuard,
+  restricted_role: !!p.restrictedRole,
+  restricted_tcn: !!p.restrictedTcn,
+});
+const portChanges = (p: BridgePortView, f: PortForm) => {
+  const d: BridgePortUpdate = {};
+  if (f.tag_stacking !== !!p.tagStacking) d.tag_stacking = f.tag_stacking;
+  if (p.mvrpApplicant != null && f.mvrp_applicant_state !== p.mvrpApplicant) d.mvrp_applicant_state = f.mvrp_applicant_state;
+  if (p.mvrpRegistrar != null && f.mvrp_registrar_state !== p.mvrpRegistrar) d.mvrp_registrar_state = f.mvrp_registrar_state;
+  // Spanning tree: only what changed, and only settings the device reported.
+  if (f.stp_priority.trim() && portPriorityValue(f.stp_priority) !== portPriorityValue(p.stpPriority ?? '')) d.stp_priority = f.stp_priority.trim();
+  if (f.path_cost.trim() && f.path_cost.trim() !== (p.pathCost ?? '')) d.path_cost = f.path_cost.trim();
+  // Emptied: back to RouterOS's own (it doesn't print the default).
+  else if (!f.path_cost.trim() && p.pathCost) d.path_cost = 'default';
+  if (p.edge != null && f.edge !== p.edge) d.edge = f.edge;
+  if (p.pointToPoint != null && f.point_to_point !== p.pointToPoint) d.point_to_point = f.point_to_point;
+  if (p.bpduGuard != null && f.bpdu_guard !== p.bpduGuard) d.bpdu_guard = f.bpdu_guard;
+  if (p.restrictedRole != null && f.restricted_role !== p.restrictedRole) d.restricted_role = f.restricted_role;
+  if (p.restrictedTcn != null && f.restricted_tcn !== p.restrictedTcn) d.restricted_tcn = f.restricted_tcn;
+  return d;
+};
+
+const EDGE_CHOICES = [
+  { value: 'auto', label: 'Auto (edge until a BPDU arrives)' },
+  { value: 'yes', label: 'Yes (end device: forward at once)' },
+  { value: 'no', label: 'No (always a link to a switch)' },
+  { value: 'yes-discover', label: 'Yes, but become non-edge on a BPDU' },
+  { value: 'no-discover', label: 'No, but become edge without BPDUs' },
+];
 
 /**
  * Every bridge on the device (#284): its settings, ports (hardware-switched or
@@ -39,6 +91,9 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
   const [lockout, setLockout] = useState<{ verdict: LockoutVerdict; retry: () => void } | null>(null);
   const [adding, setAdding] = useState<{ name: string; protocol_mode: string; vlan_filtering: boolean; comment: string } | null>(null);
   const [editing, setEditing] = useState<{ bridge: BridgeView; form: EditForm } | null>(null);
+  const [portEdit, setPortEdit] = useState<{ bridgeId: string; port: BridgePortView; form: PortForm } | null>(null);
+  // The bridge whose addresses are open for editing (#466).
+  const [addrFor, setAddrFor] = useState<string | null>(null);
 
   const refresh = () => {
     void qc.invalidateQueries({ queryKey: ['bridges', deviceId] });
@@ -66,7 +121,7 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
   });
 
   const changesOf = (b: BridgeView, f: EditForm) => {
-    const d: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean; mtu?: string } = {};
+    const d: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean; mtu?: string; ether_type?: string; mvrp?: boolean } = {};
     if (f.name.trim() !== b.name) d.name = f.name.trim();
     if (f.protocol_mode !== b.protocolMode) d.protocol_mode = f.protocol_mode;
     if (f.priority.trim() && f.priority.trim().toLowerCase() !== (b.priority ?? '').toLowerCase()) d.priority = f.priority.trim();
@@ -74,6 +129,8 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
     if (f.enabled !== !b.disabled) d.disabled = !f.enabled;
     const mtu = f.mtu.trim().toLowerCase() || 'auto';
     if (mtu !== (b.mtuSetting ?? 'auto')) d.mtu = mtu;
+    if (b.etherType != null && f.ether_type !== b.etherType) d.ether_type = f.ether_type;
+    if (b.mvrp != null && f.mvrp !== b.mvrp) d.mvrp = f.mvrp;
     return d;
   };
   const update = useMutation({
@@ -81,6 +138,12 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
       devicesApi.updateBridge(deviceId, b.name, d, confirm),
     onSuccess: (r) => { setEditing(null); done(r); },
     onError: (e, v) => failed(() => update.mutate({ ...v, confirm: true }))(e),
+  });
+  const portUpdate = useMutation({
+    mutationFn: ({ iface, d, confirm = false }: { iface: string; d: BridgePortUpdate; confirm?: boolean }) =>
+      devicesApi.updateBridgePort(deviceId, iface, d, confirm),
+    onSuccess: (r) => { setPortEdit(null); done(r); },
+    onError: (e, v) => failed(() => portUpdate.mutate({ ...v, confirm: true }))(e),
   });
   const filtering = useMutation({
     mutationFn: ({ b, on, confirm = false }: { b: BridgeView; on: boolean; confirm?: boolean }) =>
@@ -93,7 +156,7 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
     onSuccess: done,
     onError: (e, v) => failed(() => remove.mutate({ ...v, confirm: true }))(e),
   });
-  const busy = add.isPending || update.isPending || filtering.isPending || remove.isPending;
+  const busy = add.isPending || update.isPending || filtering.isPending || remove.isPending || portUpdate.isPending;
 
   if (isLoading) return <div className="text-center py-8 text-gray-400">Loading…</div>;
   if (loadError) return <div className="card p-6 text-sm text-red-500">{errText(loadError)}</div>;
@@ -128,7 +191,7 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
 
       {adding && (
         <div className="card p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-gray-900 dark:text-white">New bridge</h3>
+          <h3 className="text-sm font-semibold text-gray-900 dark:text-white">New Bridge</h3>
           <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
             <div><label className="label">Name</label>
               <input className="input font-mono" value={adding.name} placeholder="bridge-guest" autoFocus
@@ -180,11 +243,23 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
                 {b.disabled ? 'disabled' : b.running ? 'running' : 'not running'}
               </span>
               <span className="text-xs text-gray-500 dark:text-slate-400 font-mono">{b.protocolMode.toUpperCase()}{b.priority ? ` · priority ${b.priority}` : ''}{b.mtu ? ` · MTU ${b.mtu}${b.mtuSetting && b.mtuSetting !== 'auto' ? '' : ' (auto)'}` : ''}</span>
+              {b.etherType && b.etherType !== '0x8100' && (
+                <span title={`The bridge reads ${b.etherType} as the VLAN tag`}
+                  className="px-1.5 py-0.5 rounded text-[11px] font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300">
+                  Q-in-Q {b.etherType}
+                </span>
+              )}
+              {b.mvrp && (
+                <span title="MVRP registers VLANs with its neighbours"
+                  className="px-1.5 py-0.5 rounded text-[11px] font-medium bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-300">
+                  MVRP
+                </span>
+              )}
               {b.comment && <span className="text-xs text-gray-400">· {b.comment}</span>}
               {canWrite && !e && !b.dynamic && (
                 <div className="ml-auto flex items-center gap-1">
                   <button type="button" title="Edit" disabled={busy}
-                    onClick={() => { setNote(null); setAdding(null); setEditing({ bridge: b, form: { name: b.name, protocol_mode: b.protocolMode, priority: b.priority ?? '', comment: b.comment ?? '', enabled: !b.disabled, mtu: b.mtuSetting ?? 'auto' } }); }}
+                    onClick={() => { setNote(null); setAdding(null); setPortEdit(null); setEditing({ bridge: b, form: { name: b.name, protocol_mode: b.protocolMode, priority: b.priority ?? '', comment: b.comment ?? '', enabled: !b.disabled, mtu: b.mtuSetting ?? 'auto', ether_type: b.etherType ?? '0x8100', mvrp: !!b.mvrp } }); }}
                     className="btn-secondary text-xs py-1 flex items-center gap-1.5"><Pencil className="w-3 h-3" /> Edit</button>
                   <button type="button" disabled={busy || !emptyBridge}
                     title={emptyBridge ? 'Delete this bridge' : 'Only a bridge with no ports, addresses or VLANs can be deleted'}
@@ -216,6 +291,33 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
                       {mtuErr ?? `auto, or up to ${ceiling ?? 'the ports\u2019 L2 MTU'}${b.mtu ? ` · now ${b.mtu}` : ''}. Only the router\u2019s own traffic on the bridge; ports switch jumbo frames on their own MTUs.`}
                     </p></div>
                 </div>
+                {b.etherType == null && (
+                  <p className="text-xs text-gray-500 dark:text-slate-400">
+                    Q-in-Q (the VLAN tag type) and MVRP are VLAN filtering settings: RouterOS only shows them with VLAN
+                    filtering on. Turn it on to see and change them.
+                  </p>
+                )}
+                {b.etherType != null && <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  <div className="sm:col-span-2"><label className="label">VLAN tag (EtherType)</label>
+                    <select className="input" value={e.form.ether_type} onChange={(ev) => setEditing({ ...e, form: { ...e.form, ether_type: ev.target.value } })}>
+                      {ETHER_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                    </select>
+                    <p className="text-[11px] mt-1 text-gray-400">
+                      Which tag the bridge reads as the VLAN, in effect with VLAN filtering on. With 0x88a8 a customer&apos;s
+                      802.1Q tags pass through inside the service VLAN; a VLAN interface on the bridge then needs
+                      &ldquo;Service tag&rdquo; ticked. Some switch chips only do 0x8100 in hardware and switch the rest on the CPU.
+                    </p></div>
+                  {b.mvrp != null && (
+                    <div><label className="label">MVRP</label>
+                      <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300 mt-2">
+                        <input type="checkbox" checked={e.form.mvrp} onChange={(ev) => setEditing({ ...e, form: { ...e.form, mvrp: ev.target.checked } })} />
+                        Register VLANs with neighbours
+                      </label>
+                      <p className="text-[11px] mt-1 text-gray-400">
+                        A VLAN a neighbour registers makes that port a tagged member of it, dynamically.
+                      </p></div>
+                  )}
+                </div>}
                 <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
                   <input type="checkbox" checked={e.form.enabled} onChange={(ev) => setEditing({ ...e, form: { ...e.form, enabled: ev.target.checked } })} />
                   Enabled
@@ -225,7 +327,8 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
                   on the bridge the manager connects through, both run with auto-revert. Disabling that bridge is predicted
                   as a lockout and asks first. An MTU change on that bridge also runs with auto-revert. The bridge&apos;s MTU is
                   for the router&apos;s own address, routing and VLAN interfaces on it; jumbo frames switched between ports
-                  only need those ports&apos; MTU raised on the Ports tab.
+                  only need those ports&apos; MTU raised on the Ports tab. Changing the VLAN tag or MVRP on that bridge
+                  runs with auto-revert too.
                 </p>
                 <div className="flex gap-2">
                   <button onClick={() => update.mutate({ b, d: changesOf(b, e.form) })} disabled={busy || pending === 0 || !e.form.name.trim() || !!mtuErr}
@@ -244,14 +347,26 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
                 </div>
                 {b.ports.length === 0 ? <span className="text-gray-400">none</span> : (
                   <div className="flex flex-wrap gap-1">
-                    {b.ports.map((p) => (
-                      <span key={p.name}
-                        title={[p.hw ? 'Switched by the switch chip' : 'Switched by the CPU', p.pvid ? `PVID ${p.pvid}` : '', p.role ?? '', p.inactive ? 'inactive' : '', p.disabled ? 'disabled' : ''].filter(Boolean).join(' · ')}
-                        className={clsx('px-1.5 py-0.5 rounded font-mono text-xs border',
-                          p.disabled || p.inactive ? 'border-gray-200 text-gray-400 dark:border-slate-700' : 'border-gray-300 text-gray-700 dark:border-slate-600 dark:text-slate-200')}>
-                        {p.name}{!p.hw && <Cpu className="w-3 h-3 inline ml-0.5 -mt-0.5 text-amber-500" />}
-                      </span>
-                    ))}
+                    {b.ports.map((p) => {
+                      const editable = canWrite && !p.dynamic && !b.dynamic;
+                      const open = portEdit?.bridgeId === b.id && portEdit.port.name === p.name;
+                      return (
+                        <button type="button" key={p.name} disabled={!editable || busy}
+                          onClick={() => { setNote(null); setEditing(null); setPortEdit(open ? null : { bridgeId: b.id, port: p, form: portFormOf(p) }); }}
+                          title={[p.hw ? 'Switched by the switch chip' : 'Switched by the CPU', p.pvid ? `PVID ${p.pvid}` : '', p.role ?? '',
+                            p.tagStacking ? 'tag stacking' : '', p.mvrpRegistrar === 'fixed' ? 'MVRP registrar fixed' : '',
+                            p.mvrpApplicant === 'non-participant' ? 'MVRP non-participant' : '',
+                            p.bpduGuard ? 'BPDU guard' : '', p.restrictedRole ? 'restricted role' : '',
+                            p.inactive ? 'inactive' : '', p.disabled ? 'disabled' : '', editable ? 'Click for spanning tree, tag stacking and MVRP' : ''].filter(Boolean).join(' · ')}
+                          className={clsx('px-1.5 py-0.5 rounded font-mono text-xs border disabled:cursor-default',
+                            open ? 'border-blue-500 ring-1 ring-blue-500' : '',
+                            p.disabled || p.inactive ? 'border-gray-200 text-gray-400 dark:border-slate-700' : 'border-gray-300 text-gray-700 dark:border-slate-600 dark:text-slate-200',
+                            editable && 'enabled:hover:border-blue-400')}>
+                          {p.name}{!p.hw && <Cpu className="w-3 h-3 inline ml-0.5 -mt-0.5 text-amber-500" />}
+                          {p.tagStacking && <span className="ml-1 text-[9px] font-sans font-semibold text-indigo-600 dark:text-indigo-300">TS</span>}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -277,9 +392,149 @@ export default function BridgesTab({ deviceId, deviceName, onGoToPorts }: {
               <div>
                 <div className="text-xs text-gray-500 dark:text-slate-400 mb-1">Addresses</div>
                 {b.addresses.length ? <span className="font-mono text-xs text-gray-700 dark:text-slate-300">{b.addresses.join(', ')}</span> : <span className="text-gray-400">none</span>}
+                {canWrite && !b.dynamic && (
+                  <button type="button" className="ml-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                    onClick={() => setAddrFor(addrFor === b.name ? null : b.name)}>
+                    {addrFor === b.name ? 'Close' : b.addresses.length ? 'Edit' : 'Add one'}
+                  </button>
+                )}
                 {b.mtu && <div className="text-xs text-gray-400 mt-1">MTU {b.mtu}{b.macAddress ? ` · ${b.macAddress}` : ''}</div>}
               </div>
             </div>
+
+            {addrFor === b.name && (
+              <div className="mt-3">
+                <IpAddressesCard deviceId={deviceId} deviceName={deviceName || 'confirm'} iface={b.name} onChanged={refresh} />
+              </div>
+            )}
+
+            {portEdit?.bridgeId === b.id && (() => {
+              const pe = portEdit;
+              const d = portChanges(pe.port, pe.form);
+              const hasMvrp = pe.port.mvrpApplicant != null || pe.port.mvrpRegistrar != null;
+              const hasStp = b.protocolMode !== 'none' && (pe.port.edge != null || pe.port.stpPriority != null);
+              const prioErr = portPriorityError(pe.form.stp_priority);
+              const costErr = pathCostError(pe.form.path_cost);
+              const guardWarn = pe.form.bpdu_guard && !pe.port.bpduGuard ? bpduGuardWarning(pe.port.role) : null;
+              const setF = (patch: Partial<PortForm>) => setPortEdit({ ...pe, form: { ...pe.form, ...patch } });
+              return (
+                <div className="rounded-lg border border-gray-200 dark:border-slate-700 p-3 space-y-3">
+                  <h4 className="text-sm font-semibold text-gray-900 dark:text-white">Port <span className="font-mono">{pe.port.name}</span></h4>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
+                        <input type="checkbox" checked={pe.form.tag_stacking} onChange={(ev) => setPortEdit({ ...pe, form: { ...pe.form, tag_stacking: ev.target.checked } })} />
+                        Tag stacking
+                      </label>
+                      <p className="text-[11px] mt-1 text-gray-400">
+                        Every frame in is treated as untagged and gets the port&apos;s PVID{pe.port.pvid ? ` (${pe.port.pvid})` : ''} as an
+                        outer tag, over any tag it had. Needs VLAN filtering and a VLAN entry for the PVID.
+                      </p>
+                    </div>
+                    {hasMvrp && (<>
+                      <div><label className="label">MVRP applicant</label>
+                        <select className="input" value={pe.form.mvrp_applicant_state} onChange={(ev) => setPortEdit({ ...pe, form: { ...pe.form, mvrp_applicant_state: ev.target.value } })}>
+                          <option value="normal-participant">Normal participant</option>
+                          <option value="non-participant">Non-participant (sends nothing)</option>
+                        </select></div>
+                      <div><label className="label">MVRP registrar</label>
+                        <select className="input" value={pe.form.mvrp_registrar_state} onChange={(ev) => setPortEdit({ ...pe, form: { ...pe.form, mvrp_registrar_state: ev.target.value } })}>
+                          <option value="normal">Normal</option>
+                          <option value="fixed">Fixed (ignores registrations, stays in its configured VLANs)</option>
+                        </select></div>
+                    </>)}
+                  </div>
+                  {hasStp && (
+                    <div className="space-y-2 border-t border-gray-100 dark:border-slate-700 pt-3">
+                      <div className="text-xs font-semibold text-gray-700 dark:text-slate-200">
+                        Spanning Tree
+                        <span className="ml-2 font-normal text-gray-400">
+                          {[pe.port.role ? `${pe.port.role.replace(/-port$/, '')} port` : '', pe.port.edgePort ? 'running as an edge port' : ''].filter(Boolean).join(' · ') || 'not running yet'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                        <div><label className="label">Port priority</label>
+                          <input className={clsx('input font-mono', prioErr && 'border-red-400')} value={pe.form.stp_priority} placeholder="0x80"
+                            onChange={(ev) => setF({ stp_priority: ev.target.value })} />
+                          {prioErr && <p className="text-[11px] mt-1 text-red-500">{prioErr}</p>}</div>
+                        <div><label className="label">Path cost</label>
+                          <input className={clsx('input font-mono', costErr && 'border-red-400')} value={pe.form.path_cost} placeholder="default"
+                            onChange={(ev) => setF({ path_cost: ev.target.value })} />
+                          {costErr && <p className="text-[11px] mt-1 text-red-500">{costErr}</p>}</div>
+                        <div><label className="label">Edge</label>
+                          <select className="input" value={pe.form.edge} onChange={(ev) => setF({ edge: ev.target.value })}>
+                            {EDGE_CHOICES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+                          </select></div>
+                        <div><label className="label">Point-to-point</label>
+                          <select className="input" value={pe.form.point_to_point} onChange={(ev) => setF({ point_to_point: ev.target.value })}>
+                            <option value="auto">Auto (from duplex)</option>
+                            <option value="yes">Yes</option>
+                            <option value="no">No (shared segment)</option>
+                          </select></div>
+                      </div>
+                      <p className="text-[11px] text-gray-400">
+                        Between two links to the same switch, the lower path cost becomes the root port, then the lower priority.
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                        <div>
+                          <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
+                            <input type="checkbox" checked={pe.form.bpdu_guard} onChange={(ev) => setF({ bpdu_guard: ev.target.checked })} />
+                            BPDU guard
+                          </label>
+                          <p className="text-[11px] mt-1 text-gray-400">Shuts the port if a BPDU arrives. For ports to end devices only.</p>
+                          {guardWarn && <p className="text-[11px] mt-1 text-amber-600 dark:text-amber-400 flex gap-1"><AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />{guardWarn}</p>}
+                        </div>
+                        <div>
+                          <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
+                            <input type="checkbox" checked={pe.form.restricted_role} onChange={(ev) => setF({ restricted_role: ev.target.checked })} />
+                            Restricted role
+                          </label>
+                          <p className="text-[11px] mt-1 text-gray-400">The port can never become the root port, so equipment beyond it can&apos;t take over as root.</p>
+                        </div>
+                        <div>
+                          <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-slate-300">
+                            <input type="checkbox" checked={pe.form.restricted_tcn} onChange={(ev) => setF({ restricted_tcn: ev.target.checked })} />
+                            Restricted TCN
+                          </label>
+                          <p className="text-[11px] mt-1 text-gray-400">Topology changes heard on the port aren&apos;t passed on, so they don&apos;t flush the network&apos;s MAC tables.</p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400">On the port the manager connects through, these run with auto-revert.</p>
+                  <div className="flex gap-2">
+                    <button onClick={() => portUpdate.mutate({ iface: pe.port.name, d })} disabled={busy || Object.keys(d).length === 0 || !!prioErr || !!costErr}
+                      className="btn-primary flex items-center gap-2 text-sm">
+                      {portUpdate.isPending ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />} Save
+                    </button>
+                    <button onClick={() => setPortEdit(null)} disabled={portUpdate.isPending} className="btn-secondary text-sm"><X className="w-3.5 h-3.5 inline mr-1" />Cancel</button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {b.mvrp && b.ports.some((p) => p.registeredVlans || p.declaredVlans) && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-gray-200 dark:border-slate-700">
+                      <th className="table-header px-2 py-1.5 text-left">MVRP port</th>
+                      <th className="table-header px-2 py-1.5 text-left">Registered VLANs</th>
+                      <th className="table-header px-2 py-1.5 text-left">Declared VLANs</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 dark:divide-slate-700">
+                    {b.ports.filter((p) => p.registeredVlans || p.declaredVlans).map((p) => (
+                      <tr key={p.name}>
+                        <td className="px-2 py-1 font-mono">{p.name}</td>
+                        <td className="px-2 py-1 font-mono">{p.registeredVlans || '—'}</td>
+                        <td className="px-2 py-1 font-mono">{p.declaredVlans || '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         );
       })}

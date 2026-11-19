@@ -10,7 +10,7 @@ import { useGuardedWrite, GuardedWriteUi } from '../ChangeGuardDialog';
 import ReviewChangesButton from '../common/ReviewChangesButton';
 import {
   ROUTER, pairKey, draftErrors, policySummary, initialDraft, addZone, removeZone, setPolicy, zoneNameError, customError, protocolName,
-  logsDrops, setLogsDrops,
+  logsDrops, setLogsDrops, ZONE_PRESETS, applyPreset,
 } from '../../utils/zones';
 
 const errMsg = (e: unknown) => (e as { response?: { data?: { error?: string } } })?.response?.data?.error || (e as Error)?.message || 'That didn’t work';
@@ -31,6 +31,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
   const [open, setOpen] = useState(true);
   const [message, setMessage] = useState('');
   const [failure, setFailure] = useState('');
+  const [preset, setPreset] = useState('');
   const base = useMemo(() => (data ? initialDraft(data) : null), [data]);
   const current = draft ?? base;
   const editing = !!data && !!current && canWrite && (data.enabled || setup);
@@ -53,7 +54,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
   const guard = useGuardedWrite();
   const fail = (e: unknown) => setFailure(errMsg(e));
   const done = (msg: string) => {
-    setMessage(msg); setFailure(''); setDraft(null); setSetup(false);
+    setMessage(msg); setFailure(''); setDraft(null); setSetup(false); setPreset('');
     qc.invalidateQueries({ queryKey: ['firewall-zones', deviceId] });
     onApplied();
   };
@@ -124,6 +125,26 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
           </div>
         )}
 
+        {editing && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <label className="text-gray-600 dark:text-slate-300" htmlFor={`zone-preset-${deviceId}`}>Start from a preset</label>
+            <select id={`zone-preset-${deviceId}`} className="input text-xs py-1 w-auto" value={preset}
+              onChange={(e) => {
+                const p = ZONE_PRESETS.find((x) => x.key === e.target.value);
+                setPreset(e.target.value);
+                if (p) update(applyPreset(d, data, p));
+              }}>
+              <option value="">Choose…</option>
+              {ZONE_PRESETS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
+            </select>
+            {preset && (
+              <span className="text-gray-500 dark:text-slate-400 basis-full">
+                {ZONE_PRESETS.find((x) => x.key === preset)?.description} It replaces the zones and matrix below; put each routed
+                interface in its zone, check the cells, and nothing is sent until you {setup ? 'turn zones on' : 'apply'}.
+              </span>
+            )}
+          </div>
+        )}
         <ZoneList data={data} draft={d} errors={errors} editable={editing} onChange={update} />
         <Matrix draft={d} labels={labels} errors={errors} editable={editing} onChange={update} services={data.services} managerIp={data.manager_ip} />
 
@@ -180,7 +201,7 @@ export default function ZonesCard({ deviceId, deviceName, onApplied }: { deviceI
             </button>
             <ReviewChangesButton className="text-xs py-1.5" deviceName={deviceName} applyLabel={setup ? 'Turn on zones' : 'Apply'} onApply={apply}
               disabled={applyMut.isPending || !clean} request={() => zonesApi.apply(deviceId, d)} />
-            {(dirty || setup) && <button className="btn-secondary text-xs py-1.5" onClick={() => { setDraft(null); setSetup(false); }}>Cancel</button>}
+            {(dirty || setup) && <button className="btn-secondary text-xs py-1.5" onClick={() => { setDraft(null); setSetup(false); setPreset(''); }}>Cancel</button>}
             {data.enabled && (
               <button className="ml-auto text-xs text-gray-500 hover:text-red-600 flex items-center gap-1" disabled={offMut.isPending}
                 onClick={() => { if (confirm('Turn zones off? The rules stay on the device as ordinary rules you can edit; nothing is changed.')) offMut.mutate(); }}>
@@ -209,7 +230,7 @@ function ZoneList({ data, draft, errors, editable, onChange }: {
   const ifaces = data.interfaces.filter((i) => i.type !== 'loopback');
   return (
     <div className="space-y-2">
-      <div className="text-xs font-medium text-gray-700 dark:text-slate-300">Zones and their interfaces</div>
+      <div className="text-xs font-medium text-gray-700 dark:text-slate-300">Zones and Their Interfaces</div>
       {draft.config.zones.map((z) => {
         const dynamic = data.lists.find((l) => l.name === z)?.members.filter((m) => m.dynamic).map((m) => m.interface) ?? [];
         const free = ifaces.filter((i) => !owner.has(i.name) && !dynamic.includes(i.name));
@@ -300,7 +321,7 @@ function Matrix({ draft, labels, errors, editable, onChange, services, managerIp
   return (
     <div className="space-y-2">
       <div>
-        <div className="text-xs font-medium text-gray-700 dark:text-slate-300">What each zone can reach</div>
+        <div className="text-xs font-medium text-gray-700 dark:text-slate-300">What Each Zone Can Reach</div>
         <div className="text-[11px] text-gray-500 dark:text-slate-400">
           {editable ? 'Click a cell to choose what the zone on the left can reach in the zone or router above it.' : 'Click a cell to see what\u2019s allowed.'}
         </div>

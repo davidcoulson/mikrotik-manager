@@ -5,7 +5,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { FileText, Plus, Play, Pencil, Copy, Trash2, Search, X, Download } from 'lucide-react';
 import { commandTemplatesApi, devicesApi, type CommandTemplate } from '../services/api';
 import { apiErrorMessage } from '../utils/apiError';
-import { useCanWrite } from '../hooks/useCanWrite';
 import SecretsCard from '../components/templates/SecretsCard';
 import { useAuthStore } from '../store/authStore';
 
@@ -26,7 +25,8 @@ export default function TemplatesPage() {
   const isFleetAdmin = useAuthStore((st) => st.user?.role === 'admin' && !(st.user as { siteRoles?: Record<string, string> | null })?.siteRoles);
   const { formatDateTime } = useDateTimeFormat();
   const qc = useQueryClient();
-  const canWrite = useCanWrite();
+  // Writing templates is fleet-admin only: a template can run as a router's admin login (GHSA-fv5m-vfmw-8h9v).
+  const canWrite = isFleetAdmin;
   const [search, setSearch] = useState('');
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState('');
@@ -113,7 +113,7 @@ export default function TemplatesPage() {
 
       {capturing && !draft && (
         <div className="card p-5 space-y-3">
-          <h2 className="font-semibold text-gray-900 dark:text-white">Template from a device</h2>
+          <h2 className="font-semibold text-gray-900 dark:text-white">Template from a Device</h2>
           <p className="text-sm text-gray-600 dark:text-slate-300">
             Pick a device you&rsquo;ve set up the way you want, and what to take from it. It&rsquo;s read now and written as the commands
             that set it, in a new template to check before saving. Secrets (SNMP communities, passwords) and the device&rsquo;s own
@@ -146,7 +146,7 @@ export default function TemplatesPage() {
 
       {draft && (
         <div className="card p-5 space-y-3">
-          <h2 className="font-semibold text-gray-900 dark:text-white">{draft.id ? 'Edit template' : 'New template'}</h2>
+          <h2 className="font-semibold text-gray-900 dark:text-white">{draft.id ? 'Edit Template' : 'New Template'}</h2>
           <input className="input w-full" placeholder="Name, e.g. LTE failover defaults" value={draft.name}
                  onChange={(e) => setDraft({ ...draft, name: e.target.value })} autoFocus />
           <input className="input w-full" placeholder="What it's for (optional)" value={draft.description}

@@ -330,7 +330,7 @@ Certificate (ACME)**. The email is optional, but without one you get no expiry n
   in use, including an uploaded one, and nginx reloads.
 - Renewal is checked every 12 hours. A failed request is retried after an hour, and the
   certificate in use stays until a new one arrives.
-- **Last Certbot attempt** on the same card shows the result and Certbot's output, which is the
+- **Last Certbot Attempt** on the same card shows the result and Certbot's output, which is the
   place to look when it fails. `docker compose logs nginx` has it too.
 - To turn it off, press **Use .env Values** with no `ACME_DOMAIN` in `.env`. The certificate it
   got stays in place.
@@ -564,10 +564,11 @@ turned off individually. All are **on** by default.
 | Daily RouterOS update check | MikroTik's update servers, contacted **by each device** | Devices are not asked daily; the on-demand button still works |
 | RouterOS changelogs | `download.mikrotik.com` | Release notes are not shown |
 | MAC vendor database download | `standards-oui.ieee.org` | The vendor list is not refreshed; an existing copy is still used |
+| IP owner database download | `iptoasn.com` | Traffic destinations are named from the copy built into the release, which ages until the next update |
 | RouterOS vulnerability list | `services.nvd.nist.gov`, `www.cisa.gov` | The Security page doesn't list known CVEs for the fleet's versions |
 | Documentation link | `2gt-media-group-llc.github.io` | The top-bar documentation button is hidden |
 
-Alert channels — Slack, Discord, Telegram, ntfy, webhooks — are not listed. They send only
+Alert channels (Slack, Discord, Telegram, ntfy, webhooks) and AdGuard Home sources are not listed. They send only
 when a destination has been configured, so leaving them unconfigured is already the off switch.
 
 The daily RouterOS check is the one that is easy to miss when auditing a firewall: the request

@@ -6,7 +6,7 @@ what each tab of a device does, and the parts that write to hardware.
 ## Adding devices
 
 Use **Wireless Systems** for outdoor PTP/PtMP bridges, antennas and CPE. It has a
-dedicated device filter and an **Antenna aligner** tab for watching both ends of
+dedicated device filter and an **Antenna Aligner** tab for watching both ends of
 a link. Existing devices can be reclassified in Edit Device. See the
 [antenna aligner guide](antenna-aligner.md).
 
@@ -40,6 +40,24 @@ given. The plain API sends the login unencrypted on every poll, so a device that
 8728 is listed on the [Security page](security.md#encrypted-management-api-ssl), where it
 can be switched over. Choosing 8728 for a public address still shows a warning.
 
+**Force add without checking connectivity** saves the device with unknown status without
+connecting. If no API port was specified in the form, address, or credential preset, it
+stores port `0` until a poll can connect: the poll tries API-SSL first, then the plain API
+when API-SSL is unavailable, and saves the working port. An explicit API-SSL choice uses
+its corresponding standard port instead. A specified port is kept as given. If **The API
+isn't enabled on this device yet** is also ticked, the first poll uses SSH instead; later
+polls retry the API as described below.
+
+On the first successful connection, a **force-added** device's serial is checked before it is
+collected. Failed polls leave it unknown and pending until it connects; polling statistics retain the
+failure details. Manual sync and API checks are available after that first poll succeeds.
+If it matches one device in the same site, the new record is removed when the
+existing device is online. Otherwise the new connection settings are merged into the existing
+record, preserving its history and combining tags; the new record is removed. A disabled
+existing device stays disabled. Matches in another site, multiple matches, or conflicting
+identity pins disable the new device and record an event for an administrator instead. If
+the device does not report a serial, no duplicate can be identified this way.
+
 When you enter a port, an **API-SSL (encrypted)** box appears under it. It is ticked for 8729
 and clear for any other port. Tick it when api-ssl runs on another port: a port forwarded
 through NAT to reach several devices behind one address, say, or a network where 8729 is
@@ -53,11 +71,12 @@ Many fleets start with the RouterOS API services (`api`, `api-ssl`) turned off. 
 isn't enabled on this device yet** in Add Device, or put `yes` in the `ssh_only` column of a
 [CSV import](#importing-from-csv) (#174).
 
-The manager tries the API briefly first, and if it answers, the device is added normally. If
+Unless force add is selected, the manager tries the API briefly first, and if it answers, the device is added normally. If
 it doesn't, the manager logs in over SSH instead. That reads the device's identity, model,
 RouterOS version and serial number (the serial still catches duplicates), and pins its SSH host
 key. The same login is used for SSH now and tried on the API later. A credential preset works
 too: its SSH login is used, or its API login when it has no SSH one.
+With force add, neither connection is checked until the first poll, which uses SSH.
 
 The device is listed as **SSH ONLY** in the API column. Until the API is on:
 
@@ -431,7 +450,8 @@ manager in is caught before it is applied.
 
 The **Config** tab's **IP Addresses** card lists the device's IPv4 addresses. Add one with the
 form below the list, remove one with the bin, or click the pencil to edit it in place: the
-address and prefix, the interface, the comment, and whether it's enabled (#285). Only the
+address and prefix, the interface, the comment, and whether it's enabled (#285). A bridge's
+addresses can also be edited from its row on the **Bridges** tab (see [Bridges](#bridges)). Only the
 fields you change are sent. Dynamic addresses (from a DHCP client, say) can't be edited.
 
 Every change runs through [Change Guard](change-guard.md). Changing, disabling or moving the
@@ -453,7 +473,7 @@ header. Click a header to fold a section, or use the chips at the top to hide on
 both are remembered in your browser. Sections only appear where the device has the data: a switch
 without connection tracking has no Connections section, a single-core device no per-core chart.
 
-On the dashboard's **Capacity & health** card, a device's CPU opens this tab at its CPU graph and
+On the dashboard's **Capacity & Health** card, a device's CPU opens this tab at its CPU graph and
 its memory at the Memory graph; the name opens the device.
 
 | Section | What it shows |
@@ -461,7 +481,7 @@ its memory at the Memory graph; the name opens the device.
 | **CPU** | Load as 5-minute (or longer) averages, with a light band up to the highest reading in each window, and each core on its own when there are several: one core pinned at 100% hardly moves the overall load |
 | **Memory** | Memory used, with the peak band where it differs |
 | **Connections** | Active connections (with the peak, and the share of the table's maximum), connections by protocol and NAT translations (src-nat, dst-nat), and new connections per second where the router counts them (below). Only where connection tracking is running |
-| **Firewall drops** | Packets per second dropped by drop and reject rules, per chain (input, forward, and raw), and the rules that dropped the most in the range |
+| **Firewall Drops** | Packets per second dropped by drop and reject rules, per chain (input, forward, and raw), and the rules that dropped the most in the range |
 | **Interfaces** | The four busiest ports and bonds in the range (or the ones you pick, up to eight), in and out on one chart each, their utilisation of the link speed, and packets per second. The same traffic isn't picked twice: a bond is picked rather than its members, a PPPoE client rather than the port under it, and VLAN and VRRP interfaces are left out (their traffic is counted on the port or bond they ride on). A bond's speed is its running members' together and a PPPoE client's is its port's; an interface whose speed isn't known is named under the utilisation chart. The picker lists ports in number order (ether1, ether2 … ether48, then SFP and QSFP ports, bonds and VLANs) |
 | **Temperature** | Each temperature sensor the device reports |
 
@@ -594,6 +614,20 @@ Add interfaces to a zone, or a new zone (which creates an interface list on the 
 interfaces in zones: a bridge, a VLAN interface, the WAN port. The firewall sees routed traffic on
 the bridge, not on its ports, so a zone made of bridge ports gets a warning. So does an interface
 with an address that's in no zone, since nothing reaches the router or another zone through it.
+
+**Start from a preset** (#330) lays out the zones and matrix for a common network, and replaces
+whatever the form held:
+
+| Preset | Zones | What it allows |
+|---|---|---|
+| Home or small office | LAN, WAN | LAN reaches everything; WAN gets ping to the router |
+| Office with a guest network | LAN, GUEST, WAN | Guests get the internet and the router's DNS and DHCP, not the LAN or each other |
+| Management network | MGMT, LAN, GUEST, WAN | Only MGMT manages the router and reaches every zone; LAN and guests get the internet and DNS, DHCP (and NTP for LAN) from the router |
+| Servers in a DMZ | LAN, DMZ, WAN | WAN reaches the DMZ on web ports only (add a port forward per server); the DMZ can't reach the LAN |
+
+A zone named like an interface list already on the device keeps that list's interfaces; the
+others start empty, for you to fill. Then check the cells, and nothing is sent until you turn
+zones on or apply.
 
 As you change the matrix, the form shows what applying will do: the lists and members it changes,
 and how many rules it adds, removes and keeps. **Show the rules** lists them all.
@@ -798,7 +832,7 @@ lite, can't hardware-switch a bridge with VLAN filtering on: turning it on moves
 switching to the CPU. On these chips VLANs belong in the switch chip's own table (**Switch,
 VLAN** in WinBox), with each port's VLAN mode, VLAN header and default VLAN.
 
-On such a device the **VLANs** tab shows a **Switch chip VLANs** card with that table and the
+On such a device the **VLANs** tab shows a **Switch Chip VLANs** card with that table and the
 port settings (#278), and no longer suggests turning on bridge VLAN filtering or offers to add
 bridge VLANs. You can edit it there:
 
@@ -824,7 +858,7 @@ use bridge VLAN filtering as described above and don't show the card.
 
 Routers often carry VLANs as VLAN interfaces (`/interface vlan`, **Interfaces, VLAN** in WinBox)
 on a port, with no bridge VLAN table at all: the router-on-a-stick layout on a CCR, CHR or RB.
-When a device has any, the **VLANs** tab lists them in a **VLAN interfaces** card (#309): VLAN
+When a device has any, the **VLANs** tab lists them in a **VLAN Interfaces** card (#309): VLAN
 ID, name, parent, addresses (IPv4, and IPv6 other than link-local), MTU, state and comment.
 
 The label next to the parent says what it is:
@@ -835,6 +869,15 @@ The label next to the parent says what it is:
 - **bridge, no filtering**: a bridge without VLAN filtering; only the device itself sees the
   tag, nothing is enforced on the bridge's ports
 - **bond**, or **Q-in-Q** for a VLAN stacked on another VLAN interface
+
+A VLAN interface tagged with the 802.1ad service tag (0x88a8) rather than 802.1Q is marked
+**service tag**. Tick **Service tag (802.1ad)** in the form for one on a Q-in-Q bridge (see
+[Q-in-Q and MVRP](#q-in-q-and-mvrp)) (#449).
+
+A VLAN interface with **MVRP** on is marked **MVRP**: it declares its VLAN to MVRP neighbours on
+its parent, so switches running MVRP add the VLAN to their links toward this device. Tick
+**MVRP** in the form to turn it on. It needs RouterOS 7.15 or later, and the form only offers it
+on a device that has it.
 
 The card is read live from the device each time the tab opens and every minute while it's open.
 
@@ -880,16 +923,109 @@ has a small chip icon; hover a port for its PVID and spanning tree role.
   port whose hardware can't go that high, such as a CRS510's 2028-byte management port, has to
   leave the bridge instead.
 - **turn on / turn off** next to VLAN filtering works as it does from the faceplate.
+- **Edit** (or **Add one**) next to the addresses opens the bridge's addresses under it: add
+  one, change one in place, or remove one, the same as **Config**, **IP Addresses** (see
+  [IP addresses](#ip-addresses)) but only for this bridge (from
+  [@ronchan44](https://github.com/ronchan44)'s #466). A DHCP server on the bridge isn't changed
+  with it: after moving a bridge to a new subnet, update its DHCP network, gateway and pool on
+  **Network Services**, **DHCP**.
 - The bin deletes a bridge with no ports, addresses or VLAN entries.
 
 Everything runs through [Change Guard](change-guard.md). Renaming the bridge the manager
 connects through, or changing its spanning tree or MTU, can't be simulated, so it runs with
 auto-revert required; turning that bridge off is predicted as a lockout and asks first.
 
+### Q-in-Q and MVRP
+
+The bridge's **Edit** form and its ports cover 802.1ad Q-in-Q, tag stacking and MVRP (#449).
+
+- **VLAN tag (EtherType)** is the tag the bridge reads as the VLAN: 0x8100 (802.1Q, the
+  default), 0x88a8 (the 802.1ad service tag) or 0x9100. It takes effect with VLAN filtering on.
+  With 0x88a8, a customer's 802.1Q tags pass through inside the service VLAN, and a VLAN
+  interface on the bridge needs **Service tag** ticked. A bridge reading anything other than
+  0x8100 shows a **Q-in-Q** label. Some switch chips only do 0x8100 in hardware (MikroTik lists
+  the 88E6393X, 88E6191X and 88E6190 as having no Q-in-Q), and switch the rest on the CPU.
+- **MVRP** registers VLANs with neighbouring switches. A VLAN a neighbour registers makes that
+  port a tagged member of it, dynamically. The setting only shows when the device's RouterOS
+  has MVRP.
+- Both are VLAN filtering settings: RouterOS only shows them with VLAN filtering on, so on a
+  bridge with filtering off the form asks you to turn it on first.
+- Click a port to set its **tag stacking**: every frame in is treated as untagged and gets the
+  port's PVID as an outer tag, over any tag it had. On a bridge with MVRP, the same panel sets the
+  port's **applicant** (normal, or non-participant: sends nothing) and **registrar** (normal, or
+  fixed: ignores registrations and stays in its configured VLANs). A port with tag stacking is
+  marked **TS**.
+- On a bridge running MVRP, a table lists each port's **registered** and **declared** VLANs, read
+  from the device when the tab opens.
+- **MVRP forbidden ports** are set per VLAN, on the **VLANs** tab: adding or editing a VLAN on a
+  bridge running MVRP shows the field. A forbidden port never registers that VLAN from a
+  neighbour and never declares it, so MVRP can't extend the VLAN over that link. It needs
+  RouterOS 7.15 or later. The VLANs table shows the forbidden ports in their own column when any
+  VLAN has some.
+- A **VLAN interface** can declare its VLAN over MVRP too: tick **MVRP** on it in the VLAN
+  Interfaces card (see [VLAN interfaces](#vlan-interfaces)).
+
+On the bridge or port the manager connects through, these run with auto-revert required.
+
+Editing a VLAN on the **VLANs** tab keeps the parts of the entry the form doesn't show: its
+comment (shown as the VLAN's name), whether it's disabled, and its forbidden ports. Before
+1.1.0-beta.62, an edit dropped them.
+
+### A port's spanning tree
+
+Click a port on a bridge running spanning tree to set how it takes part. The panel shows the
+port's role now (root, designated, alternate) and whether it's running as an edge port.
+
+- **Port priority** (0 to 240 in steps of 16, default 0x80) and **path cost** decide which of
+  two links to the same switch becomes the root port: the lower path cost, then the lower
+  priority. RouterOS works out the path cost itself unless you set one, and doesn't show it
+  then; empty the field to go back to that.
+- **Edge**: an edge port goes straight to forwarding, for end devices. **Auto** treats a port as
+  an edge until a BPDU arrives. **Yes** and **No** force it; the **discover** choices start
+  that way and change on what the port hears.
+- **Point-to-point**: whether the port is a direct link to one other switch, which lets RSTP
+  change its state quickly. **Auto** goes by duplex.
+- **BPDU guard** shuts the port the moment a BPDU arrives: for ports to end devices only. The
+  panel warns before you turn it on for a port that is the root, alternate or backup port,
+  since a switch is sending it BPDUs.
+- **Restricted role**: the port can never become the root port, so equipment beyond it can't
+  take over as root. For ports facing equipment you don't control.
+- **Restricted TCN**: topology changes heard on the port aren't passed on, so they don't flush
+  the MAC tables of the rest of the network.
+
+These run under [Change Guard](change-guard.md), with auto-revert on the port the manager
+connects through: BPDU guard, an edge setting or a restricted role on the wrong port can take a
+link down. Each bridge's own priority is set from its **Edit** form, or for a whole site from
+the **Spanning Tree** card on the [Topology](topology.md#the-spanning-tree-card) page.
+
+## 802.1X
+
+Switches and routers have an **802.1X** tab (#360) for port authentication: a port with 802.1X
+passes nothing until a device on it authenticates against a RADIUS server, such as
+[User Manager](user-manager.md#8021x-with-user-manager).
+
+- **Ports that authenticate:** turn 802.1X on for a port, with 802.1X, MAC authentication or
+  both (MAC is tried after three unanswered 802.1X attempts). A port can put devices in a
+  **guest VLAN** when they don't do 802.1X (only with 802.1X alone, as RouterOS requires), a
+  **reject VLAN** when RADIUS says no, and a **server down VLAN** when RADIUS doesn't answer.
+  These, and VLANs RADIUS assigns, need VLAN filtering on the bridge. Each port shows its
+  state: authorized, un-authorized, rejected or down.
+- **Authenticated now:** each device that's in, with its MAC, user, how it got in (802.1X, MAC,
+  or one of the fallback VLANs) and its VLAN.
+- **RADIUS servers:** the servers this device asks for 802.1X. Shared secrets are never shown;
+  leave the field empty when editing to keep the one there.
+- **This device authenticating upstream:** a supplicant on an uplink into a switch that requires
+  802.1X, with its EAP methods, identity and password or client certificate.
+
+Turning 802.1X on blocks a port until something authenticates, and a refused supplicant loses
+its uplink. Both run under Change Guard: on the port the device is managed through, it asks
+first and arms auto-revert. **Review changes** shows the RouterOS commands before they're sent.
+RouterOS has no 802.1X on SMIPS devices (hAP lite, hAP mini); the tab says so there.
+
 ## Routing between VLANs in hardware
 
 On a device whose switch chip supports it (Marvell 98DX: CRS3xx, CRS5xx, CCR2116, CCR2216),
-the **VLANs** tab has an **L3 hardware offloading** card (#254). It shows:
+the **VLANs** tab has an **L3 Hardware Offloading** card (#254). It shows:
 
 - whether offloading is on, and the switch chip;
 - which VLAN interfaces have addresses, so which VLANs the device routes between;

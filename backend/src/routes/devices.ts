@@ -1,6 +1,7 @@
 import { PartialApplyError, isPartialApply, stepFailure } from '../services/changeGuard/partialApply';
 import { resolveAuth } from '../services/sshExec';
-import { readSshInfo, refreshOverSsh, checkApi, promoteToApi, recordApiCheck, type SshOnlyDevice } from '../services/sshOnly';
+import { readSshInfo, refreshOverSsh, promoteToApi, type SshOnlyDevice } from '../services/sshOnly';
+import { checkApi, recordApiCheck } from '../services/apiCheck';
 import { describeSshFailure } from '../utils/sshOnly';
 import net from 'net';
 import { Router, Request, Response } from 'express';
@@ -92,7 +93,10 @@ import { ipv6RoutesView } from '../utils/ipv6Routes';
 import { switchVlanEntry, switchPortVlan, validPortName } from '../utils/switchVlanEdit';
 import { ipAddressEdit } from '../utils/ipAddressEdit';
 import { parseBgpConnection } from '../utils/bgpConnection';
-import { parseBridgeCreate, parseBridgeUpdate, bridgeMtuProblem } from '../utils/bridgeEdit';
+import { parseBridgeCreate, parseBridgeUpdate, parseBridgePortUpdate, bridgeMtuProblem } from '../utils/bridgeEdit';
+import { parseDot1xServer, parseDot1xClient, parseRadius } from '../utils/dot1xEdit';
+import { isItemId } from '../utils/userManager';
+import { tracerouteHops } from '../utils/traceroute';
 import { bridgesView } from '../utils/bridgesView';
 import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
 
@@ -796,6 +800,9 @@ router.put('/:id', requireWrite, async (req, res) => {
       return res.status(422).json({ error: describeSshFailure(err, ssh_port) });
     }
   } else if (!existing.ssh_only && (ipChanged || routeChanged || portChanged || tlsChanged || userChanged || api_password || presetReplacesApiCreds)) {
+    if (api_port === 0) {
+      return res.status(400).json({ error: 'Specify an API port to change the connection settings before the first successful poll.' });
+    }
     const testIp = ip_address ?? existing.ip_address;
     const testPort = api_port;
     const testUser = api_username ?? existing.api_username;
@@ -877,6 +884,9 @@ router.post('/:id/sync', requireWrite, async (req, res) => {
     [req.params.id]
   );
   if (!deviceRow) return res.status(404).json({ error: 'Device not found' });
+  if (deviceRow.force_add_pending) {
+    return res.status(409).json({ error: 'This force-added device is awaiting its first successful poll. Retry sync after it connects.' });
+  }
 
   // Without its API yet (#174), a sync is the SSH read the poller does.
   if (deviceRow.ssh_only) {
@@ -914,9 +924,12 @@ router.post('/:id/sync', requireWrite, async (req, res) => {
 // does the API answer now? If it does, the device is managed over the API from
 // now on and a full sync starts. The poller checks too, every minute.
 router.post('/:id/check-api', requireWrite, async (req, res) => {
-  const device = await queryOne<SshOnlyDevice & { ssh_only: boolean }>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  const device = await queryOne<SshOnlyDevice & { ssh_only: boolean; force_add_pending: boolean }>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
   if (!device) return res.status(404).json({ error: 'Device not found' });
   if (!device.ssh_only) return res.json({ api: true, message: 'This device is already managed over the API.' });
+  if (device.force_add_pending) {
+    return res.status(409).json({ error: 'This force-added device must complete its first SSH poll before checking the API.' });
+  }
   const check = await checkApi(device);
   if (!check.ok) {
     await recordApiCheck(device.id, check.message);
@@ -2299,6 +2312,7 @@ router.put('/:id/vlan-interfaces/:entryId', requireWrite, async (req, res) => {
     ? req.body.current_name : req.params.entryId;
   const changes: PlannedChange[] = [{ kind: 'vlan-iface.set', id: req.params.entryId, fields }];
   if (fields.mtu !== undefined) changes.push({ kind: 'path-object.change', name: label, what: 'MTU' });
+  if (fields['use-service-tag'] !== undefined) changes.push({ kind: 'path-object.change', name: label, what: 'The tag type (802.1ad service tag)' });
   await withGuardedChange(req.params.id, req, res,
     {
       kind: 'vlan-iface.set',
@@ -3689,6 +3703,18 @@ router.get('/:id/routing/router-id', async (req, res) => {
 
 // POST /api/devices/:id/vlans (add bridge VLAN)
 /**
+ * MVRP forbidden ports for a bridge VLAN (#449): undefined when not given (an
+ * edit keeps what the entry has), else a list of interface names.
+ */
+function mvrpForbiddenOf(v: unknown): { ports?: string[]; error?: string } {
+  if (v === undefined) return {};
+  if (!Array.isArray(v) || v.length > 512
+    || !v.every((p) => typeof p === 'string' && /^[^\s,"'=;\\]{1,64}$/.test(p))) {
+    return { error: 'mvrp_forbidden must be a list of interface names' };
+  }
+  return { ports: [...new Set(v as string[])] };
+}
+/**
  * A single RouterOS bridge VLAN row can cover a range or list ("10-20"), which the
  * cache expands into one row per VLAN. Editing or deleting one of those rows would
  * rewrite the whole entry, silently taking the other VLANs with it — so refuse, and
@@ -3708,6 +3734,8 @@ router.post('/:id/vlans', requireWrite, async (req, res) => {
   if (!bridge || !Number.isInteger(vlan_id) || vlan_id < 1 || vlan_id > 4094) {
     return res.status(400).json({ error: 'bridge and vlan_id (a whole number, 1-4094) are required' });
   }
+  const forbidden = mvrpForbiddenOf(req.body.mvrp_forbidden);
+  if (forbidden.error) return res.status(400).json({ error: forbidden.error });
 
   await withGuardedChange(
     req.params.id,
@@ -3719,7 +3747,7 @@ router.post('/:id/vlans', requireWrite, async (req, res) => {
       change: { kind: 'vlan.add', bridge, vlanId: vlan_id, tagged: tagged_ports, untagged: untagged_ports },
     },
     async (c) => {
-      await c.addBridgeVlan(bridge, vlan_id, tagged_ports, untagged_ports);
+      await c.addBridgeVlan(bridge, vlan_id, tagged_ports, untagged_ports, { mvrpForbidden: forbidden.ports });
       return { message: `VLAN ${vlan_id} added` };
     },
     async (c) => { await c.collectVlans(); }
@@ -3737,6 +3765,8 @@ router.put('/:id/vlans/:vlanDbId', requireWrite, async (req, res) => {
   if (multi) return res.status(409).json({ error: multi, reason: multi });
 
   const { tagged_ports = [], untagged_ports = [] } = req.body;
+  const forbidden = mvrpForbiddenOf(req.body.mvrp_forbidden);
+  if (forbidden.error) return res.status(400).json({ error: forbidden.error });
 
   await withGuardedChange(
     req.params.id,
@@ -3751,7 +3781,7 @@ router.put('/:id/vlans/:vlanDbId', requireWrite, async (req, res) => {
       },
     },
     async (c) => {
-      await c.updateBridgeVlan(vlan.bridge, vlan.vlan_id, tagged_ports, untagged_ports);
+      await c.updateBridgeVlan(vlan.bridge, vlan.vlan_id, tagged_ports, untagged_ports, { mvrpForbidden: forbidden.ports });
       return { message: `VLAN ${vlan.vlan_id} updated` };
     },
     async (c) => { await c.collectVlans(); }
@@ -4101,9 +4131,12 @@ router.put('/:id/bridges/:bridgeName', requireWrite, async (req, res) => {
   if (f.name && f.name !== name) changes.push({ kind: 'path-object.change', name, what: `Renaming the bridge to ${f.name}` });
   if (f.mtu) changes.push({ kind: 'path-object.change', name, what: 'Changing the MTU' });
   if (f['protocol-mode'] || f.priority) changes.push({ kind: 'path-object.change', name, what: 'Changing spanning tree' });
+  if (f['ether-type']) changes.push({ kind: 'path-object.change', name, what: 'Changing which tag the bridge reads as a VLAN' });
+  if (f.mvrp) changes.push({ kind: 'path-object.change', name, what: `Turning MVRP ${f.mvrp === 'yes' ? 'on' : 'off'}` });
   if (f.disabled) changes.push({ kind: 'interface.disable', name, disabled: f.disabled === 'yes' });
   const what = [f.name && f.name !== name ? `rename to '${f.name}'` : '', f['protocol-mode'] ? `protocol ${f['protocol-mode']}` : '',
-    f.priority ? `priority ${f.priority}` : '', f.mtu ? `MTU ${f.mtu}` : '', f.disabled ? (f.disabled === 'yes' ? 'disable' : 'enable') : '',
+    f.priority ? `priority ${f.priority}` : '', f.mtu ? `MTU ${f.mtu}` : '',
+    f['ether-type'] ? `EtherType ${f['ether-type']}` : '', f.mvrp ? `MVRP ${f.mvrp === 'yes' ? 'on' : 'off'}` : '', f.disabled ? (f.disabled === 'yes' ? 'disable' : 'enable') : '',
     f.comment !== undefined ? 'comment' : ''].filter(Boolean).join(', ');
   await withGuardedChange(req.params.id, req, res,
     {
@@ -4111,7 +4144,135 @@ router.put('/:id/bridges/:bridgeName', requireWrite, async (req, res) => {
       ...(changes.length ? { change: changes.length === 1 ? changes[0] : { kind: 'batch', changes } } : {}),
     },
     async (c) => { await c.updateBridge(name, f); return { message: `Bridge ${f.name ?? name} updated` }; },
-    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); });
+    // Spanning tree too: a new priority or mode shows at once, not at the next slow poll.
+    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); await c.collectStp().catch(() => {}); });
+});
+
+// PUT /api/devices/:id/bridge-ports/:iface { tag_stacking?, mvrp_applicant_state?, mvrp_registrar_state?,
+//   stp_priority?, path_cost?, edge?, point_to_point?, bpdu_guard?, restricted_role?, restricted_tcn? }
+// Q-in-Q, MVRP and spanning tree on one port (#449). Tag stacking changes which
+// VLAN the port's frames land in, and spanning tree can block or shut a port
+// (BPDU guard on an uplink shuts it), so on the port management comes in by
+// either runs with auto-revert.
+router.put('/:id/bridge-ports/:iface', requireWrite, async (req, res) => {
+  const iface = req.params.iface;
+  if (!IFACE_NAME.test(iface)) return res.status(400).json({ error: 'Invalid interface name.' });
+  const parsed = parseBridgePortUpdate(req.body ?? {});
+  if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+  const f = parsed.fields;
+  const changes: PlannedChange[] = [];
+  if (f['tag-stacking']) changes.push({ kind: 'path-object.change', name: iface, what: `Turning tag stacking ${f['tag-stacking'] === 'yes' ? 'on' : 'off'}` });
+  if (f['mvrp-applicant-state'] || f['mvrp-registrar-state']) changes.push({ kind: 'path-object.change', name: iface, what: 'Changing how the port takes part in MVRP' });
+  const stp = [f.priority ? `priority ${f.priority}` : '', f['path-cost'] !== undefined ? `path cost ${f['path-cost'] || 'back to default'}` : '',
+    f.edge ? `edge ${f.edge}` : '', f['point-to-point'] ? `point-to-point ${f['point-to-point']}` : '',
+    f['bpdu-guard'] ? `BPDU guard ${f['bpdu-guard'] === 'yes' ? 'on' : 'off'}` : '',
+    f['restricted-role'] ? `restricted role ${f['restricted-role'] === 'yes' ? 'on' : 'off'}` : '',
+    f['restricted-tcn'] ? `restricted TCN ${f['restricted-tcn'] === 'yes' ? 'on' : 'off'}` : ''].filter(Boolean);
+  if (stp.length) changes.push({ kind: 'path-object.change', name: iface, what: `Changing spanning tree on the port: ${stp.join(', ')}` });
+  const what = [f['tag-stacking'] ? `tag stacking ${f['tag-stacking'] === 'yes' ? 'on' : 'off'}` : '',
+    f['mvrp-applicant-state'] ? `MVRP applicant ${f['mvrp-applicant-state']}` : '',
+    f['mvrp-registrar-state'] ? `MVRP registrar ${f['mvrp-registrar-state']}` : '', ...stp].filter(Boolean).join(', ');
+  await withGuardedChange(req.params.id, req, res,
+    {
+      kind: 'bridge-port.set', summary: `Bridge port ${iface}: ${what}`,
+      change: changes.length === 1 ? changes[0] : { kind: 'batch', changes },
+    },
+    async (c) => { await c.updateBridgePort(iface, f); return { message: `Bridge port ${iface} updated` }; },
+    async (c) => { await c.collectInterfaces(); await c.collectVlans().catch(() => {}); await c.collectStp().catch(() => {}); });
+});
+
+// ─── 802.1X (#360) ───────────────────────────────────────────────────────────
+
+/** A RouterOS row without its secret: whether there is one, never the value. */
+function withoutSecret(row: Record<string, string>, key: 'password' | 'secret'): Record<string, string | boolean> {
+  const out: Record<string, string | boolean> = {};
+  for (const [k, v] of Object.entries(row)) if (k !== key) out[k] = v;
+  out[`has_${key}`] = !!row[key];
+  return out;
+}
+
+// GET /api/devices/:id/dot1x — authenticators, port states, who's authenticated,
+// supplicants and RADIUS servers. Passwords and shared secrets are never returned.
+router.get('/:id/dot1x', async (req, res) => {
+  const device = await queryOne<DeviceRow>(`SELECT * FROM devices WHERE id = $1`, [req.params.id]);
+  if (!device) return res.status(404).json({ error: 'Device not found' });
+  const c = new DeviceCollector(device);
+  try {
+    await c.connect();
+    const d = await c.getDot1x();
+    res.json({
+      supported: d.supported, servers: d.servers, state: d.state, active: d.active,
+      clients: d.clients.map((r) => withoutSecret(r, 'password')),
+      radius: d.radius.map((r) => withoutSecret(r, 'secret')),
+    });
+  } catch (e) {
+    res.status(502).json({ error: `Couldn't read 802.1X on ${device.name.trim()}: ${(e as Error).message}` });
+  } finally {
+    c.disconnect();
+  }
+});
+
+const DOT1X_MENUS = {
+  servers: { menu: '/interface/dot1x/server', kind: 'dot1x.server', parse: parseDot1xServer, noun: '802.1X on' },
+  clients: { menu: '/interface/dot1x/client', kind: 'dot1x.client', parse: parseDot1xClient, noun: '802.1X supplicant on' },
+  radius: { menu: '/radius', kind: 'radius.set', parse: parseRadius, noun: 'RADIUS server' },
+} as const;
+type Dot1xMenu = keyof typeof DOT1X_MENUS;
+const isDot1xMenu = (m: string): m is Dot1xMenu => m === 'servers' || m === 'clients' || m === 'radius';
+
+/**
+ * What a change to an authenticator or supplicant can do to the way in: a port
+ * with 802.1X on drops everything until a client authenticates, and a
+ * supplicant that's refused upstream loses its uplink. Flagged on the port, so
+ * Change Guard asks for auto-revert when it's the management path.
+ */
+function dot1xChange(menu: Dot1xMenu, iface: string | undefined, what: string): PlannedChange | undefined {
+  if (menu === 'radius' || !iface) return undefined;
+  return { kind: 'path-object.change', name: iface, what };
+}
+
+// POST /api/devices/:id/dot1x/:menu — add an authenticator, supplicant or RADIUS server.
+router.post('/:id/dot1x/:menu', requireWrite, async (req, res) => {
+  const menu = String(req.params.menu);
+  if (!isDot1xMenu(menu)) return res.status(404).json({ error: 'Not found' });
+  const m = DOT1X_MENUS[menu];
+  const p = m.parse(req.body ?? {}, true);
+  if ('error' in p) return res.status(400).json({ error: p.error, field: p.field });
+  const label = menu === 'radius' ? `${m.noun} ${p.fields.address}` : `${m.noun} ${p.fields.interface}`;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: m.kind, summary: `Add ${label}`, change: dot1xChange(menu, p.fields.interface, 'Turning on 802.1X, which blocks the port until a client authenticates') },
+    async (c) => { await c.addMenuItem(m.menu, p.fields); return { message: `Added ${label}` }; });
+});
+
+// PUT /api/devices/:id/dot1x/:menu/:rid — change one. The port it's on is sent
+// with it (body.interface), so the change can be flagged on the right port.
+router.put('/:id/dot1x/:menu/:rid', requireWrite, async (req, res) => {
+  const menu = String(req.params.menu);
+  const rid = String(req.params.rid);
+  if (!isDot1xMenu(menu)) return res.status(404).json({ error: 'Not found' });
+  if (!isItemId(rid)) return res.status(400).json({ error: 'That isn’t an item id' });
+  const m = DOT1X_MENUS[menu];
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  if (menu !== 'radius' && typeof body.interface !== 'string') return res.status(400).json({ error: 'Send the port it’s on as interface.', field: 'interface' });
+  const p = m.parse(body, false);
+  if ('error' in p) return res.status(400).json({ error: p.error, field: p.field });
+  const label = menu === 'radius' ? m.noun : `${m.noun} ${String(body.interface)}`;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: m.kind, summary: `Change ${label}`, change: dot1xChange(menu, body.interface as string | undefined, 'Changing 802.1X on the port') },
+    async (c) => { await c.setMenuItem(m.menu, rid, p.fields); return { message: `Changed ${label}` }; });
+});
+
+// DELETE /api/devices/:id/dot1x/:menu/:rid?interface=ether5
+router.delete('/:id/dot1x/:menu/:rid', requireWrite, async (req, res) => {
+  const menu = String(req.params.menu);
+  const rid = String(req.params.rid);
+  if (!isDot1xMenu(menu)) return res.status(404).json({ error: 'Not found' });
+  if (!isItemId(rid)) return res.status(400).json({ error: 'That isn’t an item id' });
+  const m = DOT1X_MENUS[menu];
+  const iface = typeof req.query.interface === 'string' && IFACE_NAME.test(req.query.interface) ? req.query.interface : undefined;
+  await withGuardedChange(req.params.id, req, res,
+    { kind: m.kind, summary: `Remove ${m.noun}${iface ? ` ${iface}` : ''}`, change: dot1xChange(menu, iface, 'Removing 802.1X from the port') },
+    async (c) => { await c.removeMenuItem(m.menu, rid); return { message: 'Removed' }; });
 });
 
 router.delete('/:id/bridges/:bridgeName', requireWrite, async (req, res) => {
@@ -4674,7 +4835,9 @@ router.post('/:id/tools/ping', requireWrite, async (req, res) => {
       count: String(Math.min(Math.max(1, Number(count) || 4), 20)),
     };
     if (iface) params['interface'] = iface;
-    const results = await client.execute('/tool/ping', params);
+    // /ping: the API path on RouterOS 6 and 7. /tool/ping is 7 only, so RouterOS 6
+    // answered "no such command" (#460).
+    const results = await client.execute('/ping', params);
     return res.json(results);
   } catch (err) {
     return res.status(500).json({ error: (err as Error).message });
@@ -4695,17 +4858,8 @@ router.post('/:id/tools/traceroute', requireWrite, async (req, res) => {
   try {
     await client.connect();
     const raw = await client.execute('/tool/traceroute', { address, count: '3', timeout: '1' });
-
-    // RouterOS sends multiple !re updates per hop as probes return.
-    // Deduplicate by .id, keeping the last (most complete) row per hop.
-    const byId = new Map<string, Record<string, string>>();
-    for (const row of raw) {
-      if (row['id']) byId.set(row['id'], row);
-    }
-    const results = Array.from(byId.values()).sort(
-      (a, b) => Number(a['id'] || 0) - Number(b['id'] || 0)
-    );
-    return res.json(results);
+    // A snapshot of the whole route per round of probes; the last is the fullest (#460).
+    return res.json(tracerouteHops(raw));
   } catch (err) {
     return res.status(500).json({ error: (err as Error).message });
   } finally {

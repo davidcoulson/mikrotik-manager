@@ -355,17 +355,11 @@ function PortTrafficGraph({
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={trafficData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" opacity={0.5} />
-              <XAxis dataKey="time" tick={{ fontSize: 10, fill: 'var(--ink-4)' }} interval="preserveStartEnd" />
-              <YAxis tickFormatter={(v: number) => noWrap(formatBps(v))} tick={{ fontSize: 10, fill: 'var(--ink-4)' }} width={72} />
+              <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+              <YAxis tickFormatter={(v: number) => noWrap(formatBps(v))} tick={{ fontSize: 10 }} width={72} />
               <Tooltip
+                {...chartTooltip}
                 formatter={(v) => formatBps(v as number)}
-                contentStyle={{
-                  background: 'var(--surface)',
-                  border: '1px solid var(--line)',
-                  borderRadius: '8px',
-                  fontSize: '12px',
-                  color: 'var(--ink)',
-                }}
               />
               <Legend wrapperStyle={{ fontSize: 11 }} />
               <Line type="monotone" dataKey="rx" stroke="var(--accent)" name="RX" dot={false} strokeWidth={1.6} />
@@ -396,10 +390,9 @@ function PortTrafficGraph({
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={dropData} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" opacity={0.5} />
-                  <XAxis dataKey="time" tick={{ fontSize: 10, fill: 'var(--ink-4)' }} interval="preserveStartEnd" />
-                  <YAxis tickFormatter={(v: number) => perSec(v)} tick={{ fontSize: 10, fill: 'var(--ink-4)' }} width={72} />
-                  <Tooltip formatter={(v) => perSec(v as number)}
-                    contentStyle={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: '8px', fontSize: '12px', color: 'var(--ink)' }} />
+                  <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
+                  <YAxis tickFormatter={(v: number) => perSec(v)} tick={{ fontSize: 10 }} width={72} />
+                  <Tooltip {...chartTooltip} formatter={(v) => perSec(v as number)} />
                   <Line type="monotone" dataKey="errors" stroke="var(--bad)" name="Errors" dot={false} strokeWidth={1.4} />
                   <Line type="monotone" dataKey="drops" stroke="var(--warn)" name="Drops" dot={false} strokeWidth={1.4} />
                   <Line type="monotone" dataKey="queue" stroke="var(--violet)" name="TX queue drops" dot={false} strokeWidth={1.4} />
@@ -472,13 +465,8 @@ function PortPacketGraph({
               <XAxis dataKey="time" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
               <YAxis tickFormatter={(v: number) => noWrap(formatPps(v))} tick={{ fontSize: 10 }} width={72} />
               <Tooltip
+                {...chartTooltip}
                 formatter={(v) => formatPps(v as number)}
-                contentStyle={{
-                  background: 'var(--color-surface)',
-                  border: '1px solid var(--color-border)',
-                  borderRadius: '8px',
-                  fontSize: '12px',
-                }}
               />
               <Legend wrapperStyle={{ fontSize: 12 }} />
               <Line type="monotone" dataKey="rx" stroke="#8b5cf6" name="RX packets" dot={false} strokeWidth={2} />
@@ -538,7 +526,7 @@ function OpticSection({ deviceId, portName, optic, dropDb, chartHeight = 110 }: 
             <LineChart data={data} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="var(--line-soft)" />
               <XAxis dataKey="time" hide />
-              <YAxis tick={{ fontSize: 10, fill: 'var(--ink-3)' }} domain={['auto', 'auto']} width={36}
+              <YAxis tick={{ fontSize: 10 }} domain={['auto', 'auto']} width={36}
                 tickFormatter={(v: number) => v.toFixed(1)} />
               <Tooltip {...chartTooltip} formatter={(v) => (typeof v === 'number' ? `${v.toFixed(2)} dBm` : String(v))} />
               <Line type="monotone" dataKey="rx" name="RX" stroke="var(--accent)" dot={false} strokeWidth={1.5} isAnimationActive={false} />
@@ -601,7 +589,7 @@ function PortInfoCard({ deviceId, portName, errors, errorsPerMin = 10, flapsPerH
 
   return (
     <div className="card p-4 overflow-y-auto">
-      <div className="text-[13px] font-semibold mb-3" style={{ color: 'var(--ink)' }}>Port info</div>
+      <div className="text-[13px] font-semibold mb-3" style={{ color: 'var(--ink)' }}>Port Info</div>
 
       <div>
         {infoRow('Status', d['status'])}
@@ -2021,7 +2009,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
               {/* PoE */}
               <div>
                 <h4 className="text-xs font-semibold text-gray-500 dark:text-slate-400 uppercase tracking-wider mb-3">
-                  PoE Out (Ethernet only)
+                  PoE Out (Ethernet Only)
                 </h4>
                 <select
                   className="input"
@@ -2767,7 +2755,7 @@ export default function SwitchPortDiagram({ deviceId, deviceName, deviceModel, a
               <div className="flex items-center justify-between p-5 border-b border-gray-200 dark:border-slate-700">
                 <h3 className="font-semibold text-gray-900 dark:text-white flex items-center gap-2">
                   <Network className="w-4 h-4 text-blue-500" />
-                  Move to bridge
+                  Move to Bridge
                 </h3>
                 <button onClick={() => setMoveOpen(false)} className="text-gray-400 hover:text-gray-600">
                   <X className="w-5 h-5" />

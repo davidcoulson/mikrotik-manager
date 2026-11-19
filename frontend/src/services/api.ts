@@ -876,6 +876,8 @@ export const devicesApi = {
       credential_preset_id?: number;
       force_replace_existing_by_serial?: boolean;
       combine_with_device_id?: number;
+      /** Add the device without testing API or SSH connectivity. */
+      force_add?: boolean;
       /** Existing tags to apply once added (#161). */
       tag_ids?: number[];
     })
@@ -968,9 +970,9 @@ export const devicesApi = {
       confirmLockout ? { data: { confirm_lockout: true } } : undefined),
   // confirm_lockout overrides a predicted-lockout refusal (HTTP 409) after the user
   // has seen and accepted the verdict.
-  addVlan: (id: number, data: { bridge: string; vlan_id: number; tagged_ports?: string[]; untagged_ports?: string[]; confirm_lockout?: boolean }) =>
+  addVlan: (id: number, data: { bridge: string; vlan_id: number; tagged_ports?: string[]; untagged_ports?: string[]; mvrp_forbidden?: string[]; confirm_lockout?: boolean }) =>
     api.post(`/devices/${id}/vlans`, data),
-  updateVlan: (id: number, vlanDbId: number, data: { tagged_ports: string[]; untagged_ports: string[]; confirm_lockout?: boolean }) =>
+  updateVlan: (id: number, vlanDbId: number, data: { tagged_ports: string[]; untagged_ports: string[]; mvrp_forbidden?: string[]; confirm_lockout?: boolean }) =>
     api.put(`/devices/${id}/vlans/${vlanDbId}`, data),
   deleteVlan: (id: number, vlanDbId: number, confirmLockout = false) =>
     api.delete(`/devices/${id}/vlans/${vlanDbId}`, confirmLockout ? { data: { confirm_lockout: true } } : undefined),
@@ -1017,8 +1019,22 @@ export const devicesApi = {
   addBridge: (id: number, data: { name: string; protocol_mode?: string; priority?: string; vlan_filtering?: boolean; comment?: string }) =>
     api.post(`/devices/${id}/bridges`, data, GUARDED),
   updateBridge: (id: number, bridgeName: string,
-    data: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean; mtu?: string }, confirmLockout = false) =>
+    data: { name?: string; protocol_mode?: string; priority?: string; comment?: string; disabled?: boolean; mtu?: string; ether_type?: string; mvrp?: boolean }, confirmLockout = false) =>
     api.put(`/devices/${id}/bridges/${encodeURIComponent(bridgeName)}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
+  /** Q-in-Q and MVRP on one bridge port (#449). */
+  /** 802.1X (#360): authenticators, port states, who's in, supplicants, RADIUS servers. */
+  getDot1x: (id: number) => api.get<Dot1xView>(`/devices/${id}/dot1x`),
+  addDot1x: (id: number, menu: Dot1xMenu, data: Record<string, unknown>, confirmLockout = false) =>
+    api.post(`/devices/${id}/dot1x/${menu}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
+  updateDot1x: (id: number, menu: Dot1xMenu, rid: string, data: Record<string, unknown>, confirmLockout = false) =>
+    api.put(`/devices/${id}/dot1x/${menu}/${rid}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
+  removeDot1x: (id: number, menu: Dot1xMenu, rid: string, iface?: string, confirmLockout = false) =>
+    api.delete(`/devices/${id}/dot1x/${menu}/${rid}`, {
+      ...GUARDED, params: { ...(iface ? { interface: iface } : {}), ...(confirmLockout ? { confirm_lockout: 'true' } : {}) },
+    }),
+  updateBridgePort: (id: number, iface: string,
+    data: BridgePortUpdate, confirmLockout = false) =>
+    api.put(`/devices/${id}/bridge-ports/${encodeURIComponent(iface)}`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
   setBridgeVlanFiltering: (id: number, bridgeName: string, enabled: boolean, confirmLockout = false) =>
     api.put(`/devices/${id}/bridge/${encodeURIComponent(bridgeName)}/vlan-filtering`,
       { enabled, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
@@ -1263,6 +1279,26 @@ export interface ClientDetail extends Client {
   /** False for a neighbour the manager doesn't manage (an unmanaged switch heard over LLDP, #365). */
   upstream_managed?: boolean;
   comment?: string;
+  /** The way from the client's device to the top of the site, nearest first. The upstream_* fields are its first step. */
+  path?: ClientPathHop[];
+  /** Set when this address is one of a managed device's own: the path then starts at that device. */
+  own_device?: { id: number; name: string; device_type: string | null; ip_address: string | null } | null;
+}
+
+export interface ClientPathHop {
+  device_id: number | null;
+  name: string;
+  device_type: string | null;
+  ip: string | null;
+  managed: boolean;
+  /** A managed device in a site you can't see: named as discovery heard it, and the path stops there. */
+  other_site?: boolean;
+  /** The port on the step below that leads here. */
+  from_port: string | null;
+  /** The port on this step the link arrives at. */
+  port: string | null;
+  /** Spanning tree named this step, or neighbour discovery's ranking chose it. */
+  how: 'stp' | 'discovery';
 }
 
 export interface PresencePoint { time: string; online: number; }
@@ -1490,6 +1526,9 @@ export const eventsApi = {
     prefix?: string;
     /** Every rule but these, each `<deviceId>|<prefix>`. */
     hide?: string[];
+    /** Lines from, or to, one zone on zone-managed devices (#415). */
+    fromZone?: string;
+    toZone?: string;
     limit?: number;
     offset?: number;
     names?: 1;
@@ -1509,14 +1548,21 @@ export const eventsApi = {
     prefix?: string;
     /** Every rule but these, each `<deviceId>|<prefix>`. */
     hide?: string[];
+    /** Lines from, or to, one zone on zone-managed devices (#415). */
+    fromZone?: string;
+    toZone?: string;
     limit?: number;
     offset?: number;
     names?: 1;
   }) =>
     api.get<{ groups: FirewallGroup[]; total: number; scanLimit: number }>('/events/firewall', { params: { ...params, view: 'grouped' }, paramsSerializer: REPEAT_PARAMS }),
-  /** The rules (log prefixes) that logged in the window, per device: the rule filter's choices. */
+  /**
+   * The rules (log prefixes) that logged in the window, per device: the rule
+   * filter's choices. With them, the zones on the zone-managed devices in
+   * scope, Router first (#415): the zone filters' choices, empty without zones.
+   */
   firewallRules: (params: { deviceId?: number; since?: string }) =>
-    api.get<{ rules: FirewallRuleOption[] }>('/events/firewall/rules', { params }),
+    api.get<{ rules: FirewallRuleOption[]; zones: string[] }>('/events/firewall/rules', { params }),
   clearFirewall: (deviceId?: number) =>
     api.delete<{ message: string; deleted: number }>('/events/firewall', {
       params: deviceId ? { deviceId } : {},
@@ -2717,6 +2763,8 @@ export interface NetflowSession {
   server_nat_port: number | null;
   client_mac: string | null;
   client_name: string | null;
+  /** The name a DNS lookup answered with for the server (AdGuard Home or a router's DNS cache, #366). */
+  server_name?: string | null;
   app: string | null;
   started_at: string;
   ended_at: string;
@@ -2748,22 +2796,128 @@ export const sessionsApi = {
     api.put<{ id: number; sessions: boolean }>(`/sessions/devices/${deviceId}`, { enabled }),
 };
 
+/**
+ * The time a Traffic view covers: a preset ("24h"), or a window picked on the
+ * chart (#463), written "<from>/<to>" in ISO time so it can stand in for a
+ * range anywhere one is passed or used as a query key.
+ */
+export function trafficWindowParams(view: string): { range: string } | { from: string; to: string } {
+  const slash = view.indexOf('/');
+  return slash < 0 ? { range: view } : { from: view.slice(0, slash), to: view.slice(slash + 1) };
+}
+
 export const trafficApi = {
   status: () => api.get<TrafficCollectorStats>('/traffic/status'),
   timeseries: (range = '24h') =>
-    api.get<ClientTrafficPoint[]>('/traffic/timeseries', { params: { range } }),
+    api.get<ClientTrafficPoint[]>('/traffic/timeseries', { params: trafficWindowParams(range) }),
   topClients: (range = '24h', limit = 10) =>
-    api.get<TrafficTopClient[]>('/traffic/top-clients', { params: { range, limit } }),
+    api.get<TrafficTopClient[]>('/traffic/top-clients', { params: { ...trafficWindowParams(range), limit } }),
   apps: (range = '24h', mac?: string) =>
-    api.get<TrafficApp[]>('/traffic/apps', { params: { range, mac } }),
+    api.get<TrafficApp[]>('/traffic/apps', { params: { ...trafficWindowParams(range), mac } }),
   /** Who generates one application's traffic (#366). */
   appClients: (app: string, range = '24h') =>
-    api.get<TrafficAppClients>(`/traffic/apps/${encodeURIComponent(app)}/clients`, { params: { range } }),
+    api.get<TrafficAppClients>(`/traffic/apps/${encodeURIComponent(app)}/clients`, { params: trafficWindowParams(range) }),
   client: (mac: string, range = '24h') =>
     api.get<{ series: ClientTrafficPoint[]; apps: TrafficApp[] }>(
-      `/traffic/client/${encodeURIComponent(mac)}`, { params: { range } }
+      `/traffic/client/${encodeURIComponent(mac)}`, { params: trafficWindowParams(range) }
     ),
+  /** Where traffic goes (#366 step 2): the site, one application, one client, or both. */
+  destinations: ({ range = '24h', ...opts }: { range?: string; app?: string; mac?: string; limit?: number }) =>
+    api.get<TrafficDestinations>('/traffic/destinations', { params: { ...trafficWindowParams(range), ...opts } }),
+  /** The clients that talked to one remote address. */
+  destinationClients: (remote: string, range = '24h', app?: string) =>
+    api.get<TrafficDestinationClients>(`/traffic/destinations/${encodeURIComponent(remote)}/clients`, { params: { ...trafficWindowParams(range), app } }),
+  /** Names looked up through AdGuard Home (#366 step 3), for the site or one client. */
+  dnsNames: ({ range = '24h', ...opts }: { range?: string; mac?: string; limit?: number }) =>
+    api.get<TrafficDnsNames>('/traffic/dns', { params: { ...trafficWindowParams(range), ...opts } }),
+  dnsClients: (range = '24h') => api.get<TrafficDnsClients>('/traffic/dns/clients', { params: trafficWindowParams(range) }),
 };
+
+export interface TrafficDnsNames {
+  /** Whether an AdGuard Home source covers the site(s) in view. */
+  configured: boolean;
+  allowed: number;
+  blocked: number;
+  names: { name: string; allowed: number; blocked: number; clients: number }[];
+  /** The client's addresses AdGuard Home was searched for, when one client was asked about. */
+  client_addresses: string[] | null;
+}
+export interface TrafficDnsClients {
+  configured: boolean;
+  clients: (TrafficTopClient & { client_ip: string; allowed: number; blocked: number; names: number })[];
+}
+
+// ─── DNS sources (AdGuard Home, #366 step 3) ─────────────────────────────────
+export interface DnsSource {
+  id: number;
+  name: string;
+  kind: 'adguard' | 'pihole';
+  site_id: number;
+  site_name: string | null;
+  url: string;
+  username: string;
+  has_password: boolean;
+  tls_verify: boolean;
+  enabled: boolean;
+  cursor_at: string | null;
+  last_polled_at: string | null;
+  last_error: string | null;
+  queries_counted: string;
+}
+export interface DnsSourceInput {
+  name: string;
+  kind: 'adguard' | 'pihole';
+  site_id: number;
+  url: string;
+  username: string;
+  /** Left out to keep the saved password. */
+  password?: string;
+  tls_verify: boolean;
+  enabled: boolean;
+}
+export const dnsSourcesApi = {
+  list: () => api.get<DnsSource[]>('/dns-sources'),
+  create: (data: DnsSourceInput) => api.post<{ id: number }>('/dns-sources', data),
+  update: (id: number, data: DnsSourceInput) => api.put('/dns-sources/' + id, data),
+  remove: (id: number) => api.delete('/dns-sources/' + id),
+  test: (data: Partial<DnsSourceInput> & { id?: number }) => api.post<{ ok: boolean; entries: number }>('/dns-sources/test', data),
+  poll: (id: number) => api.post<{ ok: boolean; counted: number }>(`/dns-sources/${id}/poll`),
+};
+
+/** Who an address belongs to, or what kind of address it is (#366). */
+export interface RemoteOwner {
+  org: string | null;
+  asn: number | null;
+  country: string | null;
+  kind: 'public' | 'private' | 'loopback' | 'link-local' | 'multicast' | 'cgnat' | 'reserved' | 'other';
+  /** Reverse DNS, when it answered in time. */
+  name: string | null;
+  /** Names the client looked up that answered with this address (AdGuard Home, #366 step 3). */
+  domains?: string[];
+}
+export interface TrafficDestination extends RemoteOwner {
+  remote: string;
+  upload_bytes: number;
+  download_bytes: number;
+  total_bytes: number;
+  share: number;
+  client_count: number;
+  apps: string[];
+}
+export interface TrafficDestinations {
+  total_bytes: number;
+  /** Traffic to addresses beyond each client's busiest ones, summed. */
+  other_bytes: number;
+  retention_days: number;
+  /** When recording began, if that's inside the range (just after an upgrade). */
+  recorded_since?: string | null;
+  names_available: boolean;
+  destinations: TrafficDestination[];
+}
+export interface TrafficDestinationClients extends RemoteOwner {
+  remote: string;
+  clients: (TrafficTopClient & { apps: string[] })[];
+}
 
 // ─── Maintenance Windows ──────────────────────────────────────────────────────
 export interface MaintenanceWindow {
@@ -3102,7 +3256,25 @@ export const userManagerApi = {
   get: (id: number) => api.get<UserManagerView>(`/user-manager/${id}`, { timeout: 45_000 }),
   removeSession: (id: number, sid: string) => api.post<{ ok: boolean }>(`/user-manager/${id}/sessions/${encodeURIComponent(sid)}/remove`),
   recheck: () => api.post<{ ok: boolean }>('/user-manager/recheck'),
+  /** Users (#360): a VLAN for 802.1X is set as vlan_id; password '' on an edit keeps it. */
+  addUser: (id: number, data: UmUserInput) => api.post(`/user-manager/${id}/users`, data),
+  updateUser: (id: number, uid: string, data: UmUserInput) => api.put(`/user-manager/${id}/users/${uid}`, data),
+  removeUser: (id: number, uid: string) => api.delete(`/user-manager/${id}/users/${uid}`),
+  /** Have a switch's 802.1X ask this server, with a new shared secret on both ends. */
+  linkDot1x: (id: number, data: { device_id: number; um_address?: string; nas_address?: string }, confirmLockout = false) =>
+    api.post<{ message?: string; guard?: unknown }>(`/user-manager/${id}/link-dot1x`, { ...data, ...(confirmLockout ? { confirm_lockout: true } : {}) }, GUARDED),
 };
+
+export interface UmUserInput {
+  name?: string;
+  password?: string;
+  group?: string;
+  shared_users?: number;
+  attributes?: string;
+  vlan_id?: number | null;
+  disabled?: boolean;
+  comment?: string;
+}
 
 /** A client's firewall address lists on one router (#145). */
 export interface ClientAddressListView {
@@ -3180,12 +3352,33 @@ export const platformBackupApi = {
 };
 
 /** One bridge as the Bridges tab shows it (#284). */
+/** What the Bridges tab can change on a port (#449). */
+export interface BridgePortUpdate {
+  tag_stacking?: boolean; mvrp_applicant_state?: string; mvrp_registrar_state?: string;
+  stp_priority?: string; path_cost?: string; edge?: string; point_to_point?: string;
+  bpdu_guard?: boolean; restricted_role?: boolean; restricted_tcn?: boolean;
+}
+export interface BridgePortView {
+  name: string; hw: boolean; pvid: string | null; disabled: boolean; inactive: boolean; dynamic: boolean; role: string | null;
+  l2mtu?: number | null; maxL2mtu?: number | null;
+  /** Q-in-Q and MVRP (#449). */
+  tagStacking?: boolean; mvrpApplicant?: string | null; mvrpRegistrar?: string | null;
+  registeredVlans?: string | null; declaredVlans?: string | null;
+  /** Spanning tree on the port: as set, and how it's running. */
+  stpPriority?: string | null; pathCost?: string | null; edge?: string | null; pointToPoint?: string | null;
+  bpduGuard?: boolean | null; restrictedRole?: boolean | null; restrictedTcn?: boolean | null;
+  edgePort?: boolean | null; status?: string | null;
+}
 export interface BridgeView {
   id: string; name: string; protocolMode: string; priority: string | null; vlanFiltering: boolean;
   running: boolean; disabled: boolean; dynamic: boolean; comment: string | null; mtu: string | null; macAddress: string | null;
   /** The MTU as set: "auto" or a number. `mtu` is what it is in effect. */
   mtuSetting?: string;
-  ports: { name: string; hw: boolean; pvid: string | null; disabled: boolean; inactive: boolean; dynamic: boolean; role: string | null; l2mtu?: number | null; maxL2mtu?: number | null }[];
+  /** The tag read as a VLAN (#449): 0x8100, or 0x88a8 for 802.1ad. Null with filtering off (RouterOS doesn't print it). */
+  etherType?: string | null;
+  /** MVRP on the bridge; null where RouterOS doesn't have it (#449). */
+  mvrp?: boolean | null;
+  ports: BridgePortView[];
   vlans: string[];
   dynamicVlans?: string[];
   addresses: string[];
@@ -3354,6 +3547,10 @@ export interface VlanInterfaceInput {
   mtu?: number | '';
   comment?: string;
   disabled?: boolean;
+  /** 802.1ad service tag (0x88a8) rather than 802.1Q (#449). */
+  use_service_tag?: boolean;
+  /** Declare the VLAN to MVRP neighbours on the parent (#449, RouterOS 7.15+). */
+  mvrp?: boolean;
 }
 
 export interface VlanInterface {
@@ -3367,6 +3564,9 @@ export interface VlanInterface {
   disabled: boolean;
   addresses: string[];
   comment: string;
+  useServiceTag?: boolean;
+  /** MVRP declares this VLAN on its parent (#449); null when the device has no such setting. */
+  mvrp?: boolean | null;
 }
 
 /** An /ipv6/route row (#312). */
@@ -3515,3 +3715,15 @@ export const reverseProxyApi = {
   removeCert: (deviceId: number, sni: string, forget = false) =>
     api.delete<{ ok: boolean; message: string }>('/reverse-proxy/cert', rp(deviceId, { sni, ...(forget ? { forget: '1' } : {}) })),
 };
+
+// ─── 802.1X (#360) ───────────────────────────────────────────────────────────
+export type Dot1xMenu = 'servers' | 'clients' | 'radius';
+export interface Dot1xView {
+  /** false on devices without 802.1X (SMIPS: hAP lite, hAP mini). */
+  supported: boolean;
+  servers: Record<string, string>[];
+  state: Record<string, string>[];
+  active: Record<string, string>[];
+  clients: (Record<string, string | boolean> & { has_password: boolean })[];
+  radius: (Record<string, string | boolean> & { has_secret: boolean })[];
+}

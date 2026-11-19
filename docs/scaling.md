@@ -21,11 +21,11 @@ passwords and keys (#261). The most specific wins: a device's own setting, then 
 then the global one. A site behind a slow or metered link can be polled gently without slowing
 the rest.
 
-- **A site:** Sites → the site's edit button → **Polling and backups**. This is the usual place:
+- **A site:** Sites → the site's edit button → **Polling and Backups**. This is the usual place:
   devices behind the same slow link are normally in the same site.
 - **A device:** for the odd one out (a unit on an LTE backup link, say), **Edit Device →
   Advanced: polling and backups**, which shows each value in force and where it comes from. The
-  same settings are on the device's Overview tab, in a **Polling and backups** card listing each
+  same settings are on the device's Overview tab, in a **Polling and Backups** card listing each
   value and whether it comes from this device, its site or the global setting. **Edit** there
   works like Physical Details: tick **set for this device** on the ones to change, then **Save**
   or **Cancel**.
@@ -236,6 +236,7 @@ trip per device per cycle.
 | Neighbour discovery | slow poll | Topology stops updating; no automatic discovery |
 | Device logs | own 60s poll | No events; log alerts go quiet. The session is skipped entirely |
 | Certificates | slow poll | No certificate inventory or expiry warnings |
+| DNS cache of resolving routers | fast poll, routers that answer DNS only | Destinations, firewall logs and sessions aren't named from the routers' caches |
 
 Measured on the reference fleet, turning off clients and logs:
 

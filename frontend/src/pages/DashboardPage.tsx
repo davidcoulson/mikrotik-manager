@@ -17,6 +17,7 @@ import TerminalModal from '../components/TerminalModal';
 import ProxyUsageCard from '../components/ProxyUsageCard';
 import { useSocket } from '../hooks/useSocket';
 import { useCanWrite } from '../hooks/useCanWrite';
+import { useRowsHeight } from '../hooks/useRowsHeight';
 import { useQueryClient, useMutation } from '@tanstack/react-query';
 import { format, formatDistanceToNow } from 'date-fns';
 import type { Device, DeviceEvent } from '../types';
@@ -29,12 +30,22 @@ import { byAttention, CARD_ROWS } from '../utils/deviceCards';
 import { filterDevices } from '../utils/devicePicker';
 import { commonPrefix, shortName, sortCapacity, loadColor, loadText, memText, memHint, capacityGrid, CAPACITY_NARROW_PX } from '../utils/capacityCard';
 import { useElementWidth } from '../hooks/useElementWidth';
+import { chartTooltip } from '../components/common/chartTooltip';
 
 // ─── Primitives ───────────────────────────────────────────────────────────────
 
-function StatusDot({ color = 'var(--good)', glow = false, size = 6 }: {
+function StatusDot({ color = 'var(--good)', glow = false, size = 6, healthy = false }: {
   color?: string; glow?: boolean; size?: number;
+  /** Everything's healthy: the vibrant green that pulses (index.css). */
+  healthy?: boolean;
 }) {
+  if (healthy) {
+    return (
+      <span className="health-pulse"
+        style={{ width: size, height: size, borderRadius: 999, display: 'inline-block', flexShrink: 0,
+          ['--pulse-spread' as string]: `${Math.round(size * 0.8)}px` }} />
+    );
+  }
   return (
     <span
       style={{
@@ -217,11 +228,11 @@ function HealthBar({
         <div className="flex items-center gap-3 flex-shrink-0">
           <div
             className="w-9 h-9 rounded-[8px] flex items-center justify-center flex-shrink-0"
-            style={{ background: 'var(--accent-soft)' }}
+            style={{ background: status.tone === 'good' ? 'rgb(var(--healthy-rgb) / 0.14)' : 'var(--accent-soft)' }}
           >
             <StatusDot
-              color={status.tone === 'good' ? 'var(--accent)'
-                   : status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)'}
+              healthy={status.tone === 'good'}
+              color={status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)'}
               glow size={10}
             />
           </div>
@@ -268,7 +279,7 @@ function HealthBar({
         {/* Mini-stats */}
         {[
           {
-            label: 'Active clients',
+            label: 'Active Clients',
             value: String(summary?.clients.active ?? '—'),
             spark: clientSparkline,
             color: 'var(--accent)',
@@ -384,6 +395,11 @@ function SummaryView(props: Record<string, any>) {
   // Bars over a category axis fill their slots (thick, minimal gaps) rather than
   // sitting as thin fixed-width marks on a continuous time axis. Downsample to
   // keep them chunky even on long ranges.
+  // Five devices show and the rest scroll, so this card stays near the height
+  // of Connected Clients beside it.
+  const [deviceListRef, deviceListPx] = useRowsHeight(5, 46, 1);
+  const cardDevices = byAttention(devices as Device[]).slice(0, CARD_ROWS);
+
   const chartData = downsample(clientsOverTime as { ts: number; value: number }[], 60);
   const tickEvery = Math.max(0, Math.ceil(chartData.length / 6) - 1);
 
@@ -397,11 +413,11 @@ function SummaryView(props: Record<string, any>) {
 
       {/* Main grid: clients chart + devices list */}
       <div className="grid gap-4" style={{ gridTemplateColumns: '1.6fr 1fr' }}>
-        {/* Clients chart */}
-        <div className="card" style={{ padding: '16px 18px' }}>
+        {/* Clients chart: grows to the height of the Devices card beside it */}
+        <div className="card flex flex-col" style={{ padding: '16px 18px' }}>
           <div className="flex items-baseline justify-between mb-3">
             <div>
-              <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Connected clients</div>
+              <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Connected Clients</div>
               <div className="mono text-[11px]" style={{ color: 'var(--ink-3)' }}>last {chartRange} · 5min buckets</div>
             </div>
             <div className="flex items-baseline gap-2">
@@ -430,34 +446,30 @@ function SummaryView(props: Record<string, any>) {
             </div>
           </div>
           {clientsOverTime.length > 0 ? (
-            <ResponsiveContainer width="100%" height={180}>
+            <div className="flex-1" style={{ minHeight: 180 }}>
+            <ResponsiveContainer width="100%" height="100%">
               <BarChart data={chartData} margin={{ top: 4, right: 4, left: -24, bottom: 0 }} barCategoryGap="12%">
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--line-soft)" vertical={false} />
                 <XAxis
                   dataKey="ts"
-                  tick={{ fontSize: 10, fill: 'var(--ink-4)', fontFamily: 'Geist Mono' }}
+                  tick={{ fontSize: 10, fontFamily: "'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace" }}
                   interval={tickEvery}
                   minTickGap={20}
                   tickFormatter={(t) => chartRange === '7d' ? format(new Date(t as number), 'MMM d') : formatTime(new Date(t as number))}
                 />
-                <YAxis tick={{ fontSize: 10, fill: 'var(--ink-4)' }} allowDecimals={false} />
+                <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
                 <Tooltip
                   cursor={{ fill: 'var(--surface-3)', opacity: 0.4 }}
                   formatter={(v) => [Number(v), 'Clients']}
                   labelFormatter={(t) => formatDateTime(new Date(t as number), { year: undefined })}
-                  contentStyle={{
-                    background: 'var(--surface)',
-                    border: '1px solid var(--line)',
-                    borderRadius: 8,
-                    fontSize: 12,
-                    color: 'var(--ink)',
-                  }}
+                  {...chartTooltip}
                 />
                 <Bar dataKey="value" fill="var(--accent)" radius={[3, 3, 0, 0]} />
               </BarChart>
             </ResponsiveContainer>
+            </div>
           ) : (
-            <div className="flex items-center justify-center text-[13px]" style={{ height: 180, color: 'var(--ink-4)' }}>
+            <div className="flex-1 flex items-center justify-center text-[13px]" style={{ minHeight: 180, color: 'var(--ink-4)' }}>
               No data yet — metrics appear after devices are polled
             </div>
           )}
@@ -477,8 +489,8 @@ function SummaryView(props: Record<string, any>) {
           </div>
           {/* A large fleet gets the devices needing attention, not a page of
               names (#303). */}
-          <div className="space-y-[1px]">
-            {byAttention(devices as Device[]).slice(0, CARD_ROWS).map((d) => (
+          <div ref={deviceListRef} className="space-y-[1px] overflow-y-auto" style={{ maxHeight: deviceListPx }}>
+            {cardDevices.map((d) => (
               <div
                 key={d.id}
                 className="flex items-center gap-[10px] px-[6px] py-[7px] rounded-[5px] cursor-pointer transition-colors"
@@ -547,7 +559,7 @@ function SummaryView(props: Record<string, any>) {
             the collector has data; otherwise device-reported connection counters. */}
         <div className="card" style={{ padding: '16px 18px' }}>
           <div className="flex items-baseline justify-between mb-3">
-            <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Top talkers</div>
+            <div className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Top Talkers</div>
             <span
               className="mono text-[11px]"
               style={{ color: 'var(--ink-3)' }}
@@ -698,8 +710,7 @@ function OperationsView({
   const canWrite = useCanWrite();
   const status = fleetStatus(summary?.devices);
   const statusText = status.sentence;
-  const statusColor = status.tone === 'good' ? 'var(--accent)'
-                    : status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)';
+  const statusColor = status.tone === 'warn' ? 'var(--warn)' : 'var(--ink-4)';
 
   const deviceList = devices as Device[];
   const onlineDevices = deviceList.filter(d => d.status === 'online');
@@ -772,9 +783,12 @@ function OperationsView({
   const [actionMsg, setActionMsg] = useState<FleetActionSummary | null>(null);
   const [pickTerminal, setPickTerminal] = useState(false);
   const [terminalSearch, setTerminalSearch] = useState('');
-  // Capacity lists the busiest devices first and stops at CAPACITY_ROWS, which
-  // silently hid the rest: nine devices showed eight rows, reported as a bug.
-  const [showAllCapacity, setShowAllCapacity] = useState(false);
+  // Capacity, Security Posture and Recent Activity each show five rows and
+  // scroll for the rest, so every device is in the list without the cards
+  // growing down the page (stopping at eight once hid the ninth).
+  const [capacityListRef, capacityListPx] = useRowsHeight(5, 34);
+  const [postureListRef, postureListPx] = useRowsHeight(5, 18, 6);
+  const [activityListRef, activityListPx] = useRowsHeight(5, 52);
   // The card lays out by its own width: in a narrow window the graphs go, not the names (#368).
   const [capacityRef, capacityWidth] = useElementWidth<HTMLDivElement>();
   const capacityNarrow = capacityWidth > 0 && capacityWidth < CAPACITY_NARROW_PX;
@@ -824,12 +838,11 @@ function OperationsView({
   const scored = (posture ?? []).filter(p => p.score !== null);
   const avgScore = scored.length ? Math.round(scored.reduce((s, p) => s + (p.score ?? 0), 0) / scored.length) : null;
   const highFindings = (posture ?? []).reduce((s, p) => s + p.checks.filter(c => c.severity === 'high').length, 0);
-  const worstDevices = [...scored].sort((a, b) => (a.score ?? 0) - (b.score ?? 0)).slice(0, 3);
+  const worstDevices = [...scored].sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
   const scoreColor = (s: number | null) => s == null ? 'var(--ink-3)' : s >= 85 ? 'var(--good)' : s >= 60 ? 'var(--warn)' : 'var(--bad)';
 
   // Busiest CPU first; memory counts only once it's high and growing (#368).
   const sortedCapacity = sortCapacity(capacity);
-  const CAPACITY_ROWS = 8;
   const CAPACITY_GRID = capacityGrid(capacityNarrow);
   // Fleet strip: two rows of tiles at most, the last one linking to the rest (#303).
   const FLEET_TILES = 10;
@@ -837,11 +850,10 @@ function OperationsView({
   const fleetTiles = fleetList.length > FLEET_TILES ? byAttention(fleetList).slice(0, FLEET_TILES - 1) : fleetList;
   const fleetHidden = fleetList.length - fleetTiles.length;
   const fleetOffline = fleetList.filter((d) => d.status === 'offline').length;
-  const shownCapacity = showAllCapacity ? sortedCapacity : sortedCapacity.slice(0, CAPACITY_ROWS);
-  // A prefix the rows on show share (01-SITE-ASW) is shown once, not on each
+  // A prefix the busiest rows share (01-SITE-ASW) is shown once, not on each
   // row. Taken from those rows, so an out-of-band 99-SITE-MGMT further down
-  // the list doesn't cancel it (#368).
-  const capacityPrefix = commonPrefix(shownCapacity.map((c) => c.name));
+  // the list doesn't cancel it (#368); a row without it shows its whole name.
+  const capacityPrefix = commonPrefix(sortedCapacity.slice(0, 8).map((c) => c.name));
 
   const sevColor = (s: string) => s === 'error' ? 'var(--bad)' : s === 'warn' ? 'var(--warn)' : 'var(--info)';
   const activityIcon = (kind: string) => kind === 'config' ? FileText : kind === 'alert' ? Bell : Activity;
@@ -858,9 +870,11 @@ function OperationsView({
           <div className="flex items-center gap-5">
             <div
               className="w-16 h-16 rounded-[14px] flex items-center justify-center flex-shrink-0"
-              style={{ background: 'radial-gradient(circle, rgba(193,241,126,0.2), transparent)' }}
+              style={{ background: status.tone === 'good'
+                ? 'radial-gradient(circle, rgb(var(--healthy-rgb) / 0.22), transparent)'
+                : 'radial-gradient(circle, rgba(193,241,126,0.2), transparent)' }}
             >
-              <StatusDot color={statusColor} glow size={20} />
+              <StatusDot healthy={status.tone === 'good'} color={statusColor} glow size={20} />
             </div>
             <div>
               <div className="text-[11px] uppercase tracking-[0.1em] mb-[6px]" style={{ color: 'var(--ink-3)' }}>Network status</div>
@@ -982,7 +996,7 @@ function OperationsView({
               style={{ background: 'var(--warn)', color: 'var(--accent-fg)' }}
             >!
             </div>
-            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Things to handle</span>
+            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Things to Handle</span>
             <span className="mono text-[11px]" style={{ color: 'var(--ink-3)' }}>
               {thingsToHandle.length} item{thingsToHandle.length !== 1 ? 's' : ''}
             </span>
@@ -1076,13 +1090,13 @@ function OperationsView({
         <div className="card" style={{ overflow: 'hidden' }} ref={capacityRef}>
           <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
             <Cpu className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Capacity &amp; health</span>
+            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Capacity &amp; Health</span>
             <span className="mono text-[11px] ml-auto" style={{ color: 'var(--ink-3)' }}>busiest CPU first</span>
           </div>
           {sortedCapacity.length === 0 ? (
             <div className="py-8 text-center text-[13px]" style={{ color: 'var(--ink-3)' }}>No resource data yet.</div>
           ) : (
-            <div className="px-5 py-3" style={showAllCapacity ? { maxHeight: 'min(52vh, 460px)', overflowY: 'auto' } : undefined}>
+            <div className="px-5 py-3">
               {capacityPrefix && (
                 <div className="pb-2 text-[11px]" style={{ color: 'var(--ink-4)' }}>
                   Common prefix{' '}
@@ -1094,7 +1108,8 @@ function OperationsView({
                 style={{ gridTemplateColumns: CAPACITY_GRID, color: 'var(--ink-4)' }}>
                 <span>Device</span>{!capacityNarrow && <span>CPU 24h</span>}<span>CPU now</span><span className="text-right">Mem</span>
               </div>
-              {shownCapacity.map((c) => (
+              <div ref={capacityListRef} className="overflow-y-auto -mx-5 px-5" style={{ maxHeight: capacityListPx }}>
+              {sortedCapacity.map((c) => (
                 // The name opens the device; a metric opens its graph (Ron, #448).
                 <div key={c.id}
                   className="w-full text-left grid items-center gap-x-3 py-[5px] group"
@@ -1126,18 +1141,10 @@ function OperationsView({
                     title={[memHint(c), 'Memory graph'].filter(Boolean).join(' · ')}>{c.mem_pct}%</button>
                 </div>
               ))}
-              {sortedCapacity.length > CAPACITY_ROWS && (
-                <div className="pt-2 text-[11.5px] flex items-center gap-2" style={{ color: 'var(--ink-3)' }}>
-                  {showAllCapacity
-                    ? `All ${sortedCapacity.length} devices`
-                    : `${CAPACITY_ROWS} busiest of ${sortedCapacity.length} shown`}
-                  <button
-                    onClick={() => setShowAllCapacity((v) => !v)}
-                    className="underline"
-                    style={{ color: 'var(--accent)' }}
-                  >
-                    {showAllCapacity ? 'Show fewer' : 'Show all'}
-                  </button>
+              </div>
+              {sortedCapacity.length > 5 && (
+                <div className="pt-2 text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
+                  {sortedCapacity.length} devices, busiest first: scroll for the rest
                 </div>
               )}
             </div>
@@ -1156,7 +1163,7 @@ function OperationsView({
         >
           <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
             <Shield className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Security posture</span>
+            <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Security Posture</span>
             <ChevronRight className="w-4 h-4 ml-auto" style={{ color: 'var(--ink-3)' }} />
           </div>
           <div className="px-5 py-4">
@@ -1173,7 +1180,7 @@ function OperationsView({
               {highFindings} high-severity finding{highFindings !== 1 ? 's' : ''}
             </div>
             {worstDevices.length > 0 && (
-              <div className="space-y-1.5">
+              <div ref={postureListRef} className="space-y-1.5 overflow-y-auto" style={{ maxHeight: postureListPx }}>
                 {worstDevices.map((d) => (
                   <div key={d.id} className="flex items-center gap-2 text-[12px]">
                     <StatusDot color={scoreColor(d.score)} size={6} />
@@ -1191,7 +1198,7 @@ function OperationsView({
       <div className="card" style={{ overflow: 'hidden' }}>
         <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
           <Clock className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-          <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Recent activity</span>
+          <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Recent Activity</span>
           <button
             onClick={toggleRequests}
             className="ml-auto text-[11px]"
@@ -1206,7 +1213,7 @@ function OperationsView({
         {activity.length === 0 ? (
           <div className="py-8 text-center text-[13px]" style={{ color: 'var(--ink-3)' }}>No recent activity.</div>
         ) : (
-          <div>
+          <div ref={activityListRef} className="overflow-y-auto" style={{ maxHeight: activityListPx }}>
             {activity.map((a, i) => {
               const Icon = activityIcon(a.kind);
               const color = a.kind === 'alert' ? sevColor(a.sev === 'error' ? 'error' : 'warn') : a.kind === 'config' ? 'var(--info)' : 'var(--ink-3)';
@@ -1216,7 +1223,7 @@ function OperationsView({
                   <Icon className="w-3.5 h-3.5 flex-shrink-0 mt-[2px]" style={{ color }} />
                   <div className="min-w-0 flex-1">
                     <div className="text-[12.5px] truncate" style={{ color: 'var(--ink)' }}>{a.title}</div>
-                    <div className="text-[11px]" style={{ color: 'var(--ink-3)' }}>{a.sub}</div>
+                    <div className="text-[11px] truncate" style={{ color: 'var(--ink-3)' }} title={a.sub}>{a.sub}</div>
                   </div>
                   <span className="mono text-[10.5px] flex-shrink-0" style={{ color: 'var(--ink-4)' }}>
                     {formatDistanceToNow(new Date(a.at), { addSuffix: false })}
@@ -1291,7 +1298,7 @@ function OperationsView({
           <div className="card w-full max-w-sm" style={{ overflow: 'hidden' }} onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2 px-5 py-[14px]" style={{ borderBottom: '1px solid var(--line)' }}>
               <Terminal className="w-4 h-4" style={{ color: 'var(--violet)' }} />
-              <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Open terminal — pick a device</span>
+              <span className="text-[13px] font-semibold" style={{ color: 'var(--ink)' }}>Open Terminal — Pick a Device</span>
               <button onClick={() => setPickTerminal(false)} className="ml-auto" style={{ color: 'var(--ink-3)' }}>
                 <X className="w-4 h-4" />
               </button>
@@ -1362,6 +1369,7 @@ function loadSeverities(): Set<string> {
 export default function DashboardPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const deviceRefreshTimer = useRef<number | null>(null);
 
   const [dashView, setDashView] = useState<'summary' | 'operations'>(() =>
     (localStorage.getItem('dashboard:view') as 'summary' | 'operations') ?? 'summary'
@@ -1442,10 +1450,18 @@ export default function DashboardPage() {
     refetchInterval: 30_000,
   });
 
+  useEffect(() => () => {
+    if (deviceRefreshTimer.current !== null) window.clearTimeout(deviceRefreshTimer.current);
+  }, []);
+
   useSocket({
     'device:updated': () => {
-      queryClient.invalidateQueries({ queryKey: ['metrics-summary'] });
-      queryClient.invalidateQueries({ queryKey: ['devices'] });
+      if (deviceRefreshTimer.current !== null) return;
+      deviceRefreshTimer.current = window.setTimeout(() => {
+        deviceRefreshTimer.current = null;
+        void queryClient.invalidateQueries({ queryKey: ['metrics-summary'] });
+        void queryClient.invalidateQueries({ queryKey: ['devices'] });
+      }, 1_000);
     },
     'clients:updated': () => {
       queryClient.invalidateQueries({ queryKey: ['top-clients'] });
@@ -1515,7 +1531,7 @@ export default function DashboardPage() {
         >
           <ArrowUpCircle className="w-4 h-4 mt-0.5 flex-shrink-0" style={{ color: 'var(--warn)' }} />
           <div className="flex-1 text-[13px] space-y-1" style={{ color: 'var(--ink-2)' }}>
-            <span className="font-semibold" style={{ color: 'var(--warn)' }}>Updates available</span>
+            <span className="font-semibold" style={{ color: 'var(--warn)' }}>Updates Available</span>
             <button onClick={() => navigate('/firmware')} className="ml-3 underline underline-offset-2" style={{ color: 'var(--ink-3)' }}>
               Upgrade several devices
             </button>
@@ -1613,4 +1629,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-

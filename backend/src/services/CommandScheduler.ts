@@ -58,10 +58,11 @@ async function creatorOf(s: ScheduleRow): Promise<{ user: AuthPayload } | { refu
   if (!u) return { refused: 'The account that made this schedule was removed.' };
   const siteRoles = await loadSiteRoles(u.id);
   const user: AuthPayload = { userId: u.id, username: u.username, role: u.role, ...(siteRoles ? { siteRoles } : {}) };
-  // Commands are admin-only (#411), so a creator who was demoted stops running them.
-  // A site-limited account is an admin in some site; which devices that reaches is checked per device below.
+  // Running commands is admin-only (#411), so a schedule stops when its creator
+  // is no longer an admin (GHSA-fv5m-vfmw-8h9v). A site-limited account must be
+  // admin in some site; which devices that reaches is checked per device below.
   const roles = siteRoles ? Object.values(siteRoles) : [u.role];
-  if (!roles.some((r) => r === 'admin')) return { refused: `${u.username} is no longer an administrator, so this schedule can't run commands.` };
+  if (!roles.includes('admin')) return { refused: `${u.username} is no longer an admin, so this schedule can't run commands.` };
   return { user };
 }
 
@@ -141,6 +142,7 @@ class CommandScheduler {
     let ids = await resolveTargets(s);
     let note: string | null = null;
     if (user.siteRoles) {
+      // Admin, as for running by hand: a tag or site can reach devices where the creator is only an operator.
       const denied = new Set((await devicesDenied(user, ids, 'admin')).map(Number));
       if (denied.size) note = `${denied.size} device${denied.size === 1 ? ' is' : 's are'} outside ${user.username}'s sites and ${denied.size === 1 ? 'was' : 'were'} left out.`;
       ids = ids.filter((id) => !denied.has(id));

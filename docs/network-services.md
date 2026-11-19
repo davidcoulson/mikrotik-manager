@@ -9,6 +9,10 @@ refreshing anything older than ten minutes in the background; **Refresh** reads 
 again. On a large fleet the page fills in over a few seconds rather than contacting every device
 at once (see [Scaling](scaling.md#pages-that-show-something-from-every-device)).
 
+DHCP, DNS and NTP show one device at a time, chosen at the top of the page. When the selected
+site or group has only one device, it is chosen for you (from [@ronchan44](https://github.com/ronchan44)'s #464), and
+so is the router for **PPP Users and Sessions** when there's only one.
+
 Most of it writes to the device (Routing, Tunnels & PPP and MLAG only read). Changes go through [Change Guard](change-guard.md) where
 they could affect reachability.
 
@@ -27,7 +31,7 @@ lists the rest.
 A DHCP server bound to an interface that later changes VLAN is a common way to hand out
 addresses on the wrong segment; the lease list is the quickest way to notice.
 
-**DHCP pool usage**, at the top of the page (and on Wireless → Overview), shows how full every
+**DHCP Pool Usage**, at the top of the page (and on Wireless → Overview), shows how full every
 IPv4 address pool across the fleet is, read on each slow poll (#156): yellow from 80%, red from
 95%. A pool that runs out is a quiet failure, since clients connect but get no address, so
 a nearly full pool is also listed on the dashboard. Widen the range or shorten the lease
@@ -75,6 +79,26 @@ Every device in the site that has WireGuard gets its own card. Devices without i
 underneath; **Show / add interface** opens a card for one so an interface can be added.
 
 A peer's persistent keepalive is in seconds; leave it empty to turn keepalive off.
+
+### Client config and QR code
+
+**View** (the eye) on a peer shows the client's `.conf` and a QR code to scan into the WireGuard
+app, when the router keeps the client's private key for that peer. Peers made with WinBox's
+WireGuard wizard do, and so do peers made here with **Generate a client key pair now** (#444):
+
+- The key pair is made in your browser. The public key goes into the peer, and the private key
+  is saved on the router with the client's address, DNS and endpoint, as WinBox does. Anyone who
+  can read the router's configuration can read it.
+- **Client endpoint host** is where the client reaches this router. It starts as the management
+  address, which is often not the address the client should use, so check it. The router's
+  listen port is added unless you give one.
+- **Client allowed IPs** is what the client sends through the tunnel. Narrowing it from the
+  full tunnel needs RouterOS 7.21 or later.
+- Turning it on when editing a peer replaces the peer's key, so the client using the old one
+  needs the new config.
+
+A peer whose private key isn't on the router has no config to show; View says so. Operators and
+admins see View; read-only accounts never receive private keys.
 
 ## Routing
 
@@ -126,7 +150,7 @@ that match the filters.
 
 ### PPP users and sessions
 
-**PPP users and sessions**, at the top of the page, reads one router live: its PPPoE servers,
+**PPP Users and Sessions**, at the top of the page, reads one router live: its PPPoE servers,
 who is connected, and its PPP users (`/ppp secret`). Choose the router, or press **manage** on
 a PPPoE server or PPP session row. Operators and admins can:
 

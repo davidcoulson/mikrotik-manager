@@ -52,6 +52,13 @@ colour comes from the name:
   with the hourly config check. A membership change made on the device shows here within the
   hour.
 
+When a device in the selected site or group runs zones, two filters appear next to the rule
+filters: **From any zone** and **To any zone**. Pick a zone in one to see only traffic from it,
+or in the other for traffic to it, or both for one direction, such as from WAN to LAN. **Router**
+is traffic from, or to, the router itself. The filters cover every zone-managed device in scope,
+so picking LAN brings in LAN on each of them; pick a device too for just one. Lines from devices
+without zones don't match a zone filter.
+
 ## Resolve names
 
 **Resolve names** shows names in place of addresses. Hover a name to see its address. A name
@@ -65,6 +72,34 @@ Reverse DNS answers are kept for an hour and misses for ten minutes. A page wait
 default, because reverse DNS sends the addresses on the page to the manager's DNS server.
 Search still matches addresses, not names.
 
+## Application and row colours
+
+The **Application** column names the service behind a line's port (#415): 443 is HTTPS, 587 is
+SUBMISSION, 8291 is WINBOX. It goes by the destination port, or by the source port for a reply
+(a DNS answer from port 53 back to a client shows as DNS). The grouped view has only the
+destination port, so it names that. Names come from a built-in list based on `/etc/services`,
+plus the MikroTik ports it doesn't know (WinBox, the API, MNDP, bandwidth test). Search still
+matches ports, not names.
+
+Names you add under **Settings → Firewall Logs** also name applications in
+[Traffic](traffic.md#what-it-shows), for ports it would otherwise count as Other TCP or Other UDP.
+
+Two kinds of background traffic get a row colour, so they stand apart:
+
+- **DHCP**: UDP 67/68, and DHCPv6 on 546/547. A DHCP discover to 255.255.255.255 counts as
+  DHCP.
+- **Multicast and broadcast**: 224.0.0.0/4, ff00::/8 and 255.255.255.255. A subnet's own
+  broadcast address (192.168.88.255, say) isn't recognised, because the log line doesn't carry
+  the mask.
+
+Set both under **Settings**, **Firewall Logs**, or with **Port names & colours** on the page.
+Each colour can be one of nine, or **None**. **Port Names** adds a port the list doesn't know, or
+names one it does your way, for TCP, UDP or both. A port can also be a range, such as
+`5000-5100`, which names every port in it (from [@ronchan44](https://github.com/ronchan44)'s #415). A single port listed as
+well keeps its own name, a narrower range wins over a wider one, and two ranges can't overlap.
+Show the built-in list to see what it already names; a port you've renamed is struck out there. Everyone sees the same names and colours;
+only admins change them.
+
 ## Where the events come from
 
 Firewall logs are collected from the normal RouterOS log stream. A firewall
@@ -75,7 +110,7 @@ By default, the page requests firewall events from the last 24 hours. The
 period selector changes that to the last hour, 7 days or 30 days (only lines
 still within the firewall log retention are there to find), and a link can
 open it with `?range=1h|24h|7d|30d`. Results can be filtered by device, action,
-protocol, or text such as an address, port, interface, or log prefix.
+protocol, [zone](#zones), or text such as an address, port, interface, or log prefix.
 
 **All rules** narrows the page to one rule's lines. It lists the log prefixes that logged in
 the period, each with its device and how many lines it wrote, busiest first; with a device
