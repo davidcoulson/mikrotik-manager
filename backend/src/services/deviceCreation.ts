@@ -33,7 +33,8 @@ export type CreateDeviceContext = {
    */
   siteId?: number | null;
   /**
-   * The sites the caller may touch, for a site-scoped account (P1-7); absent or
+   * The sites the caller may change devices in (operator or admin there), for a
+   * site-scoped account (P1-7); absent or
    * null for a fleet-wide one. A device already managed in another site is
    * neither revealed nor merged into.
    */
@@ -418,8 +419,8 @@ async function createDevice(
            api_username=$5,
            api_password_encrypted=$6,
            ssh_port=COALESCE($7,ssh_port),
-           ssh_username=COALESCE($8,ssh_username),
-           ssh_password_encrypted=COALESCE($9,ssh_password_encrypted),
+           ssh_username=$8,
+           ssh_password_encrypted=$9,
            device_type=COALESCE($10,device_type),
            notes=COALESCE($11,notes),
            ssh_only=$13,
@@ -435,7 +436,7 @@ async function createDevice(
           api_username,
           encryptedPass,
           sshPortGiven,
-          sshUserToStore,
+          sshUserToStore || null,
           encryptedSshPass,
           device_type,
           notes || null,
