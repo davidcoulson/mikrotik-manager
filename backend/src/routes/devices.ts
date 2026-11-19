@@ -401,7 +401,7 @@ router.post('/', requireWrite, async (req, res) => {
     requestingUserRole: isSiteScoped(req.user) ? 'operator' : req.user?.role,
     presetCaller: presetCaller(req.user),
     siteId: target.siteId,
-    allowedSites: req.user?.siteRoles ? Object.keys(req.user.siteRoles).map(Number) : null,
+    allowedSites: req.user?.siteRoles ? Object.entries(req.user.siteRoles).filter(([, r]) => r !== 'viewer').map(([id]) => Number(id)) : null,
   });
   return res.status(result.status).json(result.body);
 });
