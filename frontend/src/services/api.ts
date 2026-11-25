@@ -748,6 +748,8 @@ export interface CommandRunDevice {
 
 export interface CommandRunDetail extends CommandRunSummary {
   devices: CommandRunDevice[];
+  /** Device output is for operators and admins; a viewer gets none. */
+  output_hidden?: boolean;
 }
 
 // ─── Command templates (#163) ───────────────────────────────────────────────
@@ -959,6 +961,8 @@ export const devicesApi = {
     api.post<{
       started: boolean; installed_version: string | null;
       target_version?: string; message: string;
+      /** Set when the update is only on the device's package mirror (#482). */
+      mirror_version?: string;
     }>(`/devices/${id}/install-update`),
   getClock: (id: number) => api.get<{ date: string; time: string; timezone: string }>(`/devices/${id}/clock`),
   setClock: (id: number, data: { date?: string; time?: string; timezone?: string }) =>
@@ -1302,7 +1306,8 @@ export interface ClientPathHop {
 }
 
 export interface PresencePoint { time: string; online: number; }
-export interface TrafficPoint2 { time: string; tx_bytes: number; rx_bytes: number; }
+/** `seconds`: what the point covers, for showing it as a rate. */
+export interface TrafficPoint2 { time: string; tx_bytes: number; rx_bytes: number; seconds?: number }
 export interface SignalPoint { time: string; signal_strength: number; }
 
 export interface RoamEvent {
@@ -1441,6 +1446,8 @@ export interface FirewallEvent {
   action: 'accept' | 'drop' | 'reject' | 'fasttrack' | 'unknown';
   prefix: string;
   chain: 'input' | 'forward' | 'output';
+  /** The chain RouterOS logged it under, when it's a chain of the user's own (#369). */
+  ruleChain?: string;
 
   inInterface?: string;
   outInterface?: string;
@@ -2100,6 +2107,8 @@ export type ZoneAction = 'deny' | 'allow' | 'services';
 /** `icmp` is a type or type:code for ICMP; `number` an IP protocol number for "other" (#369). */
 export interface ZoneCustomService {
   protocol: 'tcp' | 'udp' | 'any' | 'icmp' | 'other'; ports: string; icmp?: string; number?: string; src?: string; dst?: string;
+  /** Log the connections it accepts (#369). */
+  log?: boolean;
 }
 export interface ZonePolicy { action: ZoneAction; services: string[]; custom: ZoneCustomService[] }
 export interface ZoneConfig {
@@ -2609,10 +2618,11 @@ export const networkServicesApi = {
 
   // ── DNS ───────────────────────────────────────────────────────────────────
   getDns: (deviceId: number) =>
-    api.get<{ settings: NS; statics: NS[] }>('/network-services/dns', { params: { deviceId } }),
+    api.get<{ settings: NS; statics: NS[]; dohBuiltinTrust?: boolean | null }>('/network-services/dns', { params: { deviceId } }),
   setDns: (deviceId: number, settings: {
     servers?: string; allow_remote_requests?: boolean;
     max_udp_packet_size?: string; cache_size?: string; cache_max_ttl?: string;
+    use_doh_server?: string; verify_doh_cert?: boolean;
   }) =>
     api.put<NS>('/network-services/dns', settings, { params: { deviceId } }),
   flushDns: (deviceId: number) =>
@@ -2706,7 +2716,8 @@ export interface NetflowDeviceState {
 
 // ─── Traffic Analytics (NetFlow) ──────────────────────────────────────────────
 
-export interface ClientTrafficPoint { time: string; upload: number; download: number; uploadPackets?: number; downloadPackets?: number }
+/** `seconds`: what the point covers, for showing it as a rate. */
+export interface ClientTrafficPoint { time: string; upload: number; download: number; uploadPackets?: number; downloadPackets?: number; seconds?: number }
 export interface TrafficTopClient {
   mac: string;
   upload_bytes: number;
@@ -3460,6 +3471,7 @@ export type NetinstallSupport = 'installed' | 'available' | 'too-old' | 'unsuppo
 export interface NetinstallFleetDevice {
   id: number; name: string; status: string; device_type: string; model: string | null;
   ros_version: string | null; architecture: string | null; support: NetinstallSupport;
+  site_id: number | null;
   /** A package install or removal sent from the page, until the device shows it. */
   package_change: 'install' | 'remove' | null;
 }

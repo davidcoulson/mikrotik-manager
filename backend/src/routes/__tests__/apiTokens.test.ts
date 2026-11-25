@@ -3,6 +3,7 @@ jest.mock('../../config/redis', () => ({ redis: {} }));
 jest.mock('../../middleware/auth', () => ({
   requireAuth: (_q: unknown, _s: unknown, next: () => void) => next(),
   requireAdmin: (_q: unknown, _s: unknown, next: () => void) => next(),
+  requireSettingsRead: (_q: unknown, _s: unknown, next: () => void) => next(),
   requireWrite: (_q: unknown, _s: unknown, next: () => void) => next(),
   fleetOnly: (_q: unknown, _s: unknown, next: () => void) => next(),
   isSiteScoped: () => false,

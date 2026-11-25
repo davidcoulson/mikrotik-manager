@@ -29,7 +29,7 @@ import { fit, normalizeMac } from '../../utils/fit';
 import { rosDurationSeconds } from '../../utils/rosDuration';
 import { guestSsidTag, legacyAuthTypes, legacyProfileName, legacyProfileParams } from './legacySecurity';
 import { decrypt } from '../../utils/crypto';
-import { lookupVendor } from '../../utils/oui';
+import { lookupVendor, ouiLoaded } from '../../utils/oui';
 import { buildServerArpMap } from '../../utils/serverArp';
 import { aggregateBridgeVlans, portVlanMembership, expandVlanIds, rosList } from '../../utils/vlan';
 import {
@@ -37,6 +37,7 @@ import {
   normalizeRadios, macIndexKeys, parseRadioMonitor, resolveDatapath,
   clientsPerRadio, buildMacIndex, matchRadiosToDevices, matchLegacyRadio,
   legacyManagerEnabled, legacyCapInterfaces, legacyRadios, hasRadios, chooseWifiPackage,
+  radioClientCount,
   type WifiRole,
 } from './capsman';
 
@@ -92,6 +93,7 @@ import { parseDeviceLogTime } from '../../utils/deviceTime';
 import { BackupService } from '../BackupService';
 import { apiExport } from '../apiExport';
 import { storeProxyConnections } from '../ProxyLogService';
+import { writeClientCounts } from '../clientCounts';
 
 /** RouterOS update commands reach out to MikroTik's servers and are slow by nature. */
 const UPDATE_CHECK_TIMEOUT_MS = 90_000;
@@ -1877,46 +1879,9 @@ export class DeviceCollector {
         .intField('wired_clients', Math.max(0, totalClients - Object.keys(wifiSignal).length))
         .timestamp(new Date());
       writeApi.writePoint(point);
-
-      // Write a global deduplicated metric so the dashboard graph shows the true
-      // unique client count across all devices (not a per-device sum that double-counts
-      // clients visible from multiple devices simultaneously).
-      const dedupedRows = await query<{ count: string }>(
-        `SELECT COUNT(DISTINCT mac_address) AS count FROM clients WHERE active = TRUE`
-      );
-      const globalTotal = parseInt(dedupedRows[0]?.count || '0', 10);
-      const globalPoint = new Point('client_counts')
-        .tag('device_id', '_global')
-        .tag('device_name', '_global')
-        .intField('total_clients', globalTotal)
-        .timestamp(new Date());
-      writeApi.writePoint(globalPoint);
-
-      // The same deduplicated count, but for this device's site (issue #130).
-      // Summing the per-device series instead would double-count a client seen
-      // by two access points -- which is the exact error the global series was
-      // introduced to avoid, so the site series has to be deduplicated too.
-      const siteRows = await query<{ site_id: number | null; count: string }>(
-        `SELECT d0.site_id,
-                (SELECT COUNT(DISTINCT c.mac_address)
-                   FROM clients c
-                   JOIN devices d ON d.id = c.device_id
-                  WHERE c.active = TRUE AND d.site_id = d0.site_id) AS count
-           FROM devices d0 WHERE d0.id = $1`,
-        [this.device.id]
-      );
-      const siteId = siteRows[0]?.site_id ?? null;
-      if (siteId != null) {
-        writeApi.writePoint(
-          new Point('client_counts')
-            .tag('device_id', `_site_${siteId}`)
-            .tag('device_name', `_site_${siteId}`)
-            .intField('total_clients', parseInt(siteRows[0]?.count || '0', 10))
-            .timestamp(new Date())
-        );
-      }
-
       await writeApi.flush().catch(() => {});
+      // The fleet and site totals, deduplicated across devices.
+      await writeClientCounts();
     } catch (err) {
       console.error(`[${this.device.name}] Failed to update clients:`, err);
     }
@@ -1924,11 +1889,16 @@ export class DeviceCollector {
 
   private async lookupMissingVendors(): Promise<void> {
     try {
-      // Include vendor='' entries: those were set by the old API-based lookup
-      // when it was rate-limited and never actually resolved.
+      // Not loaded yet: every answer would be '', stored as "not in the list".
+      if (!ouiLoaded()) return;
+      // Only clients never looked up. '' is "looked up, not in the list" (a
+      // randomised MAC, mostly): selecting those too rewrote every one of them
+      // on every fast poll, for ever. Startup clears '' once (index.ts), so a
+      // newer list still gets its turn.
       const rows = await query<{ mac_address: string }>(
         `SELECT mac_address FROM clients
-         WHERE device_id = $1 AND (vendor IS NULL OR vendor = '') AND active = TRUE`,
+         WHERE device_id = $1 AND vendor IS NULL AND active = TRUE
+         LIMIT 200`,
         [this.device.id]
       );
       for (const row of rows) {
@@ -3706,11 +3676,13 @@ export class DeviceCollector {
         }
       }
 
+      const controllerPeers = await this.controllerRadioPeers(wlans);
+
       const writeApi = getWriteApi();
       for (const wlan of wlans) {
         const name = wlan['name'];
         if (!name || wlan['disabled'] === 'true') continue;
-        const clientCount = clientsByIface[name] || 0;
+        const clientCount = radioClientCount(wlan, clientsByIface[name] || 0, controllerPeers);
         const noiseFloor  = parseInt(wlan['noise-floor'] || '0', 10);
 
         const point = new Point('wireless_stats')
@@ -3753,6 +3725,26 @@ export class DeviceCollector {
     } catch (err) {
       console.error(`[${this.device.name}] Failed to collect wireless stats:`, err);
     }
+  }
+
+  /**
+   * Clients per radio as a CAPsMAN controller counted them on its last poll,
+   * by radio MAC (#504). Counts older than 15 minutes are left out, so a
+   * controller that stopped polling doesn't hold a CAP's figure up.
+   */
+  private async controllerRadioPeers(wlans: Record<string, string>[]): Promise<Map<string, number>> {
+    const out = new Map<string, number>();
+    const macs = wlans.map((w) => (w['mac-address'] || '').toUpperCase()).filter(Boolean);
+    if (macs.length === 0) return out;
+    const rows = await query<{ radio_mac: string; registered_peers: number }>(
+      `SELECT DISTINCT ON (radio_mac) radio_mac, registered_peers FROM capsman_radios
+        WHERE radio_mac = ANY($1::text[]) AND registered_peers IS NOT NULL
+          AND updated_at > NOW() - INTERVAL '15 minutes'
+        ORDER BY radio_mac, updated_at DESC`,
+      [macs]
+    ).catch(() => []);
+    for (const r of rows) out.set(r.radio_mac, Number(r.registered_peers));
+    return out;
   }
 
   /** Remove stored security profiles that no longer exist on the device. */
@@ -7142,9 +7134,14 @@ export class DeviceCollector {
     max_udp_packet_size?: string;
     cache_size?: string;
     cache_max_ttl?: string;
+    use_doh_server?: string;
+    verify_doh_cert?: boolean;
   }): Promise<void> {
     const params: Record<string, string> = {};
     if (settings.servers !== undefined) params['servers'] = settings.servers;
+    // DNS over HTTPS (#468): an empty URL turns it off.
+    if (settings.use_doh_server !== undefined) params['use-doh-server'] = settings.use_doh_server;
+    if (settings.verify_doh_cert !== undefined) params['verify-doh-cert'] = settings.verify_doh_cert ? 'yes' : 'no';
     if (settings.allow_remote_requests !== undefined) {
       params['allow-remote-requests'] = settings.allow_remote_requests ? 'yes' : 'no';
     }
@@ -7152,6 +7149,23 @@ export class DeviceCollector {
     if (settings.cache_size) params['cache-size'] = settings.cache_size;
     if (settings.cache_max_ttl) params['cache-max-ttl'] = settings.cache_max_ttl;
     await this.client.execute('/ip/dns/set', params);
+  }
+
+  /**
+   * Whether DNS checks DoH certificates against RouterOS's built-in trusted
+   * roots (#468): yes when /certificate/settings has a builtin-trust-store
+   * that isn't off and DNS is among its current defaults. False on versions
+   * without one, which need the server's CA imported; null when unreadable.
+   */
+  async dnsUsesBuiltinTrust(): Promise<boolean | null> {
+    const rows = await this.client.execute('/certificate/settings/print', {}).catch(() => null);
+    if (!rows) return null;
+    const row = rows[0] ?? {};
+    const store = row['builtin-trust-store'];
+    if (store === undefined) return false;
+    if (store === 'none') return false;
+    if (store === 'all') return true;
+    return (row['current-defaults'] ?? '').split(',').map((v) => v.trim()).includes('dns');
   }
 
   async getDnsStaticEntries(): Promise<Record<string, string>[]> {

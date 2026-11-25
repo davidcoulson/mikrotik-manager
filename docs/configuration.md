@@ -128,6 +128,13 @@ each person, and each browser, can have their own.
   hardware looks: RJ45 jacks, SFP cages, QSFP28 and QSFP-DD cages, and broken-out cages as their
   lanes inside one cage outline. Up ports take the accent colour, with a green link light. **Tiles**
   brings back the plain green and red squares.
+- **Traffic graphs:** **Volume** (the default) plots what each point of a traffic chart adds up,
+  in bytes and packets: 4.2 GB at 19:45 is the traffic of the 15 minutes up to 19:45 on a 24-hour
+  chart. **Rate** plots the same traffic per second, the way links are rated: bits per second
+  (Kbps, Mbps, Gbps) and packets per second (Kpps). This applies to the Traffic page and a
+  client's usage and app traffic charts. The newest point, still filling up, is divided by the
+  time it has covered so far, so it doesn't dip. The totals stay in bytes. Interface graphs were
+  already per second.
 
 ## Sessions
 
@@ -146,7 +153,7 @@ connections are checked again every minute and closed when their session has end
 terminal re-checks the account before it opens a shell. Before 0.24.46 a session kept its
 original role and access for its full 24 hours, whatever happened to the account.
 
-An admin who resets their *own* password from **Settings → Users** is signed out and
+An admin who resets their *own* password from **Settings → Users & Roles** is signed out and
 signs in again with the new one. API tokens are separate and unaffected: revoke those
 under **Settings → Automation → API Tokens**.
 
@@ -240,9 +247,18 @@ These are edited in the Settings UI and take effect without a restart:
 | Change Guard | `change_guard_enabled`, `change_guard_mode`, `change_guard_timeout_sec` | [Change Guard](change-guard.md) |
 | Config Health | `config_health_enabled`, `config_health_interval_min` | [Change Guard](change-guard.md) |
 | Polling | fast / slow / log intervals, MAC scan, spectral and AP scan cadence | Settings → Polling |
-| Config snapshots | `config_snapshot_enabled`, `config_snapshot_interval_min`, `config_snapshot_retention` | Settings → Config History |
-| NetFlow | collector address and port, version, retention, top-N clients | Settings → NetFlow |
+| Config snapshots | `config_snapshot_enabled`, `config_snapshot_interval_min`, `config_snapshot_retention` | Settings → General |
+| NetFlow | collector address and port, version, retention, top-N clients | Network Services → NetFlow |
 | Alerting | rules, thresholds, cooldowns, channels | [Alerting](alerting.md) |
+
+### Who sees Settings
+
+- **Admins** (fleet-wide) see and change everything.
+- **Operators** (fleet-wide) see every setting, read-only, apart from the SSH Keys tool.
+  This includes alerting, webhooks and report schedules, which operators could change before
+  1.1. Secrets stay masked.
+- **Viewers**, and any account limited to particular sites, see only their own account:
+  time format and password.
 
 ## Network exposure
 
@@ -518,7 +534,7 @@ From 1.0 there are two lines, and you choose which one you follow:
 | Channel | Git branch | Image tag | What it gets |
 |---|---|---|---|
 | **Stable** (default) | `main` | `:latest` | 1.0.x: fixes only, including security fixes |
-| **Beta** | `dev` | `:beta` | The next minor version as betas (1.1.0-beta.1, ...), with new features as they land |
+| **Beta** | `dev` | `:beta` | The next minor version as betas (1.1.0-beta.1, ...), with new features as they land, then its release candidates (1.1.0-rc.1, ...) |
 
 Stable is what you get unless you change something, and what production fleets should run.
 New features are built on `dev` and reach stable in the next minor release; fixes go to both.
@@ -534,8 +550,8 @@ once stable has caught up with the version you were on, because the database is 
 forwards, not back; until then, stay on beta or restore a platform backup taken on stable.
 
 The update notice in the app follows your channel: a stable install is told about stable
-releases, a beta install about the next beta. A specific version can be pinned with its image
-tag (`MTM_TAG=1.0.0`).
+releases, a beta or release candidate install about the next one on `dev`. A specific version
+can be pinned with its image tag (`MTM_TAG=1.0.0`, or `MTM_TAG=1.1.0-rc.1`).
 
 From 0.24.51 each image carries an SBOM and build provenance, and is signed with
 [cosign](https://docs.sigstore.dev/) by the workflow that built it. To check an image before

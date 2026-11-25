@@ -1,7 +1,458 @@
-# MikroTik Manager 1.1 (beta)
+# MikroTik Manager 1.1 (release candidate)
 
-1.1 is in beta on the `dev` branch and the `:beta` images
-([release channels](configuration.md#release-channels)). For stable, stay on 1.0 below.
+1.1 is in release candidates on the `dev` branch and the `:beta` images
+([release channels](configuration.md#release-channels)): its features are complete, and only
+fixes go in from here. For stable, stay on 1.0 below.
+
+## What's new in 1.1
+
+Everything 1.1 adds beyond the latest 1.0.x, for anyone coming from 1.0. Fixes aren't listed
+here; the beta entries below have every change, release by release.
+
+### New
+
+**Firewall zones** ([Zones](devices.md#zones))
+
+- Group a router's interfaces into zones and set what may pass between each pair, in a matrix;
+  the manager writes and keeps the RouterOS rules, under Change Guard with **Review changes**.
+- Presets to start from: home or small office, an office with a guest network, a management
+  network, or servers in a DMZ.
+- Custom rules in a zone pair can name ports, addresses, hostnames, ICMP of one type, or any IP
+  protocol by number. NAT rules can name the WAN interface.
+- **Log drops** per zone, capped at 5 a second so logging can't overload a small router, and
+  **Log** on a rule (or **Log some of it** on an allow-all pair) for what a zone accepts.
+- Zones can limit what the manager itself reaches on the router to the API, API-SSL and SSH
+  ports.
+- With zones on, the Firewall tab reads as zones; the chains and jumps behind them are under
+  **Show RouterOS rules**.
+- Zones work on routers without FastTrack offload.
+
+**Firewall** ([Devices](devices.md#quick-firewall-rules))
+
+- **Quick rules**: common protections in one step, including
+  [brute-force protection](devices.md#brute-force-protection), which bans an address after
+  repeated failed logins and shows bans across the fleet on the Security page. Management access
+  adds the manager's own address.
+- The IPv6 firewall can be edited like IPv4: filter rules, NAT (RouterOS 7) and address lists,
+  with reordering, counters and **Review changes**.
+- A rule that logs gets a short tag in its log prefix, so Firewall Logs can say which rule logged
+  a line; rules that would read the same show their tags.
+- Known RouterOS CVEs count in a device's hardening score.
+
+**Firewall Logs and Sessions**, now under **Security** ([Firewall logs](firewall-events.md),
+[Sessions](sessions.md))
+
+- Firewall Logs opens grouped: one line per device, rule, interfaces, protocol and port, with
+  counts. **Raw** shows every line.
+- It reads in zones, with zones as coloured badges, and filters **From any zone** and **To any
+  zone**.
+- A period (1 hour to 30 days), an **All rules** filter for one rule's lines, and **Hide rules**
+  for everything but the rules you pick.
+- An **Application** column naming the service behind each port, with row colours for DHCP and
+  multicast. Port names, ranges and colours are set under **Settings → Firewall Logs**.
+- **Resolve names** shows client hostnames and reverse DNS in place of addresses.
+- The Firewall tab can show only the rules that log.
+- **Sessions**: one row per connection from NetFlow, with the client, server, NAT, bytes each way
+  and how it ended.
+- Routers behind NAT are told apart in NetFlow, so their flows aren't lumped together.
+
+**Traffic** ([Traffic analytics](traffic.md))
+
+- Click an application to see the clients behind it, each with its share, and **Where it goes**:
+  its destinations and Top Destinations.
+- Names behind addresses, from the DNS query logs of AdGuard Home or Pi-hole
+  (**Settings → DNS Query Log**), including AdGuard Home as a Home Assistant add-on.
+- Port names from Settings → Firewall Logs name Traffic's applications too.
+- Drag across a chart to zoom the whole page into that window.
+- Graphs as rates (bits and packets per second) rather than totals, under **Settings → General →
+  Appearance**.
+- A new layout: Top Talkers beside Traffic by Application, with Top Destinations below.
+
+**Network services** ([Network services](network-services.md))
+
+- **Tunnels & PPP**: the state of every IPsec peer, PPPoE server and client, PPP session, and
+  EoIP, GRE and IPIP tunnel, problems first, with a **Tunnel down** alert. **PPP Users and
+  Sessions** reads a router live: disconnect a session, and turn a PPP user or a PPPoE server off
+  or on.
+- **Netinstall** from a router running RouterOS's netinstall package: install the package,
+  entries that name the device to install, the package cache, and starting an install.
+- **MLAG**: each pair's state and role, the peer link, settings that differ between peers, and
+  heartbeat and host-sync storms from the logs, with an **MLAG degraded** alert.
+- **Routing rules** on a device's Routing tab, in order, with what each one looks up.
+- **DNS over HTTPS** on Network Services → DNS.
+- **WireGuard**: a peer's client `.conf` and QR code, and **Add Peer** can generate the client's
+  key pair.
+- DHCP, DNS, NTP and PPP open on the device when a site has only one.
+- **Reverse proxy** rules on routers, with Let's Encrypt certificates for public hostnames, on a
+  new tab of **Operations → Certificates** ([Device certificates](certificates.md#reverse-proxy)).
+
+**Switching, VLANs and bridges** ([Devices](devices.md#bridges))
+
+- VLAN interfaces can be added, edited and removed from the VLANs tab, with addresses, and a
+  change to the one the manager reaches the device through is predicted as a lockout.
+- **Q-in-Q** (a bridge's VLAN tag type, and a port's tag stacking) and **MVRP**, on bridges,
+  bridge VLANs (forbidden ports) and VLAN interfaces.
+- A bridge's addresses can be edited from the Bridges tab, and EoIP, wireless, VLAN and other
+  interfaces not on the faceplate can be added to a bridge.
+- Spanning tree you can set: a **Spanning Tree** card on the topology page for every tree in
+  view, and each bridge port's priority, path cost, edge, point-to-point, BPDU guard and
+  restricted role and TCN.
+- A bridge's MTU can be set, and a port's MTU form says the most its hardware takes.
+- **802.1X** on switches and routers: ports that authenticate clients, with RADIUS from User
+  Manager or your own server ([802.1X](devices.md#8021x), [User Manager](user-manager.md#8021x-with-user-manager)).
+- Drawn ports on the faceplate (RJ45 jacks, SFP cages, QSFP), sized to the device with its model
+  name, virtual interfaces in a box of their own, and ports per row remembered per device.
+- Config Health finds access ports left tagged in other VLANs.
+
+**Device pages** ([Device tabs](devices.md#device-tabs))
+
+- A **Graphs** tab: history for every chart over one range (1 hour to 30 days), with a shared
+  hover cursor, interfaces, connections, NAT, firewall drops and per-core CPU
+  ([Device graphs](devices.md#device-graphs)).
+- **Peaks and drops**: CPU and memory peaks as a band above the 5-minute average, and dropped
+  packets counted.
+- A **Firmware** tab for the RouterOS and RouterBOOT check and install.
+- **Torch** in Tools: who is talking on an interface right now, flow by flow, narrowed by
+  address, port and protocol.
+- An **SMS inbox** on the LTE tab, and the data-cap rule can delete the carrier's replies to its
+  reset SMS ([Cellular](cellular.md)).
+- A **Wireless Systems** device type for outdoor PTP, PtMP and CPE radios, with an **Antenna
+  Aligner** tab: live signal from one or both ends of a link and an optional tone
+  ([Antenna aligner](antenna-aligner.md)).
+- Backups over the API when SSH is off, on RouterOS 7.13 and later
+  ([Backups](backups.md#devices-with-ssh-off)).
+- **Force add without checking connectivity** in Add Device, for a device that isn't reachable
+  yet.
+- The **Configuration changed** alert says what changed, as a diff.
+
+**Wireless and CAPsMAN** ([CAPsMAN](capsman.md#set-up-capsman))
+
+- **Set up CAPsMAN** on the Wireless page: a controller and its access points, on both bands or
+  one, with a 5 GHz SSID of its own if you want one, on wifi and legacy CAPsMAN.
+- A controller with radios of its own shows as **Controller and AP**.
+- AP Radio TX Retries remembers the band you picked.
+
+**Topology** ([Topology](topology.md))
+
+- Curved links leaving the bottom of one card and entering the top of the next, with **Links** to
+  switch back to straight lines.
+- A tiered layout with the gateway on top, then core, access and APs, drawn top-down or
+  left-to-right, and **Arrange** to lay the cards out again.
+- A **Compact** view of icons with a role chip (Gateway, CAPsMAN, CAP, STP root).
+- Port labels on links, short port names, bonds shown at both ends, and parallel links over
+  VLAN, VRRP or bond interfaces merged into one with a **+N**.
+- Links heard over tunnels drawn dotted; links from OSPF neighbours, for routers reached only
+  over tunnels.
+- Hosts that send LLDP without a name collapse into one **N hosts** chip.
+- Your own firewall, ISP modem or other gateway as a node on top of the map.
+- **Export** the whole map as PNG or SVG.
+- **Display** holds the Cards, Links, Layout and Port labels choices in one place.
+
+**Clients and sites** ([Clients](clients.md), [Sites](sites.md))
+
+- Client columns can be hidden and resized.
+- Clients leaves out the manager's own network devices, and switches, routers and access points
+  it doesn't manage.
+- **Connection Path** goes from a client's device all the way to the top of the site.
+- A site can be placed on the map by latitude and longitude, and has its own map zoom, used
+  wherever its devices show; the sites map opens on the default site.
+
+**Dashboard**
+
+- A readable **Capacity & health** card: busiest devices first, shared name prefixes shown once,
+  24-hour CPU graphs, and each metric opens its device graph.
+
+**Operations and the manager itself**
+
+- [Jump hosts](jump-hosts.md): reach devices through an SSH connection to another router, with
+  RouterOS's reason when forwarding is off.
+- **Scheduled bulk commands**, once or repeating ([Bulk commands](commands.md#schedules)).
+- **A template from a device**: start a command template from a device's configuration
+  ([Templates](commands.md#a-template-from-a-device)).
+- **AI connections**: read-only fleet review for AI tools over MCP or OpenAPI, with a token or
+  your identity provider ([AI connections](ai-connections.md)).
+- **Let's Encrypt** certificates for the manager ([Let's Encrypt](configuration.md#lets-encrypt-acme)).
+- **12- or 24-hour time**, as a fleet default and per account
+  ([Time display](configuration.md#time-display)).
+- **Appearance**: a System theme that follows your computer, seven accent colours or your own,
+  and Midnight dark surfaces ([Appearance](configuration.md#appearance)).
+- Source builds behind a network proxy (`HTTPS_PROXY`).
+- Settings tabs can be linked to and stay put on reload.
+- User Manager is in the sidebar only where a device runs it.
+
+**Scale and reliability** ([Polling and scaling](scaling.md))
+
+- Polls no longer stall on large networks: clients are written in batches.
+- A device is marked offline only after a number of missed polls in a row (**Missed polls
+  before offline**, 2 by default); when most of a site goes quiet at once there's one alert for
+  the site; and a reboot the manager sent, a rollout step or a maintenance window doesn't alert.
+- Device Logs and Firewall events open quickly on large log tables.
+- New major versions underneath: Express 5, BullMQ, openid-client 6, recharts 3, zustand 5 and
+  TypeScript 6, and property-based fuzz tests on code that reads outside input.
+
+### Changes you may notice
+
+- **Who sees Settings.** Admins change everything. Fleet operators see every Settings tab
+  read-only (SSH Keys apart) and can no longer change alerting, webhooks, report schedules or
+  clear the poll queue; write API tokens, which act as an operator, lose them too. Viewers and
+  accounts limited to particular sites see only their own account
+  ([Who sees Settings](configuration.md#who-sees-settings)).
+- **Netinstall and scheduled commands need an admin.** Netinstall changes need an admin for the
+  router's site, and a scheduled bulk command runs only while the account that made it is still
+  an admin ([Netinstall](network-services.md#netinstall), [Bulk commands](commands.md)).
+- **Menu**: Firewall Logs and Sessions moved under **Security**.
+- **Zones fold their rules away.** With zones on, a device's Firewall tab reads as zones; the
+  chains and jumps that carry them out are behind **Show RouterOS rules**.
+
+### Upgrading from 1.0
+
+1. Update to the latest 1.0.x first if you can, then take a [platform backup](platform-backup.md)
+   (**Settings → Backup & Restore**).
+2. Get the 1.1 compose file as well as the images, and keep your `.env`
+   ([Updating and image versions](configuration.md#updating-and-image-versions)). A 1.0 compose
+   file with 1.1 images also starts, so an update half done isn't stuck.
+3. Start it. Database migrations run on their own. PostgreSQL and Redis restart once, because
+   1.1's compose file pins newer builds of their images (still PostgreSQL 15 and Redis 7).
+
+Going back to 1.0 means restoring that platform backup: migrations only go forwards.
+
+Every security fix made during 1.1 also shipped on 1.0.x, so an up-to-date 1.0 install already
+has them ([1.0 release notes](#mikrotik-manager-10)).
+
+### Thank you
+
+1.1 is mostly features people asked for. Thank you to everyone who suggested one, tested a
+beta, sent a fix or reported a problem:
+
+- [@ronchan44](https://github.com/ronchan44) (Ron): firewall zones and everything around them
+  (custom rules with addresses, hostnames and protocols, logging per zone and per rule, which rule
+  logged a line, presets), the Firewall Logs redesign and Sessions, Tunnels & PPP and Netinstall,
+  the reverse proxy with Let's Encrypt, scheduled bulk commands, 802.1X with User Manager,
+  placing sites on the map and their zoom, routing rules, backups without SSH, drawn ports, Torch,
+  the CAPsMAN quick set, NAT rules naming the WAN, dashboard metrics that open their graph, Q-in-Q
+  and MVRP, zooming into Traffic, the only device chosen for you, bridge addresses and interfaces
+  from the Bridges tab, DNS over HTTPS, AP Radio TX Retries, and testing nearly every beta.
+- [@azizfayziev](https://github.com/azizfayziev) (aziz): Traffic from an application to its
+  clients, destinations and names; the more readable topology map, with its tiered layout,
+  compact view, port labels and export; the Capacity & health card; MLAG monitoring and its peer
+  link; the Graphs tab with peaks and drops; Clients leaving out network devices and the
+  Connection Path; and code for Firewall Logs' period, **All rules** and **Hide rules** filters
+  and for fewer false offline alerts.
+- [@eskyuu](https://github.com/eskyuu) (Steven Wilton): Let's Encrypt for the manager, source
+  builds behind a proxy, adding a device without checking it first, fewer refreshes from busy
+  pages, the RouterBOOT restart check, and Config Health's check of VLAN interfaces as bridge
+  ports.
+- [@KevinGinger](https://github.com/KevinGinger): jump hosts, and RouterOS's reason when one
+  can't forward.
+- [@jenserling](https://github.com/jenserling): 12- or 24-hour time, and Wireless Systems with
+  the antenna aligner.
+- [@JohnDepon](https://github.com/JohnDepon): traffic graphs as rates, and performance on large
+  fleets.
+- [@davidcoulson](https://github.com/davidcoulson): the Firmware tab, and security reports.
+- [@Bigben83](https://github.com/Bigben83): the read-only MCP connector that AI connections grew
+  from.
+- [@cybr4nx](https://github.com/cybr4nx): Quick firewall rules and zone presets, and resizable
+  client columns.
+- [@Lithiuhm](https://github.com/Lithiuhm): WireGuard client configs and QR codes.
+- [@thanhtrung5763](https://github.com/thanhtrung5763): log tables that open quickly.
+- [@pimlie](https://github.com/pimlie): topology links from OSPF, and security reports.
+- [@dlemery](https://github.com/dlemery): editing the IPv6 firewall.
+- [@rvanderwouw](https://github.com/rvanderwouw): VLAN interfaces on the VLANs tab.
+- [@kraken-XIV](https://github.com/kraken-XIV): the System theme and accent colours.
+- [@simonkrebsd3](https://github.com/simonkrebsd3): brute-force protection.
+- [@kamils777](https://github.com/kamils777): the Configuration changed alert's diff.
+- [@HectorUrrea24](https://github.com/HectorUrrea24) (Hector): PPP users and sessions.
+- [@Toryius](https://github.com/Toryius) (Manuel): a template from a device.
+- [@trackersoft](https://github.com/trackersoft) (Stanley): the SMS inbox and deleting the
+  carrier's replies, and readable chart labels.
+- [@schmitt330](https://github.com/schmitt330): device tools on RouterOS 6.
+- [@orshih6](https://github.com/orshih6): a security report on the release workflow.
+
+## 1.1.0-rc.8
+
+The fix in 1.0.36 below.
+
+## 1.1.0-rc.7
+
+The fixes in 1.0.35 below. On 1.1 the address check also covers the **Bridges** tab.
+
+## 1.1.0-rc.6
+
+The fix in 1.0.34 below.
+
+## 1.1.0-rc.5
+
+The fix in 1.0.33 below, and dependency updates: nodemailer 10.6.1, openid-client 6.9.0,
+cron-parser 5.10.6, bullmq 6.7.8, recharts 3.11.0, @tanstack/react-query 5.108.1,
+tailwind-merge 3.7.1, and CodeQL 4.39.4 for the security scans.
+
+## 1.1.0-rc.4
+
+The fix in 1.0.32 below.
+
+- **Downloads through a router with a private WAN address are counted for the right client.**
+  A router behind an ISP modem or CGNAT (its WAN address 192.168.x, 10.x or 100.64.x) had nearly
+  all of its downloads shown in Traffic as **Unattributed (local)**, while uploads went to the
+  right clients. Downloads are recorded at the WAN, addressed to the router, and the LAN client
+  was taken from the post-NAT address only when the WAN address was public. It is now taken
+  whenever that address is local. Traffic already recorded stays where it is. The Traffic page
+  docs now say what Unattributed (local) means (Discussion #486, from
+  [@godlessmind](https://github.com/godlessmind)).
+
+## 1.1.0-rc.3
+
+The security fix and hardening in 1.0.31 below, from an outside review of rc.1.
+
+- **Viewers and read-only API tokens could read command output, which can contain secrets**
+  ([GHSA-rr75-cq8g-v6gq](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-rr75-cq8g-v6gq)). What
+  each device printed for a command run, and the run's CSV export, needed only viewer access, and
+  only `{{secret:...}}` values were masked in it. A run that printed Wi-Fi or WireGuard keys showed
+  them to accounts that see `••••••••` everywhere else. Output is now for operators and admins;
+  viewers see each device's status and errors, with a note saying why. If viewers or `read` tokens
+  may have read such a run, consider changing those secrets.
+- **Removing one device's SSH key could remove another's.** The match was on the start of the key's
+  comment, so revoking device 1's key also took device 12's, which then lost SSH. It now matches
+  that device's keys only.
+- **Changing your password, and setting up or turning off two-factor, have a limit per account**
+  (10 tries per 15 minutes), so a stolen session can't keep guessing the account password. The
+  two-factor lockout counter can no longer be left without an expiry by a restart.
+- **Smaller hardening**: scripts, styles and images carry the same security headers as pages; a
+  negative or non-numeric `?limit=` gets the default instead of an error; only admins are told the
+  admin account still has its default password; the username in the SSH key import is quoted.
+
+## 1.1.0-rc.2
+
+The fix in 1.0.30 below.
+
+- **Devices that get their updates from the package mirror now show them everywhere.** The
+  Firmware page knew the mirror held a newer version for a device, but the Dashboard, the device
+  list, the device's Firmware tab, alerts and reports only went by the device's own check with
+  MikroTik, which finds nothing on a switch with no internet. They now count the mirror too,
+  within about ten minutes of a sync, in Dark Site Mode as well. **Install & Reboot** on such a
+  device says to upgrade it with a mirror rollout instead of calling it up to date
+  ([Local package mirror](firmware.md#switching-devices-to-the-mirror)). Thanks to
+  [@ddavehauser](https://github.com/ddavehauser) for [#482](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/482).
+
+## 1.1.0-rc.1
+
+The first release candidate for 1.1. Nothing new goes in from here, only fixes: please run it as
+you would a stable release and [open an issue](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues)
+for anything that's wrong. What 1.1 adds is [above](#whats-new-in-11). Since beta.75:
+
+- **An RC install is told about the next RC.** The update notice compared release candidates with
+  stable, as it did for 1.0's, so a 1.1 RC wouldn't have heard about rc.2. RCs now compare with
+  `dev`, and their images get a version tag (`:1.1.0-rc.1`) as betas do
+  ([Release channels](configuration.md#release-channels)).
+- **The docs, checked against 1.1**: the device tabs as they are now (802.1X, Bandwidth, Firmware,
+  Antenna Aligner, and Torch in Tools), Settings paths that had drifted, who can change alerting,
+  DNS query logs and platform backups, and the adoption sweep, which has no button: it's
+  `POST /api/adoption/cleanup`.
+
+## 1.1.0-beta.75
+
+The fixes in 1.0.29 below, two of them security fixes, and more hardening from the 1.1
+security review.
+
+- **A long version string from a device could stall the manager**
+  ([GHSA-vf5h-hmmw-67wq](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-vf5h-hmmw-67wq)),
+  **site-limited operators could rename neighbours on other sites' maps**
+  ([GHSA-3cq7-qcrg-vqj5](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-3cq7-qcrg-vqj5)), and **RouterBOOT upgrades said a
+  device didn't restart when it had**, from Steven Wilton ([@eskyuu](https://github.com/eskyuu))
+  on [#481](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/481): see 1.0.29.
+- **More hardening**: URLs and paths lose their trailing slashes without a regex that slowed on
+  long runs of them; firewall zone names such as `constructor` are only ever names; and three
+  more log lines can't be given extra lines by what they quote.
+
+## 1.1.0-beta.74
+
+A security fix, also in 1.0.28, and tighter roles, both from the 1.1 security review.
+
+- **Accounts limited to some sites saw, and could rearrange, other sites' parts of the map**
+  ([GHSA-97cq-mgp7-9p5f](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-97cq-mgp7-9p5f)): the fix in 1.0.28 below.
+- **Settings by role.** Admins change settings. Fleet operators now see every Settings tab,
+  read-only, apart from SSH Keys. They can no longer change alerting rules and channels,
+  webhooks or report schedules, or clear the poll queue: those are admin-only now, for write
+  API tokens too, since they act as an operator. Viewers, and accounts limited to particular
+  sites, see only their own account in Settings: time format and password.
+- **Netinstall changes need an admin.** An install wipes whatever netboots on that network,
+  so installing or removing the package, entries, the cache and starting an install need an
+  admin for the router's site. Operators and viewers see the page read-only.
+
+## 1.1.0-beta.73
+
+- **AP Radio TX Retries says why it's empty under legacy CAPsMAN**: the fix in 1.0.27 below,
+  from Ron on [#470](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/470).
+
+## 1.1.0-beta.72
+
+- **Performance on large fleets**, from [@JohnDepon](https://github.com/JohnDepon): the
+  changes in 1.0.26 below (no JIT for the app's queries, pages that refresh on their own
+  timers, client counts every 15 seconds, no repeated vendor lookups, cheaper log times, and
+  a clients table that stays small), plus the wider site list. 1.1 already stored a device's
+  clients in batches.
+- **Traffic graphs as rates.** **Settings → General → Appearance → Traffic graphs** shows the
+  Traffic page and a client's usage and app charts as bits and packets per second (Mbps,
+  Kpps) instead of bytes and packets per point, the way links are rated. The newest point is
+  divided by the time it has covered so far, so the chart doesn't dip at the end. Also from
+  JohnDepon ([#479](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/479)). See
+  [Configuration](configuration.md#appearance).
+
+## 1.1.0-beta.71
+
+- **DNS over HTTPS.** **Network Services → DNS** takes a DoH server URL, such as
+  `https://cloudflare-dns.com/dns-query`, and the router sends its lookups there over HTTPS.
+  **Verify the server's certificate** says whether the router can check it with RouterOS's
+  built-in trusted roots, and the page warns when the router would have no way to look up the
+  DoH server's own name. See [DNS](network-services.md#dns). Thanks to Ron
+  ([@ronchan44](https://github.com/ronchan44)) for
+  [#468](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/468).
+- **EoIP, wireless and other interfaces into a bridge.** Under a bridge's ports on the
+  **Bridges** tab, **+ Add EoIP, wireless, VLAN…** adds interfaces that aren't on the Ports
+  tab's faceplate: EoIP, VXLAN, VPLS, veth, VLAN, wifi and wlan. Click a port for **Remove from
+  bridge**. Routed interfaces such as WireGuard and GRE are refused with the reason. See
+  [Bridges](devices.md#bridges). Also from Ron, on
+  [#466](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/466).
+- **Log what a zone rule accepts.** A custom rule in a zone pair has a **Log** box, and a pair
+  that allows everything can **Log some of it**: the connections that match are logged (up to
+  20 a second) and show in Firewall Logs as accepted. See [Zones](devices.md#zones). From Ron
+  on [#369](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/369).
+- **Firewall Logs shows rules in your own chains.** RouterOS logs a rule in a jump chain under
+  that chain's name, and those lines were left off the page. They show now, with the chain's
+  name, and the zone columns and filters place them correctly.
+- **Two zone rule fixes, found by the new fuzz tests.** A custom rule set to **Protocol #** 6
+  or 17 with no ports or addresses was dropped on save as if blank; it's now kept as all of TCP
+  or UDP, as the form showed. A **Protocol #** 1 rule could be refused for an ICMP type left in
+  the hidden ICMP field; that field is now ignored for it. The form also reads spaces inside
+  an address the way the server does.
+- **Fuzz testing.** Code that reads outside input has property-based fuzz tests in every CI
+  run, and a weekly **Fuzz** workflow runs them at far greater length along with
+  coverage-guided fuzzing of the NetFlow decoder and the firewall log parser. See
+  [CONTRIBUTING.md](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/blob/dev/CONTRIBUTING.md).
+
+## 1.1.0-beta.70
+
+A security fix, also in 1.0.24, reported by [@davidcoulson](https://github.com/davidcoulson);
+update as soon as you can.
+
+- **Replacing a device by its serial kept its saved SSH password at the new address**
+  ([GHSA-p885-qw7f-rgx2](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-p885-qw7f-rgx2)).
+  An operator could point a device at a host that answered with its serial and have the next
+  backup log in there with that password. As when a device is edited, the saved SSH login now
+  stays only when the address and route are unchanged, or for a fleet admin. Replacing a device
+  also needs operator or admin on its site, in single and bulk adds alike.
+- **Your firewall or modem on top of the map.** Where the network meets the outside through
+  something the manager doesn't manage, add it as a node (Internet, ISP modem, Firewall or
+  another vendor's router) and the map hangs everything below it, through the unmanaged
+  switches too. A device only goes under one it has a link to: CDP heard through an unmanaged
+  switch had put devices under switches they aren't cabled to, and a router off an access
+  switch on top. Every detailed card is now the same width, so a device sits centred over the
+  ones below it. See [Layout](topology.md#layout).
+- **Top down or left to right.** **Display → Layout** draws the map growing down (the default)
+  or to the right. **Arrange** lays the cards out again and keeps the sides links attach at;
+  **Reset layout** still forgets both.
+- **Top Talkers names on the Dashboard** use the row's width instead of stopping at 20
+  characters, and **the Dashboard on a phone** stacks its cards instead of squeezing them side
+  by side. Also in 1.0.24.
 
 ## 1.1.0-beta.69
 
@@ -1047,6 +1498,221 @@ tested on real fleets.
 1.0 is the first stable release: a version to run in production, where updates on the 1.0.x
 line only fix things. It's the result of more than 130 beta releases since April 2026, many of them
 shaped by people running MikroTik Manager on their own fleets.
+
+## 1.0.36
+
+Released on Wednesday 25 November 2026. A fix for static routes.
+
+- **A route with an invalid destination is refused before you add it.** The **Routing** tab
+  took a destination such as 10.100.32.256/24, Review changes didn't flag it, and only the
+  router refused it at apply. The form now says why and holds **Add Route** and **Review
+  changes** until it's fixed, and the server refuses the same. A gateway that reads as an
+  address but isn't one (192.168.1.256) is refused too. Thanks to
+  [@ronchan44](https://github.com/ronchan44) (Ron) for the report
+  ([#505](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/505)).
+
+## 1.0.35
+
+Released on Tuesday 24 November 2026. Two fixes from Ron's reports.
+
+- **Editing an IP address has Review changes.** Changing an address in place on the device's
+  **Config** tab now has a **Review changes** button, as adding one does, so you see what the
+  change does before you save it. An address that is the network or broadcast address of its
+  prefix, such as 192.168.33.0/24 or 192.168.33.255/24, is refused, with a host address
+  suggested. Thanks to [@ronchan44](https://github.com/ronchan44) (Ron) for the report
+  ([#505](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/505)).
+- **The Connected Clients tooltip shows whole clients.** It read 3.8 when the chart averaged
+  samples; it now rounds to 4 ([#504](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/504)).
+
+## 1.0.34
+
+Released on Tuesday 24 November 2026. A fix for CAPsMAN.
+
+- **A CAP's Connected Clients chart counts its clients.** On a CAP of the legacy CAPsMAN, the
+  chart on the device's **Radios** tab read 0 all the time: the CAP's own registration table is
+  empty, since its clients are listed on the controller. It now takes the controller's count for
+  that radio when it's the higher one. Thanks to [@ronchan44](https://github.com/ronchan44) (Ron)
+  for the report ([#504](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/504)).
+
+## 1.0.33
+
+Released on Monday 23 November 2026. A label fix for Traffic.
+
+- **Traffic's data health labels say what they count.** **Attribution rate** counted packets from
+  a device MTM recognised as the exporter, not packets matched to a client, so it could read 100%
+  while **Unattributed (local)** was large. It's now **From known exporters**, and **Flows
+  attributed** is now **Flows counted**, since it includes flows in Unattributed (local). Thanks to
+  [@godlessmind](https://github.com/godlessmind) for the screenshots
+  ([Discussion #486](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/discussions/486)).
+
+## 1.0.32
+
+Released on Sunday 22 November 2026. A fix for Traffic.
+
+- **Downloads through a router with a private WAN address are counted for the right client.**
+  A router behind an ISP modem or CGNAT (its WAN address 192.168.x, 10.x or 100.64.x) had nearly
+  all of its downloads shown in Traffic as **Unattributed (local)**, while uploads went to the
+  right clients. Downloads are recorded at the WAN, addressed to the router, and the LAN client
+  was taken from the post-NAT address only when the WAN address was public. It is now taken
+  whenever that address is local. Traffic already recorded stays where it is. The Traffic page
+  docs now say what Unattributed (local) means (Discussion #486, from
+  [@godlessmind](https://github.com/godlessmind)).
+
+## 1.0.31
+
+Released on Saturday 21 November 2026. A security fix, and hardening from an outside review of
+1.1; update soon if you have viewers or `read` API tokens.
+
+- **Viewers and read-only API tokens could read command output, which can contain secrets**
+  ([GHSA-rr75-cq8g-v6gq](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-rr75-cq8g-v6gq)). What
+  each device printed for a command run, and the run's CSV export, needed only viewer access, and
+  only `{{secret:...}}` values were masked in it. A run that printed Wi-Fi or WireGuard keys showed
+  them to accounts that see `••••••••` everywhere else. Output is now for operators and admins;
+  viewers see each device's status and errors, with a note saying why. If viewers or `read` tokens
+  may have read such a run, consider changing those secrets.
+- **Removing one device's SSH key could remove another's.** The match was on the start of the key's
+  comment, so revoking device 1's key also took device 12's, which then lost SSH. It now matches
+  that device's keys only.
+- **Changing your password, and setting up or turning off two-factor, have a limit per account**
+  (10 tries per 15 minutes), so a stolen session can't keep guessing the account password. The
+  two-factor lockout counter can no longer be left without an expiry by a restart.
+- **Smaller hardening**: scripts, styles and images carry the same security headers as pages; a
+  negative or non-numeric `?limit=` gets the default instead of an error; only admins are told the
+  admin account still has its default password; the username in the SSH key import is quoted.
+
+## 1.0.30
+
+Released on Saturday 21 November 2026.
+
+- **Devices that get their updates from the package mirror now show them everywhere.** The
+  Firmware page knew the mirror held a newer version for a device, but the Dashboard, the device
+  list, the device's own page, alerts and reports only went by the device's own check with
+  MikroTik, which finds nothing on a switch with no internet. They now count the mirror too,
+  within about ten minutes of a sync, in Dark Site Mode as well. **Install & Reboot** on such a
+  device says to upgrade it with a mirror rollout instead of calling it up to date
+  ([Local package mirror](firmware.md#switching-devices-to-the-mirror)). Thanks to
+  [@ddavehauser](https://github.com/ddavehauser) for [#482](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/482).
+
+## 1.0.29
+
+Released on Friday 20 November 2026. Two security fixes from the 1.1 security review, and a
+RouterBOOT fix from Steven Wilton ([@eskyuu](https://github.com/eskyuu)); update soon.
+
+- **A long version string from a device could stall the manager**
+  ([GHSA-vf5h-hmmw-67wq](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-vf5h-hmmw-67wq)). The poller compares the RouterBOOT
+  versions a device reports before storing them, and the parser slowed with the square of their
+  length: 200,000 characters held up the web UI, API and polling for about 19 seconds. Real
+  RouterOS doesn't send such a thing, but a fake RouterOS API server added as a device could.
+  Version strings are now cut to 64 characters before they're read.
+- **Site-limited operators could rename neighbours on other sites' maps**
+  ([GHSA-3cq7-qcrg-vqj5](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-3cq7-qcrg-vqj5)). The part of 1.0.28's fix that was
+  missed: the name and type of a discovered neighbour, which show on every site's map. A
+  site-limited account now names only the neighbours on its own part of the map.
+- **RouterBOOT upgrades said a device "didn't restart when asked (twice)" when it had.** The
+  check compared uptime with a reading taken just after the first reboot, so a device that took
+  longer than that to come back from the second looked like it never went down. It now counts
+  the time since that reading, and a changed bootloader version also proves the restart. Thanks to
+  Steven Wilton ([@eskyuu](https://github.com/eskyuu)) for [#481](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/481).
+- **Hardening from the review**: pasted certificates are read in linear time (a 10 MB field of
+  BEGIN lines took a long while), and generated command secrets use every character equally
+  often.
+
+Also in 1.1.0-beta.75.
+
+## 1.0.28
+
+Released on Friday 20 November 2026. A security fix; update soon if you use per-site roles.
+
+- **Accounts limited to some sites saw, and could rearrange, other sites' parts of the map**
+  ([GHSA-97cq-mgp7-9p5f](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-97cq-mgp7-9p5f)). The discovered-devices list showed neighbours
+  heard anywhere in the fleet, with their addresses and the names of devices managed in other
+  sites, and the topology map sent every site's hidden links, positions and link colours. An
+  operator in one site could also move, recolour, hide or show links on another site's map. A
+  site-limited account now sees only what its own sites' devices heard and its own part of the
+  saved map, and changes it only where it's an operator or admin. No device logins or settings
+  were exposed. Found in the 1.1 security review.
+
+Also in 1.1.0-beta.74.
+
+## 1.0.27
+
+Released on Thursday 19 November 2026.
+
+- **AP Radio TX Retries says why it's empty under legacy CAPsMAN.** The card works from each
+  client's CCQ, which a legacy `wireless` radio reports in its own registration table. Once
+  CAPsMAN manages the radio, its clients show only on the controller, whose
+  `/caps-man registration-table` has no CCQ, so there is nothing to chart. The card now says
+  so, rather than suggesting only Wi-Fi 6/7 radios lack it. Thanks to Ron
+  ([@ronchan44](https://github.com/ronchan44)) for
+  [#470](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/issues/470) and the prints that
+  confirmed it.
+
+Also in 1.1.0-beta.73.
+
+## 1.0.26
+
+Released on Thursday 19 November 2026. Performance on large fleets, all from
+[@JohnDepon](https://github.com/JohnDepon), who measured MikroTik Manager polling 126 devices
+and fixed what held it back, one cause at a time. On that install the database went from
+about 365% CPU to 13%, and polls stopped timing out and marking healthy devices offline.
+
+- **The Clients list and counts no longer spend seconds compiling.** Postgres compiled every
+  client query (JIT) for about 2.7 s before running it in 0.1 s. It's off for the app's
+  connections ([#471](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/471)).
+- **Pages refresh on their own timers, not on every device poll.** The Dashboard, Clients,
+  Events and Firewall Logs refetched their heaviest queries each time any device was polled,
+  several times a second on a big fleet. They refresh every 30 to 60 seconds, as before
+  ([#473](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/473)), and the
+  Dashboard's wireless count asks for the total alone
+  ([#478](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/478)).
+- **Less work per poll:** the fleet and site client totals are counted once every 15 seconds
+  in one query ([#474](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/474)); a
+  device's clients are stored in one statement
+  ([#475](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/475)); a client whose
+  MAC has no known vendor isn't looked up again every poll
+  ([#476](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/476)); and log times
+  are read with far fewer time zone lookups
+  ([#472](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/472)).
+- **The clients table stays small.** An index nothing needed made every client update write
+  to every index and leave dead rows behind. It's dropped, and the table leaves room on each
+  page so updates stay in place
+  ([#477](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/477)). This runs once
+  when the backend starts after the update and takes well under a second.
+- **The site list is as wide as its longest name**, so long site names aren't cut to a few
+  letters, with the device counts lined up and the full name on hover
+  ([#480](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/pull/480)).
+
+Also in 1.1.0-beta.72.
+
+## 1.0.25
+
+Released on Thursday 19 November 2026.
+
+- **Firewall Logs shows rules in your own chains.** RouterOS logs a rule in a chain of your own
+  (a jump target, such as `LAN-to-WAN`) under that chain's name rather than input, forward or
+  output, and Firewall Logs left those lines off the page. They show now, with the chain's
+  name, and the **Action** filter reads them from their log prefix as it does any other line.
+  Also in 1.1.0-beta.71.
+
+## 1.0.24
+
+Released on Thursday 19 November 2026. A security fix, reported by
+[@davidcoulson](https://github.com/davidcoulson); update as soon as you can.
+
+- **Replacing a device by its serial kept its saved SSH password at the new address**
+  ([GHSA-p885-qw7f-rgx2](https://github.com/2GT-Media-Group-LLC/mikrotik-manager/security/advisories/GHSA-p885-qw7f-rgx2)).
+  Adding a device whose serial a managed device already has can replace that device, at the
+  address given. It kept the device's saved SSH login, so an operator could point a device at a
+  host that answered with its serial and have the next backup log in there with that password.
+  As when a device is edited, the saved SSH login now stays only when the address is unchanged,
+  or for a fleet admin; otherwise the device has only the logins given with the add. Replacing a
+  device also needs operator or admin on its site, in single and bulk adds alike: a viewer role
+  there was enough.
+- **Top Talkers names on the Dashboard** stopped at 20 characters however much room the row had.
+  They use the row now, shortened only where they run out of it, with the whole name on hover.
+- **The Dashboard on a phone.** Its rows of cards kept two or three columns at any width, so on a
+  phone Top Talkers was a narrow strip and the fleet tiles were a few pixels each. They stack
+  now, and the layout from 1024 pixels up is as before.
 
 ## 1.0.23
 

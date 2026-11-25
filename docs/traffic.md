@@ -62,6 +62,14 @@ within 10 seconds of each other stay unidentified.
 Top Talkers can be filtered by IP, name, MAC or vendor, and sorted. Selecting a client opens
 its detail page — see [Clients](clients.md).
 
+**Unattributed (local)** is traffic whose local end is a private, CGNAT or link-local address
+that MikroTik Manager can't match to a client it knows in that site, such as a host it hasn't
+seen in DHCP or ARP. Downloads through NAT are recorded as they arrive on the WAN, addressed to
+the router, and are counted for the LAN client from the post-NAT destination, so leave
+`nat-dst-address` on in the router's IPFIX settings (**IP > Traffic Flow > IPFIX**; it is on by
+default). Before 1.0.32 and 1.1.0-rc.4, a router whose WAN address is itself private (behind
+an ISP modem or CGNAT) had its downloads counted here instead (Discussion #486).
+
 Clicking an application in **Traffic by Application**, on the chart or its list, opens the
 clients behind it over the same range: each one's download, upload and share of that
 application's traffic, busiest first, up to 50 (from [@azizfayziev](https://github.com/azizfayziev)'s
@@ -111,7 +119,7 @@ then says when recording began, so the gap doesn't read as missing traffic.
 ### Names looked up (AdGuard Home and Pi-hole)
 
 NetFlow carries addresses, not names. Add the servers that answer a site's DNS under
-**Settings → DNS Query Log** (fleet admins): AdGuard Home or Pi-hole (version 6 or later), with
+**Settings → DNS Query Log** (fleet admins; fleet operators see it read-only): AdGuard Home or Pi-hole (version 6 or later), with
 the site whose clients use it, its web address and login. Add every one of them: two resolvers
 sharing the load each see their own part of the lookups, and the counts add up. **Test** checks
 the address and login first. MikroTik Manager then reads each query log every minute and keeps
@@ -158,7 +166,7 @@ Names are kept for the days set for DNS lookups under **Settings → General →
 
 With a site selected, every view shows that site's traffic only, and accounts limited to
 particular sites see only theirs. **Flow Sources & Data Health** lists that site's exporting
-devices too; its packet and attribution counts are the collector's own and cover every site.
+devices too; its packet and flow counts are the collector's own and cover every site.
 Unidentified exporters and refused sources belong to no site, so they're listed in the
 all-sites view only. Traffic recorded before 0.24.47 has no site, so on a
 multi-site install it appears in the all-sites view only. On a single-site install, or any

@@ -51,6 +51,14 @@ The resolver configuration on each device, plus static entries.
 - **Upstream DNS servers** are edited one entry at a time (#207): type an address and press
   Enter, or paste a list; × removes one. Only IP addresses are accepted. A device's own DNS
   servers, under its **Config** tab, work the same way.
+- **DNS over HTTPS (DoH)** (#468, 1.1): give the router a DoH server URL, such as
+  `https://cloudflare-dns.com/dns-query` or `https://dns.google/dns-query`, and it sends its
+  lookups there over HTTPS instead of to the upstream servers. Leave it empty for plain DNS.
+  The router still has to look up the DoH server's own name, so keep an upstream server (or a
+  static A record for that name); the page warns when there's neither. **Verify the
+  server's certificate** is recommended: recent RouterOS checks it against its built-in
+  trusted roots, and the page says when a router has none, in which case the server's CA
+  certificate has to be imported first or every lookup fails.
 
 ## NTP
 
@@ -221,6 +229,10 @@ MikroTik's netinstall package (#310), instead of from a PC with the Netinstall t
 needs RouterOS 7.24 or later, and isn't made for SMIPS devices. The device being installed must be
 on the same layer 2 segment as that router, and etherboot to it. **An install reformats that
 device**: what's kept depends on the entry (below).
+
+Because of that, every change here (installing or removing the package, entries, the cache,
+starting an install) needs an admin for the router's site: a fleet admin, or a site admin there.
+Operators and viewers see the page read-only.
 
 The page lists the devices in view in three groups:
 

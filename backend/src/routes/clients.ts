@@ -272,7 +272,11 @@ router.get('/', async (req, res) => {
     ${orderBy}
     LIMIT $${idx++} OFFSET $${idx}
   `;
-  const clients = await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
+  // limit=0 asks for the total alone (the Dashboard's wireless client count).
+  // The page of rows and the VLAN choices are two more deduplications of every
+  // sighting, for nothing.
+  const countOnly = parseInt(String(limit), 10) === 0;
+  const clients = countOnly ? [] : await query(sql, [...filterParams, parseInt(String(limit), 10), parseInt(String(offset), 10)]);
 
   const countResult = await query<{ total: string }>(
     `WITH ${INFRA_PORTS_CTE}
@@ -290,7 +294,7 @@ router.get('/', async (req, res) => {
   // Every VLAN among the clients in view, not just this page's, so the filter
   // offers all of them (outside review U14). The VLAN filter itself isn't
   // applied, or choosing one would hide the others.
-  const vlanRows = await query<{ vlan_id: number }>(
+  const vlanRows = countOnly ? [] : await query<{ vlan_id: number }>(
     `WITH ${INFRA_PORTS_CTE}
      SELECT DISTINCT deduped.vlan_id FROM (
        SELECT DISTINCT ON (c.mac_address) c.vlan_id, ${CLIENT_MAC_COLUMNS}
@@ -364,7 +368,7 @@ router.get('/:mac', async (req, res) => {
   const user = req.user;
   const canSee = (siteId: number | null) => !!user && roleInSite(user, siteId) != null;
   const path = await clientPath(start, canSee).catch((e) => {
-    console.warn(`[Clients] path for ${mac}: ${(e as Error).message}`);
+    console.warn('[Clients] path for %s: %s', logSafe(mac), logSafe((e as Error).message));
     return [] as PathHop[];
   });
   const first = path[0];
@@ -472,11 +476,16 @@ router.get('/:mac/traffic', async (req, res) => {
   const txDeltas = counterDeltas(raw.filter(p => p.field === 'tx_bytes'));
   const rxDeltas = counterDeltas(raw.filter(p => p.field === 'rx_bytes'));
 
-  const allTimes = new Set([...txDeltas.keys(), ...rxDeltas.keys()]);
-  const points = [...allTimes].sort().map(time => ({
+  const times = [...new Set([...txDeltas.keys(), ...rxDeltas.keys()])].sort();
+  const windowSec = range === '7d' ? 1800 : 300;
+  const points = times.map((time, i) => ({
     time,
     tx_bytes: txDeltas.get(time) ?? 0,
     rx_bytes: rxDeltas.get(time) ?? 0,
+    // What the delta covers, for showing it as a rate: back to the point before
+    // (a gap with no sightings counts in full, as the counter kept running), or
+    // one window for the first. The newest is the window still filling up.
+    seconds: i === 0 ? windowSec : Math.max(1, (Date.parse(time) - Date.parse(times[i - 1])) / 1000),
   }));
 
   return res.json(points);

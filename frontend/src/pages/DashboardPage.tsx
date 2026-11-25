@@ -412,7 +412,8 @@ function SummaryView(props: Record<string, any>) {
       />
 
       {/* Main grid: clients chart + devices list */}
-      <div className="grid gap-4" style={{ gridTemplateColumns: '1.6fr 1fr' }}>
+      {/* Side by side from lg up; stacked on a phone, where both squeezed. */}
+      <div className="grid gap-4 grid-cols-1 lg:grid-cols-[1.6fr_1fr]">
         {/* Clients chart: grows to the height of the Devices card beside it */}
         <div className="card flex flex-col" style={{ padding: '16px 18px' }}>
           <div className="flex items-baseline justify-between mb-3">
@@ -532,7 +533,7 @@ function SummaryView(props: Record<string, any>) {
       <ProxyUsageCard />
 
       {/* Second row: Mix + Top talkers + Activity */}
-      <div className="grid gap-4" style={{ gridTemplateColumns: '1fr 1.2fr 1fr' }}>
+      <div className="grid gap-4 grid-cols-1 lg:grid-cols-[1fr_1.2fr_1fr]">
         {/* Device mix */}
         <div className="card" style={{ padding: '16px 18px' }}>
           <div className="text-[13px] font-semibold mb-3" style={{ color: 'var(--ink)' }}>Mix</div>
@@ -588,8 +589,9 @@ function SummaryView(props: Record<string, any>) {
                       {String(i + 1).padStart(2, '0')}
                     </span>
                     <div className="min-w-0">
-                      <div className="mono text-[11.5px] truncate mb-[3px]" style={{ color: 'var(--ink)' }}>
-                        {label.length > 20 ? label.slice(0, 20) + '…' : label}
+                      {/* Cut only where the row runs out of room, not at a fixed length. */}
+                      <div className="mono text-[11.5px] truncate mb-[3px]" style={{ color: 'var(--ink)' }} title={label}>
+                        {label}
                       </div>
                       <div className="rounded-full overflow-hidden" style={{ height: 3, background: 'var(--surface-3)' }}>
                         <div className="h-full rounded-full" style={{ width: `${(c.total_bytes / maxB) * 100}%`, background: 'var(--accent)' }} />
@@ -1246,7 +1248,9 @@ function OperationsView({
         </div>
         {/* One tile per device stops at two rows; past that, the tiles needing
             attention and a link to the rest (#303). */}
-        <div className="grid gap-3" style={{ gridTemplateColumns: `repeat(${Math.min((devices as Device[]).length, 5)}, minmax(0, 1fr))` }}>
+        {/* Up to five across from lg up; two on a phone or tablet. */}
+        <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:[grid-template-columns:var(--fleet-cols)]"
+          style={{ '--fleet-cols': `repeat(${Math.min((devices as Device[]).length, 5)}, minmax(0, 1fr))` } as React.CSSProperties}>
           {fleetTiles.map((d) => {
             const hasAlert = d.firmware_update_available || d.routerboard_upgrade_available;
             return (
@@ -1429,7 +1433,8 @@ export default function DashboardPage() {
 
   const { data: wirelessClientsData } = useQuery({
     queryKey: ['wireless-clients-active'],
-    queryFn: () => clientsApi.list({ active: true, client_type: 'wireless', limit: 1 }).then(r => r.data),
+    // limit 0: the total alone, without a page of rows or the VLAN list.
+    queryFn: () => clientsApi.list({ active: true, client_type: 'wireless', limit: 0 }).then(r => r.data),
     refetchInterval: 30_000,
   });
 
@@ -1454,22 +1459,18 @@ export default function DashboardPage() {
     if (deviceRefreshTimer.current !== null) window.clearTimeout(deviceRefreshTimer.current);
   }, []);
 
+  // Only the cheap device list follows live updates. Every poll of every device
+  // sends clients:updated and events:updated, and refetching the summary, top
+  // clients and client list on each one kept the database busy without pause on
+  // a large fleet; those refresh on their own interval above, the poll cadence.
   useSocket({
     'device:updated': () => {
       if (deviceRefreshTimer.current !== null) return;
       deviceRefreshTimer.current = window.setTimeout(() => {
         deviceRefreshTimer.current = null;
-        void queryClient.invalidateQueries({ queryKey: ['metrics-summary'] });
         void queryClient.invalidateQueries({ queryKey: ['devices'] });
       }, 1_000);
     },
-    'clients:updated': () => {
-      queryClient.invalidateQueries({ queryKey: ['top-clients'] });
-      queryClient.invalidateQueries({ queryKey: ['metrics-summary'] });
-      queryClient.invalidateQueries({ queryKey: ['wireless-clients-active'] });
-    },
-    'events:updated': () => queryClient.invalidateQueries({ queryKey: ['events-recent'] }),
-    'device:status': () => queryClient.invalidateQueries({ queryKey: ['metrics-summary'] }),
   });
 
   const devicesWithRosUpdates = devices.filter(

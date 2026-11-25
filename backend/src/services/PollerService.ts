@@ -11,6 +11,7 @@ import { query, queryOne } from '../config/database';
 import { dropSessions, pooledSessionCount } from './mikrotik/sessionPool';
 import { readLoad, type LoadReading } from './processLoad';
 import { DeviceCollector, DeviceRow } from './mikrotik/DeviceCollector';
+import { writeClientCounts } from './clientCounts';
 import { Server as SocketServer } from 'socket.io';
 import { getWriteApi } from '../config/influxdb';
 import { Point } from '@influxdata/influxdb-client';
@@ -32,6 +33,8 @@ import { renewalTick as deviceCertRenewalTick } from './deviceCa';
 import { proxyRenewalTick } from './proxyCerts';
 import { resolveModules, describeDisabled } from '../utils/pollModules';
 import { updateAvailable } from '../utils/rosVersion';
+import { withMirrorUpdate } from '../utils/firmwareMirror';
+import { mirrorVersions, flagMirrorUpdates } from './firmwareMirror';
 import { certExpiryState, needsAttention, describeCert } from '../utils/certExpiry';
 import { offlineAction, recoveryAlert, describeDuration } from '../utils/intermittent';
 import {
@@ -691,6 +694,17 @@ export class PollerService {
         this.checkAllDevicesFirmware(devices.filter((d) => !d.ssh_only)).catch((e) =>
           console.error('[Poller] Firmware check error:', e)
         );
+      }
+
+      // Devices on a package mirror (#482): flag the ones it holds a newer
+      // version for. Database only, no device is contacted, so it runs in Dark
+      // Site Mode too, where the daily check above never does, and soon after
+      // a sync or a device joining the mirror.
+      const mirrorKey = 'task:mirror_updates';
+      if (now - await this.getTimestamp(mirrorKey) > 10 * 60_000) {
+        await this.setTimestamp(mirrorKey, now, 10 * 60_000);
+        this.flagMirrorUpdates().catch((e) =>
+          console.error('[Poller] Mirror update check error:', e));
       }
 
       // RouterOS vulnerability list (#175) — once a day, unless Dark Site Mode
@@ -1944,19 +1958,9 @@ export class PollerService {
             .intField('wired_clients', 0)
             .timestamp(new Date())
         );
-        // Recompute global deduplicated count after marking this device's clients inactive.
-        const dedupedRows = await query<{ count: string }>(
-          `SELECT COUNT(DISTINCT mac_address) AS count FROM clients WHERE active = TRUE`
-        );
-        const globalTotal = parseInt(dedupedRows[0]?.count || '0', 10);
-        writeApi.writePoint(
-          new Point('client_counts')
-            .tag('device_id', '_global')
-            .tag('device_name', '_global')
-            .intField('total_clients', globalTotal)
-            .timestamp(new Date())
-        );
         await writeApi.flush().catch(() => {});
+        // The fleet and site totals, now without this device's clients.
+        await writeClientCounts();
       }
     }
     void this.emitForDevice('device:status', { deviceId, status: 'offline', message }, deviceId);
@@ -2040,10 +2044,25 @@ export class PollerService {
     }
   }
 
+  private async flagMirrorUpdates(): Promise<void> {
+    for (const d of await flagMirrorUpdates()) {
+      void this.emitForDevice('device:updated', { deviceId: d.id }, d.id);
+      if (!d.newly) continue;
+      // The same alert the daily check sends on first discovery.
+      alertService.dispatch('firmware_update_available', `${d.name} has a firmware update available: ${d.latest}`, {
+        deviceId: d.id,
+        deviceName: d.name,
+        details: `Current: ${d.installed ?? 'unknown'}  →  On the package mirror: ${d.latest}`,
+      }).catch(() => {});
+      console.log(`[Poller] Firmware update on the package mirror for ${logSafe(d.name)}: ${logSafe(d.installed ?? '?')} → ${logSafe(d.latest)}`);
+    }
+  }
+
   private async checkAllDevicesFirmware(devices: DeviceRow[]): Promise<void> {
     // Only check devices that are currently online to avoid long timeouts
     const onlineDevices = devices.filter((d) => d.status === 'online');
     console.log(`[Poller] Starting firmware check for ${onlineDevices.length} online device(s)`);
+    const mirrored = await mirrorVersions().catch(() => new Map<number, string>());
 
     for (const device of onlineDevices) {
       const collector = new DeviceCollector(device);
@@ -2051,15 +2070,18 @@ export class PollerService {
         await collector.connect();
         const updateInfo = await collector.checkForUpdates();
 
-        const latestVersion = (updateInfo['latest-version'] ?? '').trim();
+        const ownLatest = (updateInfo['latest-version'] ?? '').trim();
         const installedVersion = (updateInfo['installed-version'] ?? '').trim();
         const statusText = (updateInfo['status'] ?? '').toLowerCase();
 
-        const hasUpdate = Boolean(
-          updateAvailable({
-            installed: installedVersion, latest: latestVersion, status: statusText,
-          })
-        );
+        // A device on a package mirror often has no internet, so its own check
+        // finds nothing; what the mirror holds counts as well (#482).
+        const merged = withMirrorUpdate(installedVersion || device.ros_version, {
+          available: Boolean(updateAvailable({ installed: installedVersion, latest: ownLatest, status: statusText })),
+          latest: ownLatest || null,
+        }, mirrored.get(device.id));
+        const hasUpdate = merged.available;
+        const latestVersion = merged.latest ?? '';
 
         // Read current flag before updating so we can detect first-discovery
         const current = await query<{ firmware_update_available: boolean }>(

@@ -11,7 +11,8 @@ import { reverseNames } from '../utils/reverseNames';
 import { namesForAddresses } from '../utils/addressNames';
 import { OTHER_REMOTE } from '../services/netflow/DestinationAggregator';
 import net from 'net';
-import { timeWindow, BAD_WINDOW, type TimeWindow } from '../utils/trafficWindow';
+import { timeWindow, pointSeconds, BAD_WINDOW, type TimeWindow } from '../utils/trafficWindow';
+import { queryLimit } from '../utils/queryLimit';
 
 const router = Router();
 router.use(requireAuth);
@@ -110,7 +111,9 @@ router.get('/timeseries', async (req, res) => {
     return res.status(503).json({ error: 'The metrics database could not be read, so this data is unavailable right now.' });
   }
 
-  res.json(Object.values(pivoted).sort((a, b) => a.time.localeCompare(b.time)));
+  // `seconds`: what each point covers, for showing it as a rate.
+  res.json(Object.values(pivoted).sort((a, b) => a.time.localeCompare(b.time))
+    .map((p) => ({ ...p, seconds: pointSeconds(p.time, w) })));
 });
 
 type ClientNames = { hostname: string | null; custom_name: string | null; vendor: string | null; ip_address: string | null };
@@ -142,7 +145,7 @@ async function withClientNames<T extends { mac: string }>(req: Request, rows: T[
 router.get('/top-clients', async (req, res) => {
   const w = timeWindow(req.query);
   if (!w) return res.status(400).json({ error: BAD_WINDOW });
-  const limit = Math.min(parseInt(String(req.query.limit || '10'), 10) || 10, 50);
+  const limit = queryLimit(req.query.limit, 10, 50);
   const queryApi = getQueryApi();
   const site = await siteFilter(req);
 
@@ -240,7 +243,7 @@ router.get('/apps/:app/clients', async (req, res) => {
   if (!/^[\x20-\x7e]{1,64}$/.test(app)) return res.status(400).json({ error: 'Invalid application' });
   const w = timeWindow(req.query);
   if (!w) return res.status(400).json({ error: BAD_WINDOW });
-  const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
+  const limit = queryLimit(req.query.limit, 50, 200);
   const site = await siteFilter(req);
 
   const fluxQuery = `
@@ -342,7 +345,8 @@ router.get('/client/:mac', async (req, res) => {
   const apps = Array.from(byApp.entries()).map(([app, e]) => ({ app, bytes: e.bytes, packets: e.packets }));
 
   res.json({
-    series: Object.values(pivoted).sort((a, b) => a.time.localeCompare(b.time)),
+    series: Object.values(pivoted).sort((a, b) => a.time.localeCompare(b.time))
+      .map((p) => ({ ...p, seconds: pointSeconds(p.time, w) })),
     apps: apps.sort((a, b) => b.bytes - a.bytes),
   });
 });
@@ -433,7 +437,7 @@ router.get('/dns', async (req, res) => {
     if (!mac) return res.status(400).json({ error: 'Invalid mac' });
     ips = await clientIps(req, mac);
   }
-  const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
+  const limit = queryLimit(req.query.limit, 50, 200);
   const sites = siteList(activeSite(req));
   const params: unknown[] = [hourStart(w)];
   let where = 'hour >= $1';
@@ -516,7 +520,7 @@ router.get('/destinations', async (req, res) => {
     if (!m) return res.status(400).json({ error: 'Invalid mac' });
     mac = m;
   }
-  const limit = Math.min(parseInt(String(req.query.limit || '50'), 10) || 50, 200);
+  const limit = queryLimit(req.query.limit, 50, 200);
   const w = timeWindow(req.query);
   if (!w) return res.status(400).json({ error: BAD_WINDOW });
   const { where, params } = destinationScope(req, w, { app, mac });

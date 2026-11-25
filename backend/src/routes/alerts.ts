@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { query } from '../config/database';
-import { requireAuth, requireWrite, fleetOnly } from '../middleware/auth';
+import { requireAuth, requireAdmin, requireSettingsRead, fleetOnly } from '../middleware/auth';
 import { alertService } from '../services/AlertService';
 import { maskConfig, mergeConfig, sealConfig, sealedSecretInput, PLAIN_SECRET_ERROR } from '../utils/alertChannelSecrets';
+import { queryLimit } from '../utils/queryLimit';
 
 const router = Router();
 
@@ -83,7 +84,7 @@ export async function ensureDefaultRules(): Promise<void> {
 // ── Alert Rules ────────────────────────────────────────────────────────────
 
 /** GET /api/alerts/rules — list all rules (seeds defaults on first call) */
-router.get('/rules', async (_req, res) => {
+router.get('/rules', requireSettingsRead, async (_req, res) => {
   await ensureDefaultRules();
   const rules = await query(
     `SELECT event_type, enabled, threshold, cooldown_min, updated_at
@@ -93,7 +94,7 @@ router.get('/rules', async (_req, res) => {
 });
 
 /** PUT /api/alerts/rules/:type — update a single rule */
-router.put('/rules/:type', requireWrite, async (req, res) => {
+router.put('/rules/:type', requireAdmin, async (req, res) => {
   const { type } = req.params;
   const { enabled, threshold, cooldown_min } = req.body;
   if (cooldown_min !== undefined) {
@@ -119,7 +120,7 @@ router.put('/rules/:type', requireWrite, async (req, res) => {
 // ── Alert Channels ─────────────────────────────────────────────────────────
 
 /** GET /api/alerts/channels */
-router.get('/channels', async (_req, res) => {
+router.get('/channels', requireSettingsRead, async (_req, res) => {
   const channels = await query(
     `SELECT id, name, type, enabled, config, created_at, updated_at
      FROM alert_channels ORDER BY id`
@@ -133,9 +134,8 @@ router.get('/channels', async (_req, res) => {
 });
 
 /** POST /api/alerts/channels */
-router.post('/channels', requireWrite, async (req, res) => {
-  const { name, type, enabled = true } = req.body;
-  const config = req.body.config ?? {};
+router.post('/channels', requireAdmin, async (req, res) => {
+  const { name, type, enabled = true, config = {} } = req.body;
   if (!name || !type) {
     return res.status(400).json({ error: 'name and type are required' });
   }
@@ -161,7 +161,7 @@ router.post('/channels', requireWrite, async (req, res) => {
 });
 
 /** PUT /api/alerts/channels/:id */
-router.put('/channels/:id', requireWrite, async (req, res) => {
+router.put('/channels/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const { name, enabled, config } = req.body;
 
@@ -199,14 +199,14 @@ router.put('/channels/:id', requireWrite, async (req, res) => {
 });
 
 /** DELETE /api/alerts/channels/:id */
-router.delete('/channels/:id', requireWrite, async (req, res) => {
+router.delete('/channels/:id', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   await query(`DELETE FROM alert_channels WHERE id = $1`, [id]);
   res.status(204).end();
 });
 
 /** POST /api/alerts/channels/:id/test */
-router.post('/channels/:id/test', requireWrite, async (req, res) => {
+router.post('/channels/:id/test', requireAdmin, async (req, res) => {
   const id = parseInt(req.params.id, 10);
   try {
     await alertService.testChannel(id);
@@ -220,7 +220,7 @@ router.post('/channels/:id/test', requireWrite, async (req, res) => {
 
 /** GET /api/alerts/history?limit=50 */
 router.get('/history', async (req, res) => {
-  const limit = Math.min(parseInt(String(req.query.limit ?? 50), 10), 200);
+  const limit = queryLimit(req.query.limit, 50, 200);
   const rows = await query(
     `SELECT h.id, h.event_type, h.device_id, h.device_name, h.message,
             h.channels_notified, h.sent_at

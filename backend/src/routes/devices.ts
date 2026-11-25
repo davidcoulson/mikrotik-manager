@@ -5,7 +5,7 @@ import { checkApi, recordApiCheck } from '../services/apiCheck';
 import { describeSshFailure } from '../utils/sshOnly';
 import net from 'net';
 import { Router, Request, Response } from 'express';
-import { deviceSiteAccess, deviceIdParam, devicesDenied, roleOnDevice, roleAtLeast, strictId } from '../utils/siteAccess';
+import { deviceSiteAccess, deviceIdParam, devicesDenied, roleOnDevice, roleAtLeast, strictId, writableSiteIds } from '../utils/siteAccess';
 import { bulkUpdateCredentials } from '../services/bulkCredentials';
 import { deviceSettings } from '../services/pollSettings';
 import { validateOverrides } from '../utils/pollOverrides';
@@ -54,6 +54,8 @@ import { enqueueBulkAddJob, getBulkAddJobState } from '../services/DeviceBulkAdd
 import { logSafe } from '../utils/logSafe';
 import { withGuardedChange } from '../services/changeGuard/guardedRoute';
 import { updateAvailable } from '../utils/rosVersion';
+import { withMirrorUpdate } from '../utils/firmwareMirror';
+import { mirrorVersions } from '../services/firmwareMirror';
 import { DEVICE_BASE_COLUMNS } from '../services/deviceColumns';
 import { withEffectiveLocation } from '../services/deviceLocation';
 import { SSH_TARGET_COLS } from '../services/SshKeyService';
@@ -61,7 +63,7 @@ import { classifyKeyTarget } from '../utils/sshKeyCredentials';
 import type { HealthIssue } from '../utils/deviceHealth';
 import { runHealthCheck } from '../services/healthCheck';
 import { buildSegments, summarise, summariseBands } from '../utils/lteDwell';
-import { siteScopeDevices, andSite } from '../utils/siteScope';
+import { siteScopeDevices, siteScopeByDevice, siteList, andSite } from '../utils/siteScope';
 import { activeSite, targetSite } from '../middleware/site';
 import { resolveSiteChoice } from '../services/deviceSite';
 import { romonSettingFor, romonChecks, romonSetParams } from '../services/romon';
@@ -91,7 +93,8 @@ import { vlanInterfaceEntry } from '../utils/vlanInterfaceEdit';
 import { firewallFamily, managedOverIpv4, type FirewallFamily } from '../utils/firewallFamily';
 import { ipv6RoutesView } from '../utils/ipv6Routes';
 import { switchVlanEntry, switchPortVlan, validPortName } from '../utils/switchVlanEdit';
-import { ipAddressEdit } from '../utils/ipAddressEdit';
+import { ipAddressEdit, hostAddressProblem } from '../utils/ipAddressEdit';
+import { routeInputProblem } from '../utils/routeInput';
 import { parseBgpConnection } from '../utils/bgpConnection';
 import { parseBridgeCreate, parseBridgeUpdate, parseBridgePortUpdate, bridgeMtuProblem } from '../utils/bridgeEdit';
 import { parseDot1xServer, parseDot1xClient, parseRadius } from '../utils/dot1xEdit';
@@ -99,6 +102,7 @@ import { isItemId } from '../utils/userManager';
 import { tracerouteHops } from '../utils/traceroute';
 import { bridgesView } from '../utils/bridgesView';
 import { opticStatuses, opticHistory, dropThreshold, rxLimits } from '../services/opticLevels';
+import { queryLimit } from '../utils/queryLimit';
 
 const router = Router();
 router.use(requireAuth);
@@ -275,8 +279,13 @@ router.delete('/security/suppressions/:id', requireWrite, async (req, res) => {
   res.status(204).end();
 });
 
-// GET /api/devices/discovered — unresolved MikroTik neighbors from topology_links
-router.get('/discovered', async (_req, res) => {
+// GET /api/devices/discovered — unresolved MikroTik neighbors from topology_links.
+// Only what the devices in view heard: a site-scoped account isn't told about
+// other sites' devices, their neighbours or their clients (P1-7).
+router.get('/discovered', async (req, res) => {
+  const scope = activeSite(req);
+  const heardIn = siteScopeDevices(scope, 'd');
+  const clientIn = siteScopeByDevice(scope, 'c.device_id');
   const rows = await query<{
     neighbor_identity: string | null;
     neighbor_address: string | null;
@@ -293,9 +302,11 @@ router.get('/discovered', async (_req, res) => {
     JOIN devices d ON d.id = tl.from_device_id
     LEFT JOIN clients c ON LOWER(c.mac_address) = LOWER(tl.neighbor_mac)
                         AND c.ip_address IS NOT NULL AND c.ip_address != ''
+                        ${clientIn ? `AND ${clientIn}` : ''}
     WHERE tl.to_device_id IS NULL
       AND tl.neighbor_platform ILIKE '%mikrotik%'
       AND (tl.neighbor_address IS NULL OR tl.neighbor_address = '' OR tl.neighbor_address NOT LIKE '%:%')
+      ${heardIn ? `AND ${heardIn}` : ''}
     ORDER BY tl.discovered_at DESC
   `);
 
@@ -305,25 +316,30 @@ router.get('/discovered', async (_req, res) => {
   //   - its IP matching the managed device's primary ip_address,
   //   - its identity matching the managed device's name.
   const [managedByMac, managedByIp, managedByName] = await Promise.all([
-    query<{ device_id: number; device_name: string; mac: string }>(
-      `SELECT i.device_id AS device_id, d.name AS device_name, LOWER(i.mac_address) AS mac
+    query<{ device_id: number; device_name: string; site_id: number | null; mac: string }>(
+      `SELECT i.device_id AS device_id, d.name AS device_name, d.site_id, LOWER(i.mac_address) AS mac
          FROM interfaces i
          JOIN devices d ON d.id = i.device_id
         WHERE i.mac_address IS NOT NULL AND i.mac_address <> ''`
     ),
-    query<{ id: number; name: string; ip_address: string }>(
-      `SELECT id, name, ip_address FROM devices WHERE ip_address IS NOT NULL AND ip_address <> ''`
+    query<{ id: number; name: string; site_id: number | null; ip_address: string }>(
+      `SELECT id, name, site_id, ip_address FROM devices WHERE ip_address IS NOT NULL AND ip_address <> ''`
     ),
-    query<{ id: number; name: string }>(
-      `SELECT id, name FROM devices WHERE name IS NOT NULL AND name <> ''`
+    query<{ id: number; name: string; site_id: number | null }>(
+      `SELECT id, name, site_id FROM devices WHERE name IS NOT NULL AND name <> ''`
     ),
   ]);
-  const macToDevice = new Map<string, { id: number; name: string }>();
-  for (const r of managedByMac) macToDevice.set(r.mac, { id: r.device_id, name: r.device_name });
-  const ipToDevice = new Map<string, { id: number; name: string }>();
-  for (const r of managedByIp) ipToDevice.set(r.ip_address, { id: r.id, name: r.name });
-  const nameToDevice = new Map<string, { id: number; name: string }>();
-  for (const r of managedByName) nameToDevice.set(r.name.toLowerCase(), { id: r.id, name: r.name });
+  type Managed = { id: number; name: string; site_id: number | null };
+  const macToDevice = new Map<string, Managed>();
+  for (const r of managedByMac) macToDevice.set(r.mac, { id: r.device_id, name: r.device_name, site_id: r.site_id });
+  const ipToDevice = new Map<string, Managed>();
+  for (const r of managedByIp) ipToDevice.set(r.ip_address, { id: r.id, name: r.name, site_id: r.site_id });
+  const nameToDevice = new Map<string, Managed>();
+  for (const r of managedByName) nameToDevice.set(r.name.toLowerCase(), { id: r.id, name: r.name, site_id: r.site_id });
+  // A neighbour already managed in a site this account can't see is left out,
+  // rather than named: it can't be added here, and its name isn't ours to tell.
+  const mySites = isSiteScoped(req.user) ? siteList(scope) ?? [] : null;
+  const outOfReach = (m: Managed | null) => !!m && !!mySites && (m.site_id === null || !mySites.includes(m.site_id));
 
   // Deduplicate across all three identifiers so that a neighbor seen by multiple managed
   // devices — some via LLDP (has MAC), others via MNDP (no MAC) — merges into one entry.
@@ -363,14 +379,15 @@ router.get('/discovered', async (_req, res) => {
     }
   }
 
-  const results = Array.from(seen.values()).map((r) => {
+  const results = Array.from(seen.values()).flatMap((r) => {
     const mac = (r.neighbor_mac || '').toLowerCase();
     const match =
       (mac && macToDevice.get(mac)) ||
       (r.neighbor_address && ipToDevice.get(r.neighbor_address)) ||
       (r.neighbor_identity && nameToDevice.get(r.neighbor_identity.toLowerCase())) ||
       null;
-    return {
+    if (outOfReach(match)) return [];
+    return [{
       identity: r.neighbor_identity || '',
       address: r.neighbor_address || '',
       mac_address: r.neighbor_mac || '',
@@ -379,7 +396,7 @@ router.get('/discovered', async (_req, res) => {
       seen_by: r.seen_by_list.join(', '),
       duplicate_of_device_id: match ? match.id : null,
       duplicate_of_device_name: match ? match.name : null,
-    };
+    }];
   });
 
   res.json(results);
@@ -401,7 +418,7 @@ router.post('/', requireWrite, async (req, res) => {
     requestingUserRole: isSiteScoped(req.user) ? 'operator' : req.user?.role,
     presetCaller: presetCaller(req.user),
     siteId: target.siteId,
-    allowedSites: req.user?.siteRoles ? Object.entries(req.user.siteRoles).filter(([, r]) => r !== 'viewer').map(([id]) => Number(id)) : null,
+    allowedSites: writableSiteIds(req.user?.siteRoles),
   });
   return res.status(result.status).json(result.body);
 });
@@ -484,7 +501,7 @@ router.post('/bulk-add/jobs', requireWrite, async (req, res) => {
   );
   await redis.set(`device-bulk-add:${jobId}:results`, '[]', 'EX', BULK_ADD_META_TTL_SEC);
   await enqueueBulkAddJob(jobId, items as CreateDeviceInput[], bulkTarget.siteId, isSiteScoped(req.user) ? 'operator' : req.user!.role,
-    req.user?.siteRoles ? Object.keys(req.user.siteRoles).map(Number) : null, presetCaller(req.user));
+    writableSiteIds(req.user?.siteRoles), presetCaller(req.user));
   return res.status(202).json({ job_id: jobId, total: items.length });
 });
 
@@ -2454,7 +2471,7 @@ router.delete('/:id/address-lists/:entryId', requireWrite, async (req, res) => {
 
 // ─── Active Connections (read-only) ─────────────────────────────────────────────
 router.get('/:id/connections', async (req, res) => {
-  const limit = Math.max(1, Math.min(parseInt(String(req.query.limit || '200'), 10) || 200, 2000));
+  const limit = queryLimit(req.query.limit, 200, 2000);
   const protocol = String(req.query.protocol ?? '').toLowerCase();
   if (protocol && !/^[a-z0-9-]{1,16}$/.test(protocol)) return res.status(400).json({ error: 'protocol must be a protocol name' });
   await withCollector(req.params.id, res, async (c) => {
@@ -3013,6 +3030,8 @@ router.post('/:id/ip-addresses', requireWrite, async (req, res) => {
   if (!address || !iface) {
     return res.status(400).json({ error: 'address and interface are required' });
   }
+  const notHost = hostAddressProblem(String(address));
+  if (notHost) return res.status(400).json({ error: notHost });
 
   await withGuardedChange(
     req.params.id,
@@ -3085,21 +3104,26 @@ router.post('/:id/check-update', requireWrite, async (req, res) => {
     const updateInfo = await collector.checkForUpdates();
 
     // Persist results so the UI reflects the latest check immediately
-    const latestVersion = (updateInfo['latest-version'] ?? '').trim();
+    const ownLatest = (updateInfo['latest-version'] ?? '').trim();
     const installedVersion = (updateInfo['installed-version'] ?? '').trim();
     const statusText = (updateInfo['status'] ?? '').toLowerCase();
     // Compared as versions, not as strings: "different" is not "newer", and
-    // reading it that way offered an older release as an update (#144).
-    const hasUpdate = updateAvailable({
-      installed: installedVersion, latest: latestVersion, status: statusText,
-    });
+    // reading it that way offered an older release as an update (#144). What
+    // the device's package mirror holds counts too (#482).
+    const mirrorVersion = (await mirrorVersions([deviceRow.id]).catch(() => new Map<number, string>())).get(deviceRow.id);
+    const merged = withMirrorUpdate(installedVersion, {
+      available: updateAvailable({ installed: installedVersion, latest: ownLatest, status: statusText }),
+      latest: ownLatest || null,
+    }, mirrorVersion);
 
     await query(
       `UPDATE devices SET firmware_update_available = $1, latest_ros_version = $2, updated_at = NOW() WHERE id = $3`,
-      [hasUpdate, latestVersion || null, deviceRow.id]
+      [merged.available, merged.latest, deviceRow.id]
     );
 
-    return res.json(updateInfo);
+    return res.json(merged.latest && merged.latest !== ownLatest
+      ? { ...updateInfo, 'latest-version': merged.latest, 'status': `New version is available on the package mirror` }
+      : updateInfo);
   } finally {
     collector.disconnect();
   }
@@ -3265,6 +3289,19 @@ router.post('/:id/install-update', requireWrite, async (req, res) => {
     // Only a genuinely newer version: a channel offering an older release would
     // otherwise install it, a downgrade (P2-9).
     const decision = upgradeDecision(installed, latest);
+    // Nothing from MikroTik, but the device's package mirror has a newer
+    // version (#482): this button installs from MikroTik's servers, so say
+    // where the mirror's upgrade is, and don't call the device up to date.
+    if (decision.action === 'skip') {
+      const mirrorVersion = (await mirrorVersions([deviceRow.id]).catch(() => new Map<number, string>())).get(deviceRow.id);
+      if (mirrorVersion && withMirrorUpdate(installed, { available: false, latest: null }, mirrorVersion).available) {
+        return res.json({
+          started: false, installed_version: installed || null, mirror_version: mirrorVersion,
+          message: `RouterOS ${mirrorVersion} is on this device's package mirror, not offered by MikroTik's servers. ` +
+            'Upgrade it from Firmware with a rollout, choosing Packages from: Local mirror.',
+        });
+      }
+    }
     if (decision.action === 'skip' && decision.reason !== 'Already up to date') {
       return res.json({ started: false, installed_version: installed || null, message: decision.reason });
     }
@@ -3477,6 +3514,8 @@ router.post('/:id/routing', requireWrite, async (req, res) => {
   if (!dst_address || !gateway) {
     return res.status(400).json({ error: 'dst_address and gateway are required' });
   }
+  const routeProblem = routeInputProblem(String(dst_address), String(gateway));
+  if (routeProblem) return res.status(400).json({ error: routeProblem });
   if (req.body.routing_table !== undefined && req.body.routing_table !== null && typeof req.body.routing_table !== 'string') {
     return res.status(400).json({ error: 'routing_table must be a string' });
   }

@@ -82,15 +82,16 @@ export const protocolName = (n: string): string | null => PROTOCOL_NAMES[Number(
  */
 export function customError(c: ZoneCustomService): string | null {
   const ports = c.ports.replace(/\s+/g, '');
-  const src = (c.src ?? '').trim();
-  const dst = (c.dst ?? '').trim();
+  // As the server reads them: every space dropped, not only the ends.
+  const src = (c.src ?? '').replace(/\s+/g, '');
+  const dst = (c.dst ?? '').replace(/\s+/g, '');
   const addresses = (src ? endpointError(src) : null) ?? (dst ? endpointError(dst) : null);
   if (c.protocol === 'icmp') {
-    const icmp = (c.icmp ?? '').trim();
+    const icmp = (c.icmp ?? '').replace(/\s+/g, '');
     return (icmp ? icmpError(icmp) : null) ?? addresses;
   }
   if (c.protocol === 'other') {
-    const n = (c.number ?? '').trim();
+    const n = (c.number ?? '').replace(/\s+/g, '');
     if (!n) return 'Enter an IP protocol number, such as 89 for OSPF.';
     if (!/^\d{1,3}$/.test(n) || Number(n) < 1 || Number(n) > 255) return 'An IP protocol number is 1 to 255.';
     return addresses;
@@ -106,7 +107,7 @@ export function customLabel(c: ZoneCustomService): string {
     ? (protocolName(c.number ?? '') ?? `Protocol ${c.number ?? ''}`)
     : c.protocol === 'icmp' ? ['ICMP', c.icmp ? `type ${c.icmp}` : ''].filter(Boolean).join(' ')
       : [c.protocol.toUpperCase(), c.ports].filter(Boolean).join(' ');
-  return [what, c.src ? `from ${c.src}` : '', c.dst ? `to ${c.dst}` : ''].filter(Boolean).join(' ');
+  return [what, c.src ? `from ${c.src}` : '', c.dst ? `to ${c.dst}` : '', c.log ? '(logged)' : ''].filter(Boolean).join(' ');
 }
 
 export function zoneNameError(name: string, existing: string[]): string | null {
@@ -131,10 +132,10 @@ export function draftErrors(d: ZoneRequest): Record<string, string> {
     }
   }
   for (const [key, p] of Object.entries(d.config.policies)) {
-    if (p.action !== 'services') continue;
+    if (p.action === 'deny') continue;
     const bad = p.custom.map(customError).find(Boolean);
     if (bad) errors[`pair:${key}`] = bad;
-    else if (!p.services.length && !p.custom.length) errors[`pair:${key}`] = 'Pick at least one service, or deny it.';
+    else if (p.action === 'services' && !p.services.length && !p.custom.length) errors[`pair:${key}`] = 'Pick at least one service, or deny it.';
   }
   return errors;
 }
@@ -142,7 +143,7 @@ export function draftErrors(d: ZoneRequest): Record<string, string> {
 /** One cell of the matrix, in a few words. */
 export function policySummary(p: ZonePolicy | undefined, labels: Record<string, string>): string {
   if (!p || p.action === 'deny') return 'Deny';
-  if (p.action === 'allow') return 'Allow all';
+  if (p.action === 'allow') return p.custom.length ? `Allow all, ${p.custom.length} logged` : 'Allow all';
   const names = [...p.services.map((s) => labels[s] ?? s), ...p.custom.map(customLabel)];
   return names.length > 2 ? `${names.slice(0, 2).join(', ')} +${names.length - 2}` : names.join(', ');
 }

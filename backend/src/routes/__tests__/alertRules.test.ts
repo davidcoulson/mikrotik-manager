@@ -3,6 +3,7 @@ jest.mock('../../middleware/auth', () => ({
   requireAuth: (_r: unknown, _s: unknown, n: () => void) => n(),
   requireWrite: (_r: unknown, _s: unknown, n: () => void) => n(),
   requireAdmin: (_r: unknown, _s: unknown, n: () => void) => n(),
+  requireSettingsRead: (_r: unknown, _s: unknown, n: () => void) => n(),
   fleetOnly: (_r: unknown, _s: unknown, n: () => void) => n(),
 }));
 

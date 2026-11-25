@@ -24,12 +24,18 @@ const router = Router();
 // bcrypt hash of a random string nobody knows: compared against when the
 // account has no local password, so timing matches a real attempt.
 const DUMMY_HASH = '$2b$12$x1ShfS6ua.IHfzy/kdOkeuC0OtQwJzjRaIpYhRdUDBT7Ecg3cyyL2';
+/**
+ * Steps that check the account's password or a 2FA code inside a session:
+ * a few per quarter hour per account. Only the general per-address limit
+ * applied, so a stolen session could keep guessing the password.
+ */
+const credentialRecheck = rateLimitRedis({ windowSec: 15 * 60, max: 10, keyPrefix: 'credential-recheck' });
 
 router.get(
   '/security-status',
   requireAuth,
   rateLimitRedis({ windowSec: 60, max: 10, keyPrefix: 'security-status', allMethods: true }),
-  async (_req, res) => {
+  async (req, res) => {
     const warnings: string[] = [];
 
     // Secrets self-heal to strong auto-generated values, so the only remaining
@@ -42,10 +48,12 @@ router.get(
     // Stored credentials no known key decrypts: the key was lost (P2-29).
     if (encryptionKeyMissing()) warnings.push('encryption_key_missing');
 
-    const adminUser = await queryOne<{ password_hash: string | null }>(
+    // Only admins are told the admin account still has its default password:
+    // to anyone else it's the way in.
+    const adminUser = req.user?.role === 'admin' ? await queryOne<{ password_hash: string }>(
       `SELECT password_hash FROM users WHERE username = 'admin' LIMIT 1`
-    );
-    if (adminUser?.password_hash && (await bcrypt.compare('admin', adminUser.password_hash))) {
+    ) : null;
+    if (adminUser && (await bcrypt.compare('admin', adminUser.password_hash))) {
       warnings.push('admin_password_default');
     }
 
@@ -179,7 +187,7 @@ router.post('/totp/verify', rateLimitRedis({ windowSec: 60, max: 5, keyPrefix: '
 // Generate a new TOTP secret + QR code for the current user (does not enable yet).
 // Requires the current password so a hijacked session can't enroll 2FA and lock
 // the legitimate user out.
-router.post('/totp/setup', requireAuth, async (req, res) => {
+router.post('/totp/setup', requireAuth, credentialRecheck, async (req, res) => {
   if (await refuseIfPasswordLoginOff(res)) return;
   const { password } = req.body as { password?: string };
   if (!password) return res.status(400).json({ error: 'Current password is required to set up 2FA' });
@@ -217,7 +225,7 @@ router.post('/totp/setup', requireAuth, async (req, res) => {
 // (outside review U8).
 
 // Confirm the TOTP setup by validating a code — enables TOTP
-router.post('/totp/confirm', requireAuth, async (req, res) => {
+router.post('/totp/confirm', requireAuth, credentialRecheck, async (req, res) => {
   if (await refuseIfPasswordLoginOff(res)) return;
   const { code } = req.body as { code?: string };
   if (!code) return res.status(400).json({ error: 'code is required' });
@@ -240,7 +248,7 @@ router.post('/totp/confirm', requireAuth, async (req, res) => {
 });
 
 // Disable TOTP — requires password confirmation
-router.post('/totp/disable', requireAuth, async (req, res) => {
+router.post('/totp/disable', requireAuth, credentialRecheck, async (req, res) => {
   if (await refuseIfPasswordLoginOff(res)) return;
   const { password } = req.body as { password?: string };
   if (!password) return res.status(400).json({ error: 'password is required' });
@@ -277,7 +285,7 @@ router.post('/logout', requireAuth, async (req, res) => {
   res.json({ message: 'Logged out' });
 });
 
-router.put('/password', requireAuth, async (req, res) => {
+router.put('/password', requireAuth, credentialRecheck, async (req, res) => {
   if (await refuseIfPasswordLoginOff(res)) return;
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) {

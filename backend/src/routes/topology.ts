@@ -2,8 +2,9 @@ import { loadBondMembers } from '../services/topology/bondMembers';
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../config/database';
 import { CLIENT_SIGHTINGS } from '../utils/clientPorts';
-import { requireAuth, requireWrite } from '../middleware/auth';
-import { siteScopeDevices, siteScopeByDevice } from '../utils/siteScope';
+import { requireAuth, requireWrite, isSiteScoped } from '../middleware/auth';
+import { siteScopeDevices, siteScopeByDevice, type SiteScope } from '../utils/siteScope';
+import { keyInReach, topologyKeyEnds, type MapReach } from '../utils/topologyKeys';
 import { stpDomains, resolveStpUpstreams } from '../utils/stpUpstream';
 import { deviceWaysUp } from '../services/topology/wayUp';
 import { ospfTopologyLinks, type OspfPeerRow } from '../services/topology/ospfLinks';
@@ -20,6 +21,43 @@ import {
 const router = Router();
 router.use(requireAuth);
 // Hand-drawn links and nodes check the caller's role in their site in each handler (P1-7).
+
+/**
+ * The devices, nodes, hand-drawn links and clients a site-scoped account's map
+ * holds in these sites (P1-7): what it may see of the saved arrangement, hidden
+ * links and colours, and change. Clients are read only when a key names one.
+ */
+async function mapReach(scope: SiteScope, ext: Set<string> | null, keys: string[]): Promise<MapReach> {
+  const inSite = siteScopeDevices(scope);
+  const byDevice = siteScopeByDevice(scope, 'device_id');
+  const where = (p: string | null) => (p ? `WHERE ${p}` : '');
+  const needClients = keys.some((k) => topologyKeyEnds(k).some((e) => e.kind === 'client'));
+  const [devices, nodes, hands, clients] = await Promise.all([
+    query<{ id: number }>(`SELECT id FROM devices ${where(inSite)}`),
+    query<{ id: number }>(`SELECT id FROM topology_nodes ${where(inSite)}`),
+    query<{ id: number }>(`SELECT id FROM topology_hand_links ${where(inSite)}`),
+    needClients
+      ? query<{ mac: string }>(`SELECT DISTINCT LOWER(mac_address) AS mac FROM clients ${where(byDevice)}`)
+      : Promise.resolve([] as { mac: string }[]),
+  ]);
+  return {
+    devices: new Set(devices.map((r) => r.id)),
+    nodes: new Set(nodes.map((r) => r.id)),
+    hands: new Set(hands.map((r) => r.id)),
+    clients: new Set(clients.map((r) => r.mac)),
+    ext,
+  };
+}
+
+/** For a site-scoped account, refuses keys naming anything outside the sites it can change. */
+async function refuseKeysOutOfReach(req: Request, res: Response, keys: string[]): Promise<boolean> {
+  if (!isSiteScoped(req.user) || keys.length === 0) return false;
+  const reach = await mapReach(writableScope(req), null, keys);
+  const bad = keys.find((k) => !keyInReach(k, reach));
+  if (!bad) return false;
+  res.status(403).json({ error: `That part of the map is in a site you can't change (${bad.slice(0, 60)}).` });
+  return true;
+}
 
 let pollerService: PollerService | null = null;
 export function setPollerService(p: PollerService): void {
@@ -42,12 +80,12 @@ interface BridgeRow {
   site_id?: number | null;
 }
 
-// GET /api/topology
-router.get('/', async (req, res) => {
-  // Scope the graph to the active site. Links are filtered on their *from*
-  // device: a link out of the site still shows, and resolves to an external
-  // node, which is the honest picture of an uplink to somewhere else (#130).
-  const siteId = activeSite(req);
+/**
+ * The discovered graph for the sites in scope. Links are filtered on their
+ * *from* device: a link out of the site still shows, and resolves to an
+ * external node, which is the honest picture of an uplink to somewhere else (#130).
+ */
+async function mapGraph(siteId: SiteScope) {
   const devFilter = siteScopeDevices(siteId);
   const fromFilter = siteScopeByDevice(siteId, 'tl.from_device_id');
   const ifFilter = siteScopeByDevice(siteId, 'device_id');
@@ -96,6 +134,31 @@ router.get('/', async (req, res) => {
   ]);
 
   const graph = buildTopology(devices, allLinks, [], deviceMacs);
+  return { devices, allLinks, deviceMacs, bridges, graph };
+}
+
+/** OSPF adjacencies in scope, which cross tunnels discovery can't (#373). */
+async function ospfPeersIn(siteId: SiteScope): Promise<OspfPeerRow[]> {
+  const fromFilter = siteScopeByDevice(siteId, 'tl.from_device_id');
+  return query<OspfPeerRow>(
+    `SELECT r.device_id, r.remote_id, r.remote_address, r.local_interface, i.type AS local_interface_type, r.state, r.up
+       FROM routing_peers r
+       LEFT JOIN interfaces i ON i.device_id = r.device_id AND i.name = r.local_interface
+      WHERE r.protocol = 'ospf' ${fromFilter ? `AND ${siteScopeByDevice(siteId, 'r.device_id')}` : ''}`
+  ).catch(() => [] as OspfPeerRow[]);
+}
+
+/** The neighbours (ext- ids) on the map of these sites. */
+async function neighboursIn(siteId: SiteScope): Promise<Set<string>> {
+  const { devices, graph } = await mapGraph(siteId);
+  const ospf = ospfTopologyLinks(await ospfPeersIn(siteId), devices, graph.links, graph.externalNodes);
+  return new Set([...graph.externalNodes, ...ospf.externalNodes].map((n) => n.id));
+}
+
+// GET /api/topology
+router.get('/', async (req, res) => {
+  const siteId = activeSite(req);
+  const { devices, allLinks, deviceMacs, bridges, graph } = await mapGraph(siteId);
 
   // Your own nodes and their links (#147), in the sites in view.
   const nodeFilter = siteScopeDevices(siteId);
@@ -160,12 +223,7 @@ router.get('/', async (req, res) => {
   }
 
   // Links from OSPF adjacencies, which cross tunnels discovery can't (#373).
-  const ospfPeers = await query<OspfPeerRow>(
-    `SELECT r.device_id, r.remote_id, r.remote_address, r.local_interface, i.type AS local_interface_type, r.state, r.up
-       FROM routing_peers r
-       LEFT JOIN interfaces i ON i.device_id = r.device_id AND i.name = r.local_interface
-      WHERE r.protocol = 'ospf' ${fromFilter ? `AND ${siteScopeByDevice(siteId, 'r.device_id')}` : ''}`
-  ).catch(() => [] as OspfPeerRow[]);
+  const ospfPeers = await ospfPeersIn(siteId);
   const ospf = ospfTopologyLinks(ospfPeers, devices, [...graph.links, ...stpLinks], graph.externalNodes);
 
   // Each device's way up, for the tiered layout (#367): the gateway on top.
@@ -174,6 +232,23 @@ router.get('/', async (req, res) => {
     console.warn(`[Topology] way up: ${(e as Error).message}`);
     return [];
   });
+
+  // A site-scoped account sees only what's saved for its own part of the map:
+  // others' arrangement, colours, hidden links and neighbour names name their
+  // devices and neighbours (P1-7).
+  let hidden = hiddenRows;
+  let overrides = neighbourOverrides;
+  if (isSiteScoped(req.user)) {
+    const ext = new Set([...graph.externalNodes, ...ospf.externalNodes].map((n) => n.id));
+    const keys = [...Object.keys(layout.positions), ...Object.keys(layout.anchors), ...Object.keys(layout.colors), ...hiddenRows.map((r) => r.edge_key)];
+    const reach = await mapReach(siteId, ext, keys);
+    const keep = <T>(o: Record<string, T>) => Object.fromEntries(Object.entries(o).filter(([k]) => keyInReach(k, reach)));
+    layout.positions = keep(layout.positions);
+    layout.anchors = keep(layout.anchors);
+    layout.colors = keep(layout.colors);
+    hidden = hiddenRows.filter((r) => keyInReach(r.edge_key, reach));
+    overrides = Object.fromEntries(Object.entries(neighbourOverrides).filter(([k]) => ext.has(k)));
+  }
 
   res.json({
     devices,
@@ -188,8 +263,8 @@ router.get('/', async (req, res) => {
     nodes,
     handLinks,
     layout,
-    neighbourOverrides,
-    hiddenLinks: hiddenRows.map((r) => ({ key: r.edge_key, label: r.label, hiddenAt: r.hidden_at, hiddenBy: r.hidden_by_name })),
+    neighbourOverrides: overrides,
+    hiddenLinks: hidden.map((r) => ({ key: r.edge_key, label: r.label, hiddenAt: r.hidden_at, hiddenBy: r.hidden_by_name })),
     ...(clients ? { clients } : {}),
   });
 });
@@ -440,6 +515,7 @@ router.put('/layout', requireWrite, async (req, res) => {
   const anc = Object.entries(anchors);
   const col = Object.entries(colors);
   if (pos.length + anc.length + col.length > MAX_LAYOUT_ENTRIES) return res.status(400).json({ error: 'Too many entries' });
+  if (await refuseKeysOutOfReach(req, res, [...pos, ...anc, ...col].map(([k]) => k))) return;
   for (const [k, v] of col) {
     if (!LAYOUT_KEY.test(k) || (v !== null && !/^#[0-9a-f]{6}$/i.test(String(v)))) {
       return res.status(400).json({ error: 'A colour is #rrggbb, or null for the default' });
@@ -494,6 +570,7 @@ router.put('/layout', requireWrite, async (req, res) => {
 router.post('/layout/reset', requireWrite, async (req, res) => {
   const keys = Array.isArray(req.body?.keys) ? (req.body.keys as unknown[]).map(String).filter((k) => LAYOUT_KEY.test(k)) : [];
   const edges = Array.isArray(req.body?.edges) ? (req.body.edges as unknown[]).map(String).filter((k) => LAYOUT_KEY.test(k)) : [];
+  if (await refuseKeysOutOfReach(req, res, [...keys, ...edges].slice(0, MAX_LAYOUT_ENTRIES * 2))) return;
   if (keys.length) await query(`DELETE FROM topology_positions WHERE node_key = ANY($1::text[])`, [keys.slice(0, MAX_LAYOUT_ENTRIES)]);
   // The sides links attach at; a colour someone chose is kept (#260).
   if (edges.length) {
@@ -513,6 +590,11 @@ router.put('/neighbours/:extId', requireWrite, async (req, res) => {
   const name = req.body?.name == null || String(req.body.name).trim() === '' ? null : String(req.body.name).trim().slice(0, 255);
   const kind = req.body?.kind == null || req.body.kind === '' ? null : String(req.body.kind);
   if (kind !== null && !NEIGHBOUR_KINDS.has(kind)) return res.status(400).json({ error: 'Unknown type' });
+  // A site-limited account names only neighbours on its own part of the map,
+  // where it can change things: the name shows on every site's map (P1-7).
+  if (isSiteScoped(req.user) && !(await neighboursIn(writableScope(req))).has(extId)) {
+    return res.status(403).json({ error: "That neighbour isn't on the part of the map you can change." });
+  }
   if (name === null && kind === null) {
     await query(`DELETE FROM topology_neighbour_overrides WHERE ext_id = $1`, [extId]);
   } else {
@@ -529,6 +611,7 @@ router.put('/neighbours/:extId', requireWrite, async (req, res) => {
 router.post('/hidden-links', requireWrite, async (req, res) => {
   const key = String(req.body?.key ?? '');
   if (!LAYOUT_KEY.test(key) || !key.startsWith('cable:')) return res.status(400).json({ error: 'key must be a discovered link id' });
+  if (await refuseKeysOutOfReach(req, res, [key])) return;
   const label = req.body?.label == null ? null : String(req.body.label).slice(0, 300);
   await query(
     `INSERT INTO topology_hidden_links (edge_key, label, hidden_by) VALUES ($1, $2, $3)
@@ -540,6 +623,7 @@ router.post('/hidden-links', requireWrite, async (req, res) => {
 router.delete('/hidden-links', requireWrite, async (req, res) => {
   const key = String(req.query.key ?? '');
   if (!LAYOUT_KEY.test(key)) return res.status(400).json({ error: 'key must be a discovered link id' });
+  if (await refuseKeysOutOfReach(req, res, [key])) return;
   await query(`DELETE FROM topology_hidden_links WHERE edge_key = $1`, [key]);
   return res.json({ ok: true });
 });

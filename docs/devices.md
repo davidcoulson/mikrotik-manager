@@ -410,21 +410,25 @@ history, uptime figures and reports keep every outage. **Snooze** instead hides 
 | **Ports** | The switch faceplate, per-port configuration, bonds, VLAN membership |
 | **Bridges** | Every bridge, its ports, VLAN filtering and spanning tree; create, rename, edit, delete |
 | **VLANs** | The bridge VLAN table, copying VLANs between switches, and VLAN interfaces (`/interface vlan`) with their parent and addresses, which you can add, edit and remove |
-| **Radios** | Wireless interfaces, SSIDs, channels, connected clients |
-| **Firewall** | Filter and NAT rules and address lists, for IPv4 and IPv6 (the **IPv4** / **IPv6** switch at the top), with reordering and counters, and [Quick rules](#quick-firewall-rules). IPv6 NAT needs RouterOS 7 |
+| **802.1X** | Port authentication on switches and routers, with RADIUS from User Manager or your own server. See [802.1X](#8021x) |
 | **Routing** | IPv4 routes, IPv6 routes (read-only), routing rules, OSPF, BGP, routing tables and filters |
-| **Queues** | Traffic shaping |
-| **Connections** | The live connection tracking table: the total, and the first 200, 500 or 2,000 connections, filtered by protocol on the router. A busy router isn't asked for its whole table, and refreshing is on request unless you turn on auto-refresh (#300). Every column sorts, ports included (before 0.71.0, RouterOS 7.24's ports were missing) |
-| **Graphs** | History for this device, one range for every chart (1h to 30d), with a hover cursor shared across them. See [Device graphs](#device-graphs) |
-| **Hardware** | Health sensors, PoE, SFP module detail, and CPU and memory history: 5-minute averages as lines, with a light band up to the highest reading in each 5 minutes, so a short burst to 100% doesn't hide in the average (#402). Memory's band only shows where the peak is more than two points above the average |
-| **LTE** | Signal, carrier, bands and the data cap — see [Cellular](cellular.md) |
+| **Firewall** | Filter and NAT rules and address lists, for IPv4 and IPv6 (the **IPv4** / **IPv6** switch at the top), with reordering and counters, and [Quick rules](#quick-firewall-rules). IPv6 NAT needs RouterOS 7 |
 | **Security** | Baseline hardening checks and the posture score |
+| **Bandwidth** | Queues (traffic shaping) and FastTrack. See [Bandwidth queues and FastTrack](#bandwidth-queues-and-fasttrack) |
+| **Connections** | The live connection tracking table: the total, and the first 200, 500 or 2,000 connections, filtered by protocol on the router. A busy router isn't asked for its whole table, and refreshing is on request unless you turn on auto-refresh (#300). Every column sorts, ports included (before 0.71.0, RouterOS 7.24's ports were missing) |
 | **Config** | System settings, certificates, SSH keys, clock |
+| **Firmware** | Check for and install RouterOS and RouterBOOT updates for this device, with a link to the fleet [Firmware](firmware.md) page |
 | **Config History** | Snapshots of `/export`, diffs, and rollback ([what rollback can do](backups.md#restoring)) |
-| **Tools** | Ping, traceroute, IP scan, Wake-on-LAN, packet capture, bandwidth test |
+| **Hardware** | Health sensors, PoE, SFP module detail, and CPU and memory history: 5-minute averages as lines, with a light band up to the highest reading in each 5 minutes, so a short burst to 100% doesn't hide in the average (#402). Memory's band only shows where the peak is more than two points above the average |
+| **Graphs** | History for this device, one range for every chart (1h to 30d), with a hover cursor shared across them. See [Device graphs](#device-graphs) |
+| **Radios** | Wireless interfaces, SSIDs, channels, connected clients |
+| **Antenna Aligner** | Live signal while you aim a point-to-point link. See [Antenna aligner](antenna-aligner.md) |
+| **LTE** | Signal, carrier, bands and the data cap — see [Cellular](cellular.md) |
+| **Tools** | Ping, traceroute, IP scan, Torch, Wake-on-LAN, packet capture, bandwidth test |
 
 Tabs appear only where they apply: a switch has no Radios tab, a device without a modem has no
-LTE tab.
+LTE tab, an access point has no 802.1X tab, and Antenna Aligner shows only on Wireless System
+devices managed over the API.
 
 ### Editing settings
 
@@ -592,7 +596,8 @@ A custom rule can also be **ICMP**, with an optional type (`8` for echo request)
 (`3:4`); left empty it allows every ICMP type. Or it can be any other IP protocol by number under
 **Protocol #**: `89` for OSPF, `47` for GRE, `112` for VRRP. RouterOS shows a protocol it has a name
 for by that name, so the rule appears on the device as `protocol=ospf`. Neither takes ports, and
-both can take addresses.
+both can take addresses. **Protocol #** 1, 6 or 17 is saved as ICMP, TCP or UDP; on its own it
+allows all of that protocol.
 
 A source or destination can also be a **hostname**, such as `smtp.office365.com`. The router looks
 it up with its own DNS (**IP > DNS**) and keeps an address list of every address it resolves to,
@@ -600,6 +605,20 @@ updated as the name's records change, so a service behind several changing addre
 matched. The manager keeps one list per name, called `mtm-zone-<name>`, holding a single entry
 commented `mtm zone host`, and removes it once no rule uses the name. If the router can't
 resolve a name, rules using it match nothing.
+
+Tick **Log** on a custom rule to log the connections it accepts (from
+[@ronchan44](https://github.com/ronchan44)'s #369). The manager puts an `action=log` rule with
+the same protocol, ports and addresses just before the accept, with the log prefix
+`zone accept`, so [Firewall Logs](firewall-events.md) shows them as accepted. Established
+traffic is accepted before the pair's rules, so each new connection is logged once, not every
+packet. Logging stops at 20 a second (bursts of 40) to spare the router; past that the
+connections are still accepted, just not logged.
+
+A pair set to **Allow everything** can log some of what it lets through: **+ Log some of it**
+adds a row of ports, protocol and addresses whose connections are logged the same way, while
+everything is still allowed (LAN to WAN logging mail to `smtp.office365.com`, say). The matrix
+cell reads **Allow all, 1 logged**. Switching a pair from **Only these** to **Allow
+everything** keeps only its rules that log.
 
 Traffic between interfaces of the same zone is allowed unless you turn it off for that zone.
 
@@ -929,6 +948,16 @@ has a small chip icon; hover a port for its PVID and spanning tree role.
   [@ronchan44](https://github.com/ronchan44)'s #466). A DHCP server on the bridge isn't changed
   with it: after moving a bridge to a new subnet, update its DHCP network, gateway and pool on
   **Network Services**, **DHCP**.
+- **+ Add EoIP, wireless, VLAN…** under a bridge's ports adds an interface that isn't on the
+  **Ports** tab's faceplate: EoIP, VXLAN, VPLS, veth, VLAN, wifi or wlan interfaces (from
+  [@ronchan44](https://github.com/ronchan44)'s #466). One already in another bridge moves
+  from it. A wifi interface CAPsMAN added to a bridge by itself is listed but can't be chosen.
+  An interface with an address of its own asks first, because the address stops working once
+  it's a bridge port, and then runs with auto-revert. Routed interfaces (WireGuard, GRE, IPIP,
+  PPP and the like) carry IP rather than Ethernet frames, so RouterOS can't bridge them and
+  the manager says so.
+- Click a port, then **Remove from bridge** to take it out. This works for any static port,
+  Ethernet and SFP included.
 - The bin deletes a bridge with no ports, addresses or VLAN entries.
 
 Everything runs through [Change Guard](change-guard.md). Renaming the bridge the manager

@@ -48,8 +48,10 @@ Each device goes through the same sequence:
 5. **Prove the reboot happened** — uptime must have gone *backwards*
 6. **Verify the version** — the device must report exactly the version that was installed
 7. **RouterBOOT** (optional) — a second flash and a second reboot. It waits for the device
-   to settle after the first reboot and retries its first connection, then proves the second
-   reboot the same way as step 5 before reading the bootloader version
+   to settle after the first reboot and retries its first connection. A changed bootloader
+   version proves the reboot happened; otherwise it compares uptime with the earlier reading
+   and elapsed time. If the device is still running after two minutes, it asks it to reboot
+   once more. It verifies the bootloader against the target version
 8. **Post-upgrade commands** (optional, #163). **Then run** on the rollout picks a command
    template from the Templates page; its commands are copied into the rollout when it's
    created, so editing the template later doesn't change it. They run over SSH under Change
@@ -174,6 +176,14 @@ looks at that disk.
 The **Devices** table lists the devices a mirror serves. Select some and choose **Use this
 mirror**: the manager adds the package server to each device's local update sources. **Stop
 using it** removes it again. Devices older than 7.17 can't be selected.
+
+A device whose mirror holds a newer version than it runs counts as having an update
+everywhere in the manager: the Dashboard, the device list, alerts and reports, not only
+the Firmware page. That matters for devices with no internet, whose own check with
+MikroTik finds nothing. The manager looks within about ten minutes of a sync or of a device
+joining the mirror, without contacting any device, so it works in Dark Site Mode too.
+**Install & Reboot** on a device's page installs from MikroTik's servers. For a device that
+can only get the update from the mirror, it says so; upgrade it with a rollout instead.
 
 ### Rollouts from the mirror
 
